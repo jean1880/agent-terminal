@@ -492,3 +492,91 @@ fn news_landing_after_a_stop_never_wakes_the_root_once_the_user_speaks() {
         stop(&sup).await;
     });
 }
+
+fn held_notices(r: &Root) -> usize {
+    r.notices()
+        .iter()
+        .filter(|n| n.contains("sub-agent update(s) waiting"))
+        .count()
+}
+
+/// A root in dangerous permissive mode is never woken by its child's result: its thread is told
+/// once that news waits, nothing retries it every second, and the user's next message carries
+/// it, framed and shown as the app's notice.
+#[test]
+fn a_root_in_dangerous_permissive_mode_is_told_once_and_the_users_message_carries_the_news() {
+    in_context(async {
+        let (dir, sup, root) = harness();
+        let r = root_session(&sup, dir.path(), &root).await;
+        r.session.confirm_mode(Mode::Bypass);
+        let worker = worker_of(
+            &sup.spawn_worker(&root, spawn_request("wake-bypass"))
+                .await
+                .unwrap(),
+        );
+        completed(&sup, &worker).await;
+        pump_until(|| held_notices(&r) == 1).await;
+        settle().await;
+        assert_eq!(r.wakes(), 0, "no turn nobody asked for");
+        assert_eq!(held_notices(&r), 1, "told once: {:?}", r.notices());
+        assert_eq!(pending(&sup, &root), 1, "kept for the user");
+        assert!(
+            !sup.state.borrow().wake_armed.contains(&root),
+            "no retry is armed while it is held for the user"
+        );
+        // A turn ending (the window reports every one) offers it again: nothing new, so no
+        // second notice and no retry.
+        sup.on_root_turn_end(&r.thread);
+        settle().await;
+        assert_eq!(held_notices(&r), 1);
+        assert!(!sup.state.borrow().wake_armed.contains(&root));
+
+        r.session.send_prompt("what did they find?");
+        pump_until(|| r.prompts().contains("what did they find?")).await;
+        let prompts = r.prompts();
+        assert!(
+            prompts.contains(&format!("{worker}) finished: completed.")),
+            "{prompts}"
+        );
+        assert!(prompts.contains("The user's message follows."));
+        assert_eq!(pending(&sup, &root), 0, "taken by the user's message");
+        assert!(r
+            .notices()
+            .iter()
+            .any(|n| n.contains(&format!("{worker}) finished: completed."))));
+        pump_until(|| !r.session.status().running_turn).await;
+        sup.on_root_turn_end(&r.thread);
+        settle().await;
+        assert_eq!(r.wakes(), 1, "sent once, with the user's message");
+        r.session.shutdown(false);
+        stop(&sup).await;
+    });
+}
+
+/// Leaving dangerous permissive mode offers the news it held as an ordinary wake.
+#[test]
+fn leaving_dangerous_permissive_mode_wakes_the_root_with_the_held_news() {
+    in_context(async {
+        let (dir, sup, root) = harness();
+        let r = root_session(&sup, dir.path(), &root).await;
+        r.session.confirm_mode(Mode::Bypass);
+        let worker = worker_of(
+            &sup.spawn_worker(&root, spawn_request("wake-bypass-left"))
+                .await
+                .unwrap(),
+        );
+        completed(&sup, &worker).await;
+        pump_until(|| held_notices(&r) == 1).await;
+        assert_eq!(r.wakes(), 0);
+        r.session.confirm_mode(Mode::Ask);
+        pump_until(|| r.wakes() == 1).await;
+        assert!(r
+            .prompts()
+            .contains(&format!("{worker}) finished: completed.")));
+        assert_eq!(pending(&sup, &root), 0);
+        settle().await;
+        assert_eq!(r.wakes(), 1);
+        r.session.shutdown(false);
+        stop(&sup).await;
+    });
+}

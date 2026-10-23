@@ -10,7 +10,9 @@
 //! message presented to it) is never sent again. News that arrives close together is coalesced
 //! into one turn, within [`WAKE_BUDGET`]. Every text is redacted before it is cut, so a cut can
 //! never leave half a secret unmasked. A stopped or closed parent is never woken, and at most
-//! [`MAX_CONSECUTIVE_WAKES`] wakes run without the user speaking in between.
+//! [`MAX_CONSECUTIVE_WAKES`] wakes run without the user speaking in between. A parent in
+//! dangerous permissive mode is never woken either: its thread is told what waits, and the news
+//! goes with the user's next message or once the mode is left.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -86,11 +88,23 @@ pub struct Queue {
     presented: VecDeque<MessageId>,
     /// Items that gave way to [`MAX_PENDING`] since the last wake.
     dropped: usize,
+    /// Items queued since the parent's thread was last told of what waits ([`Self::announced`]).
+    fresh: usize,
+    /// Why the last offer was held, so a hold is logged once per reason rather than per retry.
+    held_for: Option<&'static str>,
 }
 
 impl Queue {
     /// Queues `item` unless the parent was already shown it. False when it was.
     pub fn push(&mut self, item: Item) -> bool {
+        let queued = self.insert(item);
+        if queued {
+            self.fresh += 1;
+        }
+        queued
+    }
+
+    fn insert(&mut self, item: Item) -> bool {
         if self.was_shown(&item) || self.items.contains(&item) {
             return false;
         }
@@ -139,7 +153,7 @@ impl Queue {
         let newer = std::mem::take(&mut self.items);
         let older = std::mem::replace(&mut self.dropped, dropped);
         for item in items.into_iter().chain(newer) {
-            self.push(item);
+            self.insert(item);
         }
         self.dropped += older;
     }
@@ -148,6 +162,31 @@ impl Queue {
     pub fn clear(&mut self) {
         self.items.clear();
         self.dropped = 0;
+        self.fresh = 0;
+        self.held_for = None;
+    }
+
+    /// How many of the waiting items arrived since the parent's thread was last told of them.
+    pub fn unannounced(&self) -> usize {
+        self.fresh.min(self.items.len())
+    }
+
+    /// The parent's thread was told of everything waiting now.
+    pub fn announced(&mut self) {
+        self.fresh = 0;
+    }
+
+    /// The waiting items reached the parent: what its thread was told and why it was held
+    /// start over.
+    pub fn delivered(&mut self) {
+        self.fresh = 0;
+        self.held_for = None;
+    }
+
+    /// The offer was held for `reason`. True when that differs from the last hold's reason, so
+    /// a hold repeated on every retry is noted once.
+    pub fn held(&mut self, reason: &'static str) -> bool {
+        self.held_for.replace(reason) != Some(reason)
     }
 
     fn was_shown(&self, item: &Item) -> bool {
@@ -159,7 +198,23 @@ impl Queue {
 
     fn prune(&mut self) {
         let items = std::mem::take(&mut self.items);
-        self.items = items.into_iter().filter(|i| !self.was_shown(i)).collect();
+        // The items not yet announced are the newest: pushes go to the back, restores ahead.
+        let first_fresh = items.len().saturating_sub(self.fresh);
+        let mut fresh = 0;
+        let kept: VecDeque<Item> = items
+            .into_iter()
+            .enumerate()
+            .filter(|(n, i)| {
+                let keep = !self.was_shown(i);
+                if keep && *n >= first_fresh {
+                    fresh += 1;
+                }
+                keep
+            })
+            .map(|(_, i)| i)
+            .collect();
+        self.items = kept;
+        self.fresh = fresh;
     }
 }
 
@@ -173,6 +228,9 @@ pub enum ParentState {
     /// A prompt cannot be sent now: a turn runs, a prompt is queued or in flight, an approval
     /// is open, a restart or rebind is under way, or the process is gone. Tried again later.
     Busy,
+    /// In dangerous permissive mode: no turn starts that the user did not ask for, so nothing
+    /// changes until the user sends a message or leaves the mode.
+    Unattended,
     /// Idle: a turn can start now (a suspended process is resumed for it).
     Idle,
 }
@@ -185,6 +243,10 @@ pub enum Decision {
     Drop,
     /// Keep it for the next opportunity.
     Hold,
+    /// Keep it for the user: tell the thread what waits (once per new item, with
+    /// [`held_for_user_notice`]), send it with the user's next message, and offer it again
+    /// only when the mode is left. Never retried on a timer.
+    HoldForUser,
     /// Start a turn with it.
     Wake,
     /// Post it as a notice only: [`MAX_CONSECUTIVE_WAKES`] ran without the user.
@@ -198,6 +260,7 @@ pub fn decide(state: ParentState, pending: usize, consecutive: u32) -> Decision 
         _ if pending == 0 => Decision::Nothing,
         ParentState::Closed | ParentState::Stopped => Decision::Drop,
         ParentState::Busy => Decision::Hold,
+        ParentState::Unattended => Decision::HoldForUser,
         ParentState::Idle if consecutive >= MAX_CONSECUTIVE_WAKES => Decision::NoticeOnly,
         ParentState::Idle => Decision::Wake,
     }
@@ -340,6 +403,22 @@ pub fn capped_notice(framed: &str) -> String {
     )
 }
 
+/// The notice posted when news waits for a parent in dangerous permissive mode
+/// ([`Decision::HoldForUser`]): `pending` items, none of them sent.
+pub fn held_for_user_notice(pending: usize) -> String {
+    format!(
+        "{MARKER} {pending} sub-agent update(s) waiting: not sent to the agent while it is in \
+         dangerous permissive mode. They go with your next message, or as soon as you leave the \
+         mode."
+    )
+}
+
+/// The user's own `prompt` carrying `framed` news held for it ([`Decision::HoldForUser`]): the
+/// news first, then a line saying where the user's message starts.
+pub fn with_user_prompt(framed: &str, prompt: &str) -> String {
+    format!("{framed}\n\n{MARKER} The user's message follows.\n\n{prompt}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,6 +451,59 @@ mod tests {
         assert_eq!(decide(Idle, 1, MAX_CONSECUTIVE_WAKES), Decision::NoticeOnly);
         // A busy parent past the cap still waits: the cap is judged when it can be woken.
         assert_eq!(decide(Busy, 1, MAX_CONSECUTIVE_WAKES), Decision::Hold);
+    }
+
+    /// Dangerous permissive mode never starts a turn: the news is kept for the user, whatever
+    /// the cap, and nothing waiting is still nothing.
+    #[test]
+    fn an_unattended_parent_holds_the_news_for_the_user() {
+        use ParentState::*;
+        assert_eq!(decide(Unattended, 1, 0), Decision::HoldForUser);
+        assert_eq!(
+            decide(Unattended, 3, MAX_CONSECUTIVE_WAKES),
+            Decision::HoldForUser
+        );
+        assert_eq!(decide(Unattended, 0, 0), Decision::Nothing);
+        assert_eq!(decide(Busy, 1, 0), Decision::Hold);
+        let notice = held_for_user_notice(2);
+        assert!(notice.starts_with("[agent-terminal] 2 sub-agent update(s) waiting"));
+        assert!(notice.contains("dangerous permissive mode"));
+        let sent = with_user_prompt("news", "carry on");
+        assert!(sent.starts_with("news\n\n[agent-terminal] The user's message follows."));
+        assert!(sent.ends_with("\n\ncarry on"));
+    }
+
+    /// The thread is told of new items once: a restore, a take or a repeat offer does not make
+    /// them new again, a later push does, and a hold reason is noted only when it changes.
+    #[test]
+    fn new_items_are_announced_once_and_a_repeated_hold_is_noted_once() {
+        let mut q = Queue::default();
+        q.push(item('a', Outcome::Completed, "r", Shown::Event(1)));
+        q.push(item('b', Outcome::Completed, "r", Shown::Event(2)));
+        assert_eq!(q.unannounced(), 2);
+        q.announced();
+        let (taken, dropped) = q.take();
+        q.restore(taken, dropped);
+        assert_eq!(q.pending(), 2);
+        assert_eq!(q.unannounced(), 0, "put back is not new");
+        q.push(item('c', Outcome::Message, "m", Shown::Event(3)));
+        assert_eq!(q.unannounced(), 1);
+        // A page that showed the new one leaves nothing new to tell.
+        q.covered(&[worker('c')], 3);
+        assert_eq!(q.unannounced(), 0);
+
+        assert!(q.held("running turn"));
+        assert!(!q.held("running turn"));
+        assert!(q.held("approval open"));
+        q.delivered();
+        assert!(
+            q.held("approval open"),
+            "a delivery starts the reasons over"
+        );
+        q.push(item('d', Outcome::Completed, "r", Shown::Event(4)));
+        q.clear();
+        assert_eq!(q.unannounced(), 0);
+        assert!(q.held("approval open"));
     }
 
     #[test]

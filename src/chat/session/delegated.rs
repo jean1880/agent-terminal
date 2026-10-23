@@ -70,6 +70,28 @@ pub(crate) enum WakeOutcome {
     Busy,
     /// Never: the user stopped this root and has not spoken since, or it is not a root.
     Held,
+    /// Not sent: the root is in dangerous permissive mode, which never runs a turn nobody asked
+    /// for. The supervisor keeps it, tells the thread, and installs [`HeldNews`] so the user's
+    /// next message carries it or leaving the mode offers it again; it is not retried on a timer.
+    HeldForUser,
+}
+
+/// Sub-agent news a root in dangerous permissive mode holds for the user, kept by the
+/// supervisor ([`ChatSession::hold_news_for_user`]). Called with no session borrow held.
+pub(crate) trait HeldNews {
+    /// Takes what waits now, framed and redacted within `WAKE_BUDGET`; `None` when nothing does
+    /// or it cannot be given now.
+    fn take(&self) -> Option<TakenNews>;
+    /// The root left dangerous permissive mode: what waits is offered as an ordinary wake.
+    fn release(&self);
+}
+
+/// News taken from the supervisor's queue to ride on a user's prompt.
+pub(crate) struct TakenNews {
+    /// The framed news (`wake::frame`).
+    pub text: String,
+    /// Puts it back: the prompt carrying it never reached the agent.
+    pub give_back: Box<dyn FnOnce()>,
 }
 
 impl ChatSession {
@@ -89,6 +111,24 @@ impl ChatSession {
     /// Whether the user stopped this root and has not spoken to it since.
     pub(crate) fn wakes_held(&self) -> bool {
         self.inner.wakes_held.get()
+    }
+
+    /// What keeps a wake from starting a turn now, if anything: the first reason found.
+    pub(crate) fn wake_blocker(&self) -> Option<&'static str> {
+        self.inner.wake_blocker()
+    }
+
+    /// After [`WakeOutcome::HeldForUser`]: where the user's next prompt in dangerous permissive
+    /// mode takes the held news from, and what leaving the mode tells.
+    pub(crate) fn hold_news_for_user(&self, news: Rc<dyn HeldNews>) {
+        *self.inner.held_news.borrow_mut() = Some(news);
+    }
+
+    /// Confirms `mode` as the agent would (`Event::ModeChanged`), for tests that need a root in
+    /// dangerous permissive mode without the restart that enters it.
+    #[cfg(test)]
+    pub(crate) fn confirm_mode(&self, mode: Mode) {
+        self.inner.emit(Envelope::new(Event::ModeChanged { mode }));
     }
 
     /// The exact provider-facing body, shared with receipt correlation. Rendering is pure and
@@ -193,33 +233,64 @@ impl Inner {
     /// permissive mode never runs a turn nobody asked for. A dead process is restarted only from
     /// idle suspension; one that exited on its own waits for the user.
     fn wake_busy(&self) -> bool {
+        self.wake_blocker().is_some()
+    }
+
+    /// [`Self::wake_busy`]'s first reason, for the journal.
+    fn wake_blocker(&self) -> Option<&'static str> {
         let state = self.state.borrow();
         let process_gone = !state.alive && !self.suspended.get();
-        state.running_turn
-            || state.mode == Mode::Bypass
-            || process_gone
-            || self.prompt_in_flight.get()
-            || self.starting.borrow().is_some()
-            || self.stopping.get()
-            || self.rebinding.get()
-            || self.delivering.get()
-            || self.dispatching_queue.get()
-            || self.queued_dispatch_pending.get()
-            || !self.queued_prompts.borrow().is_empty()
-            || !self.held_retries.borrow().is_empty()
-            || !self.open_approvals.borrow().is_empty()
-            || !self.codex_permissions.borrow().is_empty()
-            || !self.held_permissions.borrow().is_empty()
-            || self.pending_model.borrow().is_some()
-            || self.rollback.borrow().is_some()
-            || self.pending_handoff.borrow().is_some()
-            || self.handoff_in_flight.get()
+        let reasons = [
+            (state.running_turn, "a turn is running"),
+            (state.mode == Mode::Bypass, "dangerous permissive mode"),
+            (process_gone, "the agent process is gone"),
+            (self.prompt_in_flight.get(), "a prompt is in flight"),
+            (self.starting.borrow().is_some(), "the agent is starting"),
+            (self.stopping.get(), "the agent is stopping"),
+            (self.rebinding.get(), "a rebind is under way"),
+            (self.delivering.get(), "an event is being delivered"),
+            (self.dispatching_queue.get(), "the queue is being sent"),
+            (self.queued_dispatch_pending.get(), "the queue is due"),
+            (
+                !self.queued_prompts.borrow().is_empty(),
+                "prompts are queued",
+            ),
+            (
+                !self.held_retries.borrow().is_empty(),
+                "prompts wait for a retry",
+            ),
+            (
+                !self.open_approvals.borrow().is_empty(),
+                "an approval is open",
+            ),
+            (
+                !self.codex_permissions.borrow().is_empty(),
+                "a permission card is open",
+            ),
+            (
+                !self.held_permissions.borrow().is_empty(),
+                "a permission is being checked",
+            ),
+            (
+                self.pending_model.borrow().is_some(),
+                "a model change is pending",
+            ),
+            (self.rollback.borrow().is_some(), "a rollback is pending"),
+            (
+                self.pending_handoff.borrow().is_some(),
+                "a handoff waits for a prompt",
+            ),
+            (self.handoff_in_flight.get(), "a handoff is in flight"),
+        ];
+        reasons.into_iter().find_map(|(on, why)| on.then_some(why))
     }
 
     fn wake_with(self: &Rc<Self>, text: &str) -> WakeOutcome {
         use agent_core::delegation::wake::{capped_notice, decide, Decision, ParentState};
         let state = if self.child.is_some() || self.wakes_held.get() {
             ParentState::Stopped
+        } else if self.state.borrow().mode == Mode::Bypass {
+            ParentState::Unattended
         } else if self.wake_busy() {
             ParentState::Busy
         } else {
@@ -228,6 +299,7 @@ impl Inner {
         match decide(state, 1, self.auto_wakes.get()) {
             Decision::Nothing | Decision::Drop => WakeOutcome::Held,
             Decision::Hold => WakeOutcome::Busy,
+            Decision::HoldForUser => WakeOutcome::HeldForUser,
             Decision::NoticeOnly => {
                 self.emit(Envelope::new(Event::Notice {
                     text: capped_notice(text),
@@ -235,6 +307,48 @@ impl Inner {
                 WakeOutcome::Noticed
             }
             Decision::Wake => self.start_wake(text),
+        }
+    }
+
+    /// The sub-agent news held for the user ([`WakeOutcome::HeldForUser`]) that rides on the
+    /// user's own prompt `text`, in dangerous permissive mode only: never on a slash command (it
+    /// would stop being one) nor beside a `handoff`, which frames what rides with it as the
+    /// user's message. It waits for the next prompt then.
+    pub(super) fn news_for_prompt(&self, text: &str, handoff: bool) -> Option<TakenNews> {
+        if handoff
+            || self.child.is_some()
+            || self.state.borrow().mode != Mode::Bypass
+            || Self::is_slash_command(text)
+        {
+            return None;
+        }
+        let news = self.held_news.borrow().clone()?;
+        news.take()
+    }
+
+    /// The prompt carrying `news` was `sent`: the news is posted as the app's notice, as a wake
+    /// is. Not sent: it goes back to the supervisor, and no notice is left behind.
+    pub(super) fn settle_news(&self, news: Option<TakenNews>, sent: bool) {
+        let Some(news) = news else {
+            return;
+        };
+        if sent {
+            info!("the user's message carries its sub-agents' held news");
+            self.emit(Envelope::new(Event::Notice { text: news.text }));
+        } else {
+            (news.give_back)();
+        }
+    }
+
+    /// The agent confirmed `mode`: once it is out of dangerous permissive mode, news held for
+    /// the user is offered as an ordinary wake.
+    pub(super) fn wake_mode_changed(&self, mode: Mode) {
+        if mode == Mode::Bypass || self.child.is_some() {
+            return;
+        }
+        let news = self.held_news.borrow_mut().take();
+        if let Some(news) = news {
+            news.release();
         }
     }
 

@@ -40,7 +40,7 @@ mod codex_policy;
 mod delegated;
 mod reply_questions;
 
-pub(crate) use delegated::WakeOutcome;
+pub(crate) use delegated::{HeldNews, TakenNews, WakeOutcome};
 
 use super::{ChatBackend, EnvelopeSink, SessionStatus};
 use crate::agent_proc::{
@@ -427,6 +427,9 @@ struct Inner {
     auto_wakes: Cell<u32>,
     /// The user stopped this root: no sub-agent news wakes it until the user speaks again.
     wakes_held: Cell<bool>,
+    /// Sub-agent news the supervisor holds for the user while this root is in dangerous
+    /// permissive mode ([`delegated::HeldNews`]).
+    held_news: RefCell<Option<Rc<dyn delegated::HeldNews>>>,
 }
 
 /// What the session decided about one Codex permission request, keyed by the id the view knows
@@ -821,6 +824,7 @@ impl ChatSession {
             prompted: Cell::new(false),
             auto_wakes: Cell::new(0),
             wakes_held: Cell::new(false),
+            held_news: RefCell::new(None),
         });
         *inner.weak_self.borrow_mut() = Some(Rc::downgrade(&inner));
         inner.attach_approval();
@@ -1270,6 +1274,7 @@ impl Inner {
                 if let Some(hooks) = &self.hooks {
                     hooks.mode_changed(*mode);
                 }
+                self.wake_mode_changed(*mode);
             }
             Event::CommandsChanged { commands } => {
                 self.state.borrow_mut().commands = commands.clone();
@@ -3393,9 +3398,11 @@ impl Inner {
             .item(item.clone()),
         );
 
-        let sent = match &handoff {
-            Some(h) => provider_message_with_handoff(&h.summary, &h.fence, text),
-            None => text.to_owned(),
+        let news = self.news_for_prompt(text, handoff.is_some());
+        let sent = match (&handoff, &news) {
+            (Some(h), _) => provider_message_with_handoff(&h.summary, &h.fence, text),
+            (None, Some(news)) => agent_core::delegation::wake::with_user_prompt(&news.text, text),
+            (None, None) => text.to_owned(),
         };
         self.prompt_in_flight.set(true);
         let queued = QueuedPrompt {
@@ -3403,7 +3410,9 @@ impl Inner {
             text: text.to_owned(),
             stored,
         };
-        if self.dispatch_sent_prompt(&sent, handoff) {
+        let accepted = self.dispatch_sent_prompt(&sent, handoff);
+        self.settle_news(news, accepted);
+        if accepted {
             self.note_unspawned_prompt(queued);
         } else {
             self.hold_queued_prompt(queued);
@@ -3591,16 +3600,22 @@ impl Inner {
             } else {
                 self.pending_handoff.borrow().clone()
             };
-            let sent = match &handoff {
-                Some(h) => provider_message_with_handoff(&h.summary, &h.fence, &queued.text),
-                None => queued.text.clone(),
+            let news = self.news_for_prompt(&queued.text, handoff.is_some());
+            let sent = match (&handoff, &news) {
+                (Some(h), _) => provider_message_with_handoff(&h.summary, &h.fence, &queued.text),
+                (None, Some(news)) => {
+                    agent_core::delegation::wake::with_user_prompt(&news.text, &queued.text)
+                }
+                (None, None) => queued.text.clone(),
             };
             self.prompt_in_flight.set(true);
             let queued = QueuedPrompt {
                 stored: true,
                 ..queued
             };
-            if !self.dispatch_sent_prompt(&sent, handoff) {
+            let accepted = self.dispatch_sent_prompt(&sent, handoff);
+            self.settle_news(news, accepted);
+            if !accepted {
                 self.hold_queued_prompt(queued);
                 return;
             }

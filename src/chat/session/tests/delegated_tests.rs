@@ -1905,3 +1905,139 @@ fn a_refused_wake_posts_no_notice_and_its_retry_posts_one() {
         session.shutdown(false);
     });
 }
+
+/// The supervisor's held news, faked: what it gives, what was given back, and releases.
+#[derive(Default)]
+struct FakeNews {
+    text: Rc<RefCell<Option<String>>>,
+    taken: Cell<usize>,
+    given_back: Rc<Cell<usize>>,
+    released: Cell<usize>,
+}
+
+impl crate::chat::session::HeldNews for FakeNews {
+    fn take(&self) -> Option<crate::chat::session::TakenNews> {
+        let text = self.text.borrow_mut().take()?;
+        self.taken.set(self.taken.get() + 1);
+        let (slot, back) = (self.text.clone(), self.given_back.clone());
+        let kept = text.clone();
+        Some(crate::chat::session::TakenNews {
+            text,
+            give_back: Box::new(move || {
+                *slot.borrow_mut() = Some(kept);
+                back.set(back.get() + 1);
+            }),
+        })
+    }
+
+    fn release(&self) {
+        self.released.set(self.released.get() + 1);
+    }
+}
+
+/// Dangerous permissive mode never starts a turn nobody asked for: news offered to an idle root
+/// in it is held for the user (no prompt, no notice from the session), however often it is
+/// offered. The user's next message carries it, shown as the app's notice; a message that is
+/// not sent gives it back and leaves no notice; a slash command never carries it; leaving the
+/// mode releases it, and an ordinary wake then starts.
+#[test]
+fn a_root_in_dangerous_permissive_mode_takes_news_only_with_the_users_message() {
+    use crate::chat::session::WakeOutcome;
+    in_loop(|ctx| {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let thread = fresh(&store, &dir.path().to_string_lossy());
+        let (sink, seen) = make_sink();
+        let hooks = Rc::new(TestHooks::default());
+        let session = ChatSession::with_options(
+            Box::new(agent_core::claude::ClaudeAdapter::new()),
+            super::idle_claude(dir.path()),
+            SessionStore::from(store),
+            thread,
+            sink,
+            Err(None),
+            bare_env(dir.path()),
+            SessionOptions {
+                generation_base: ProcessGeneration(0),
+                hooks: Some(hooks.clone()),
+                child: None,
+            },
+        );
+        let prompts =
+            || std::fs::read_to_string(dir.path().join("prompts.log")).unwrap_or_default();
+        let notices = |needle: &str| {
+            seen.borrow()
+                .iter()
+                .filter(|e| matches!(&e.event, Event::Notice { text } if text.contains(needle)))
+                .count()
+        };
+        let idle = |s: &ChatSession| s.status().alive && !s.status().running_turn;
+        assert!(pump_until(ctx, 10, || has(&seen, |e| matches!(
+            e,
+            Event::TurnCompleted { .. }
+        )) && idle(&session)));
+
+        session.confirm_mode(Mode::Bypass);
+        assert_eq!(session.status().mode, Mode::Bypass);
+        for _ in 0..3 {
+            assert_eq!(session.wake_with("news held"), WakeOutcome::HeldForUser);
+        }
+        assert!(!session.status().running_turn);
+        assert!(!session.inner.prompt_in_flight.get());
+        assert_eq!(session.inner.auto_wakes.get(), 0);
+        assert_eq!(
+            notices("news held"),
+            0,
+            "the supervisor tells the thread, once"
+        );
+        assert!(!prompts().contains("news held"));
+
+        let news = Rc::new(FakeNews::default());
+        *news.text.borrow_mut() = Some("[agent-terminal] held news".into());
+        session.hold_news_for_user(news.clone());
+
+        // A slash command never carries it.
+        session.send_prompt("/hello");
+        assert_eq!(news.taken.get(), 0);
+        assert!(pump_until(ctx, 10, || idle(&session)));
+
+        // A message whose send is refused gives it back and leaves no notice.
+        hooks
+            .hold_after_check
+            .set(Some(hooks.prompt_checks.get() + 1));
+        session.send_prompt("first try");
+        assert_eq!(news.taken.get(), 1);
+        assert_eq!(news.given_back.get(), 1);
+        assert_eq!(notices("held news"), 0);
+        assert!(!prompts().contains("held news"));
+
+        // Sent from the queue once the send is allowed: it carries the news, and the thread
+        // shows the news as the app's notice, not as the user's message.
+        hooks.hold_after_check.set(None);
+        session.inner.dispatch_queued_prompt();
+        assert!(pump_until(ctx, 10, || prompts().contains("first try")));
+        let sent = prompts();
+        assert!(sent.contains("held news"), "{sent}");
+        assert!(sent.contains("The user's message follows."), "{sent}");
+        assert_eq!(news.taken.get(), 2);
+        assert_eq!(notices("held news"), 1);
+        assert!(!has(&seen, |e| matches!(
+            e,
+            Event::ContentSnapshot { text, .. } if text.contains("held news")
+        )));
+        assert!(pump_until(ctx, 10, || idle(&session)));
+
+        // Nothing waits now: the next message goes alone.
+        session.send_prompt("second");
+        assert!(pump_until(ctx, 10, || prompts().contains("second")));
+        assert_eq!(news.taken.get(), 2);
+        assert!(pump_until(ctx, 10, || idle(&session)));
+
+        // Leaving the mode releases the news to an ordinary wake.
+        session.confirm_mode(Mode::Ask);
+        assert_eq!(news.released.get(), 1);
+        assert_eq!(session.wake_with("news after"), WakeOutcome::Started);
+        assert!(pump_until(ctx, 10, || prompts().contains("news after")));
+        session.shutdown(false);
+    });
+}
