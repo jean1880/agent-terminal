@@ -1210,42 +1210,21 @@ pub(crate) fn masked_for_view(env: Envelope) -> Envelope {
 }
 
 fn spawn_accept_loop(weak: Weak<ServerInner>, listener: gio::SocketListener) {
-    glib::spawn_future_local(async move {
-        loop {
-            match listener.accept_future().await {
-                Ok((conn, _)) => {
-                    // The agent this connection came from is the one current now, at accept,
-                    // not whenever `serve` is first polled: an `expire_all` in between must
-                    // still be seen.
-                    let Some(generation) = weak.upgrade().map(|i| {
-                        #[cfg(test)]
-                        i.accepted.set(i.accepted.get() + 1);
-                        i.response_generation.get()
-                    }) else {
-                        deny(conn, "agent-terminal session closed");
-                        break;
-                    };
-                    glib::spawn_future_local(serve(weak.clone(), conn, generation));
-                }
-                Err(e)
-                    if e.matches(gio::IOErrorEnum::Closed)
-                        || e.matches(gio::IOErrorEnum::Cancelled) =>
-                {
-                    debug!("approval accept loop ended");
-                    break;
-                }
-                Err(e) => {
-                    // A transient failure (a client that vanished mid-accept, fd pressure)
-                    // must not leave the gate deaf: log and keep listening.
-                    warn!(error = %e.message(), "approval accept failed; continuing");
-                    glib::timeout_future(Duration::from_millis(100)).await;
-                    if weak.strong_count() == 0 {
-                        break;
-                    }
-                }
-            }
-        }
-    });
+    let serving = weak.clone();
+    crate::accept_loop::spawn_accept_loop(
+        "approval",
+        weak,
+        listener,
+        move |inner, conn| {
+            // The agent this connection came from is the one current now, at accept, not
+            // whenever `serve` is first polled: an `expire_all` in between must still be seen.
+            #[cfg(test)]
+            inner.accepted.set(inner.accepted.get() + 1);
+            let generation = inner.response_generation.get();
+            glib::spawn_future_local(serve(serving.clone(), conn, generation));
+        },
+        |conn| deny(conn, "agent-terminal session closed"),
+    );
 }
 
 /// Writes one reply line, then closes the connection. Never blocks, never panics.

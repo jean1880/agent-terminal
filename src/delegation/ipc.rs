@@ -13,7 +13,6 @@ use std::collections::BTreeMap;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
-use std::time::Duration;
 
 use agent_core::delegation::limits::{admit_connection, Usage};
 use agent_core::delegation::{Limits, ToolError};
@@ -233,33 +232,8 @@ impl Drop for IpcServer {
 }
 
 fn spawn_accept_loop(weak: Weak<IpcServer>, listener: gio::SocketListener) {
-    glib::spawn_future_local(async move {
-        loop {
-            match listener.accept_future().await {
-                Ok((io, _)) => {
-                    let Some(server) = weak.upgrade() else {
-                        conn::close_io(&io);
-                        break;
-                    };
-                    accept(&server, io);
-                }
-                Err(e)
-                    if e.matches(gio::IOErrorEnum::Closed)
-                        || e.matches(gio::IOErrorEnum::Cancelled) =>
-                {
-                    debug!("delegation accept loop ended");
-                    break;
-                }
-                Err(e) => {
-                    // A client that vanished mid-accept, or fd pressure: keep listening.
-                    warn!(error = %e.message(), "delegation accept failed; continuing");
-                    glib::timeout_future(Duration::from_millis(100)).await;
-                    if weak.strong_count() == 0 {
-                        break;
-                    }
-                }
-            }
-        }
+    crate::accept_loop::spawn_accept_loop("delegation", weak, listener, accept, |io| {
+        conn::close_io(&io)
     });
 }
 

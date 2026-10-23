@@ -10,6 +10,7 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt, EnvFilter};
 
+mod accept_loop;
 mod account_status;
 mod agent_home;
 mod agent_proc;
