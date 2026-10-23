@@ -891,8 +891,7 @@ impl ChatSession {
 
     /// Adds a notice to the thread (stored and shown like any event).
     pub fn note(&self, text: impl Into<String>) {
-        self.inner
-            .emit(Envelope::new(Event::Notice { text: text.into() }));
+        self.inner.notice(text);
     }
 
     /// Stops the agent on purpose and closes the thread's history out: open items end
@@ -1002,10 +1001,36 @@ impl Inner {
 
     fn hookless_notice(&self) {
         let text = hookless_text(self.unbound.borrow().as_deref());
-        self.emit(Envelope::new(Event::Notice { text }));
+        self.notice(text);
     }
 
     // ---- events ----
+
+    /// Emits a [`Event::Notice`] reading `text`.
+    fn notice(&self, text: impl Into<String>) {
+        self.emit(Envelope::new(Event::Notice { text: text.into() }));
+    }
+
+    /// Refuses a mode change: says why in `text`, and puts the picker back on the running mode.
+    /// `stored: false` only shows both (a suspended thread, whose history the refusal is not).
+    fn refuse_mode(&self, text: &str, stored: bool) {
+        let notice = Envelope::new(Event::Notice {
+            text: text.to_owned(),
+        });
+        if stored {
+            self.emit(notice);
+        } else {
+            self.deliver(&notice);
+        }
+        let current = Envelope::new(Event::ModeChanged {
+            mode: self.state.borrow().mode,
+        });
+        if stored {
+            self.emit(current);
+        } else {
+            self.deliver(&current);
+        }
+    }
 
     /// Persists (under the current provider thread), updates the status, then delivers.
     fn emit(&self, env: Envelope) {
@@ -1616,7 +1641,7 @@ impl Inner {
             self.emit(Envelope::new(Event::ModeChanged { mode }));
         }
         if self.generation.get() == generation {
-            self.emit(Envelope::new(Event::Notice { text }));
+            self.notice(text);
         }
     }
 
@@ -2276,7 +2301,7 @@ impl Inner {
             Err(notice) => {
                 warn!("approval rules file unusable; saved rules are off");
                 if !self.rules_blocked_noticed.replace(true) {
-                    self.emit(Envelope::new(Event::Notice { text: notice }));
+                    self.notice(notice);
                 }
                 false
             }
@@ -2505,9 +2530,7 @@ impl Inner {
                 })
                 .request(request),
             );
-            self.emit(Envelope::new(Event::Notice {
-                text: "A permission request got no answer in time and was denied.".to_owned(),
-            }));
+            self.notice("A permission request got no answer in time and was denied.");
         }
     }
 
@@ -2594,9 +2617,7 @@ impl Inner {
                     Ok(Err(e)) => {
                         warn!(error = %e, "always-allow rule not saved");
                         inner.rules_blocked_noticed.set(true);
-                        inner.emit(Envelope::new(Event::Notice {
-                            text: crate::always_allow::blocked_notice(&path, &e),
-                        }));
+                        inner.notice(crate::always_allow::blocked_notice(&path, &e));
                     }
                     Err(_) => warn!("the always-allow save worker panicked"),
                 }
@@ -3211,9 +3232,7 @@ impl Inner {
             retired.replacement.effort.clone(),
         );
         let generation = self.generation.get();
-        self.emit(Envelope::new(Event::Notice {
-            text: retired_notice(&retired),
-        }));
+        self.notice(retired_notice(&retired));
         generation == self.generation.get()
     }
 
@@ -3744,16 +3763,14 @@ impl Inner {
         match plan {
             Some(Ok((rule, warnings))) => {
                 if let Some(text) = crate::always_allow::kept_with_warnings(&rule, &warnings) {
-                    self.emit(Envelope::new(Event::Notice { text }));
+                    self.notice(text);
                 }
                 self.keep_rule(rule, decision);
             }
-            Some(Err(why)) => self.emit(Envelope::new(Event::Notice {
-                text: format!("Allowed once; no rule was kept: {why}."),
-            })),
-            None if saved_rules_off => self.emit(Envelope::new(Event::Notice {
-                text: crate::always_allow::ALLOWED_ONCE_SAVED_RULES_OFF.to_owned(),
-            })),
+            Some(Err(why)) => self.notice(format!("Allowed once; no rule was kept: {why}.")),
+            None if saved_rules_off => {
+                self.notice(crate::always_allow::ALLOWED_ONCE_SAVED_RULES_OFF.to_owned())
+            }
             None => {}
         }
         self.emit(Envelope::new(Event::ApprovalResolved { decision }).request(request));
@@ -3774,49 +3791,42 @@ impl Inner {
         // mode, whoever asks.
         if let Some(child) = &self.child {
             if !mode_within(mode, child.mode) {
-                self.emit(Envelope::new(Event::Notice {
-                    text: format!(
+                self.refuse_mode(
+                    &format!(
                         "This delegated agent cannot leave its task's mode ({}); it stays in its \
                          current mode.",
                         mode_label(child.mode)
                     ),
-                }));
-                let current = self.state.borrow().mode;
-                self.emit(Envelope::new(Event::ModeChanged { mode: current }));
+                    true,
+                );
                 return;
             }
         }
         // Dangerous permissive agy is its hook allowing everything: with no hook, there is
         // nothing to approve through, and the flag is never passed any other way.
         if mode == Mode::Bypass && self.ask_unavailable() {
-            self.emit(Envelope::new(Event::Notice {
-                text: "Antigravity cannot run in dangerous permissive mode until the approval \
-                       hook is installed; it stays in its current mode."
-                    .to_owned(),
-            }));
-            let current = self.state.borrow().mode;
-            self.emit(Envelope::new(Event::ModeChanged { mode: current }));
+            self.refuse_mode(
+                "Antigravity cannot run in dangerous permissive mode until the approval hook is \
+                 installed; it stays in its current mode.",
+                true,
+            );
             return;
         }
         if self.ask_unavailable() {
             if mode == Mode::Ask {
                 self.choose_mode(mode);
-                self.emit(Envelope::new(Event::Notice {
-                    text:
-                        "Antigravity cannot ask before edits until the approval hook is installed; \
-                           it stays in its current mode."
-                            .to_owned(),
-                }));
                 // The picker shows the mode actually running.
-                let current = self.state.borrow().mode;
-                self.emit(Envelope::new(Event::ModeChanged { mode: current }));
+                self.refuse_mode(
+                    "Antigravity cannot ask before edits until the approval hook is installed; \
+                     it stays in its current mode.",
+                    true,
+                );
                 return;
             } else if mode == Mode::Plan {
-                self.emit(Envelope::new(Event::Notice {
-                    text: "Antigravity Plan mode refuses shell commands, but may still edit files \
-                           on disk without the approval hook installed."
-                        .to_owned(),
-                }));
+                self.notice(
+                    "Antigravity Plan mode refuses shell commands, but may still edit files on \
+                     disk without the approval hook installed.",
+                );
             }
         }
         // Suspended: there is no process to tell. The mode is kept for the resume, which starts
@@ -3824,13 +3834,11 @@ impl Inner {
         // mode: it is entered on a running agent only, through its own path.
         if self.suspended.get() {
             if mode == Mode::Bypass {
-                self.deliver(&Envelope::new(Event::Notice {
-                    text: "The agent is paused to save memory; send a message to resume it \
-                           before choosing dangerous permissive mode."
-                        .to_owned(),
-                }));
-                let current = self.state.borrow().mode;
-                self.deliver(&Envelope::new(Event::ModeChanged { mode: current }));
+                self.refuse_mode(
+                    "The agent is paused to save memory; send a message to resume it before \
+                     choosing dangerous permissive mode.",
+                    false,
+                );
                 return;
             }
             self.choose_mode(mode);
@@ -4290,7 +4298,7 @@ impl Inner {
             self.handoff_in_flight.set(false);
             *self.pending_handoff.borrow_mut() = None;
         }
-        self.emit(Envelope::new(Event::Notice { text }));
+        self.notice(text);
         if let Some(m) = model {
             self.state.borrow_mut().model = None;
             self.prepare_model_change(m.clone(), effort.clone(), true);
@@ -4331,13 +4339,11 @@ impl Inner {
         // Dangerous permissive mode ends with the agent it was entered on.
         if self.wanted_mode.get() == Mode::Bypass {
             self.wanted_mode.set(self.safe_mode.get());
-            self.emit(Envelope::new(Event::Notice {
-                text: format!(
-                    "Dangerous permissive mode has ended: it lasts for one agent session, so {} \
+            self.notice(format!(
+                "Dangerous permissive mode has ended: it lasts for one agent session, so {} \
                      starts in your previous mode.",
-                    driver_label(driver)
-                ),
-            }));
+                driver_label(driver)
+            ));
         }
         let hookless_agy = driver == Driver::Agy && self.approval().is_none();
         let new_mode = effective_mode(hookless_agy, self.wanted_mode.get());
@@ -4621,11 +4627,10 @@ impl Inner {
         let card = self.codex_permissions.borrow().get(shown).cloned();
         if let Some(card) = card.filter(|c| c.allow) {
             if card.round >= 3 {
-                self.emit(Envelope::new(Event::Notice {
-                    text: "This permission request changed repeatedly; review its latest card \
-                           and answer it explicitly."
-                        .to_owned(),
-                }));
+                self.notice(
+                    "This permission request changed repeatedly; review its latest card \
+                           and answer it explicitly.",
+                );
                 return;
             }
             self.respond_codex_permissions(shown, Decision::Allow, &card, true);
@@ -4802,7 +4807,7 @@ impl Inner {
             _ => None,
         };
         if let Some(text) = refusal {
-            self.emit(Envelope::new(Event::Notice { text }));
+            self.notice(text);
             return;
         }
         if !matches!(decision, Decision::Allow | Decision::AllowForSession) {
@@ -4911,13 +4916,11 @@ impl Inner {
             self.codex_grant_paths
                 .borrow_mut()
                 .extend(card.verdict.writes.iter().cloned());
-            self.emit(Envelope::new(Event::Notice {
-                text: format!(
-                    "Codex has extra access for this session: {}. It lasts until this thread's \
+            self.notice(format!(
+                "Codex has extra access for this session: {}. It lasts until this thread's \
                      Codex session restarts.",
-                    card.summary
-                ),
-            }));
+                card.summary
+            ));
         }
         self.emit(Envelope::new(Event::ApprovalResolved { decision }).request(shown));
     }
@@ -4949,13 +4952,11 @@ impl Inner {
         if grants.is_empty() {
             return;
         }
-        self.emit(Envelope::new(Event::Notice {
-            text: format!(
-                "The extra access Codex was allowed for this session still applies in the new \
+        self.notice(format!(
+            "The extra access Codex was allowed for this session still applies in the new \
                  mode until this thread's Codex session restarts: {}.",
-                grants.join("; ")
-            ),
-        }));
+            grants.join("; ")
+        ));
     }
 
     /// Declines, before it is shown, a Codex form whose link or field names masking would change
@@ -5001,7 +5002,7 @@ impl Inner {
             action: agent_core::form::FormAction::Decline,
             content: None,
         });
-        self.emit(Envelope::new(Event::Notice { text }));
+        self.notice(text);
         None
     }
 }
@@ -5143,9 +5144,7 @@ impl Inner {
                 .request(request),
             );
         }
-        self.emit(Envelope::new(Event::Notice {
-            text: format!("Denied without asking: {reason}."),
-        }));
+        self.notice(format!("Denied without asking: {reason}."));
     }
 }
 
