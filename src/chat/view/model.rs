@@ -1358,59 +1358,68 @@ impl Transcript {
 
     /// The user answered an approval card; it shows as sent until the agent confirms.
     pub fn mark_approval_sent(&mut self, request: &str, decision: Decision) -> Vec<Change> {
-        let Some(id) = self.requests.get(request).cloned() else {
-            return Vec::new();
-        };
-        match self.items.get_mut(&id).map(|i| &mut i.body) {
-            Some(Body::Approval(a)) if a.state == ApprovalState::Pending => {
+        self.update_requested(Some(request), |body| match body {
+            Body::Approval(a) if a.state == ApprovalState::Pending => {
                 a.state = ApprovalState::Sent(decision);
-                vec![Change::Updated(id)]
+                true
             }
-            _ => Vec::new(),
-        }
+            _ => false,
+        })
     }
 
     pub fn mark_questions_sent(&mut self, request: &str) -> Vec<Change> {
-        let Some(id) = self.requests.get(request).cloned() else {
-            return Vec::new();
-        };
-        match self.items.get_mut(&id).map(|i| &mut i.body) {
-            Some(Body::Question(q)) if q.state == QuestionState::Pending => {
+        self.update_requested(Some(request), |body| match body {
+            Body::Question(q) if q.state == QuestionState::Pending => {
                 q.state = QuestionState::Sent;
-                vec![Change::Updated(id)]
+                true
             }
-            _ => Vec::new(),
-        }
+            _ => false,
+        })
     }
 
     /// The user submitted or declined a form card; it shows as sent until the agent confirms.
     pub fn mark_form_sent(&mut self, request: &str) -> Vec<Change> {
-        let Some(id) = self.requests.get(request).cloned() else {
-            return Vec::new();
-        };
-        match self.items.get_mut(&id).map(|i| &mut i.body) {
-            Some(Body::Form(f)) if f.state == FormState::Pending => {
+        self.update_requested(Some(request), |body| match body {
+            Body::Form(f) if f.state == FormState::Pending => {
                 f.state = FormState::Sent;
                 f.refused = false;
-                vec![Change::Updated(id)]
+                true
             }
-            _ => Vec::new(),
-        }
+            _ => false,
+        })
     }
 
     /// The agent did not accept the answer just sent: the card is answerable again, with a line
     /// saying so. Does nothing once the form was resolved some other way meanwhile.
     pub fn mark_form_refused(&mut self, request: &str) -> Vec<Change> {
-        let Some(id) = self.requests.get(request).cloned() else {
-            return Vec::new();
-        };
-        match self.items.get_mut(&id).map(|i| &mut i.body) {
-            Some(Body::Form(f)) if f.state == FormState::Sent => {
+        self.update_requested(Some(request), |body| match body {
+            Body::Form(f) if f.state == FormState::Sent => {
                 f.state = FormState::Pending;
                 f.refused = true;
-                vec![Change::Updated(id)]
+                true
             }
-            _ => Vec::new(),
+            _ => false,
+        })
+    }
+
+    /// Applies `f` to the body of the item `request` belongs to: `Updated` when `f` says it
+    /// changed it, nothing for an unknown request.
+    fn update_requested(
+        &mut self,
+        request: Option<&str>,
+        f: impl FnOnce(&mut Body) -> bool,
+    ) -> Vec<Change> {
+        let Some(id) = request.and_then(|r| self.requests.get(r)).cloned() else {
+            return Vec::new();
+        };
+        let changed = self
+            .items
+            .get_mut(&id)
+            .is_some_and(|item| f(&mut item.body));
+        if changed {
+            vec![Change::Updated(id)]
+        } else {
+            Vec::new()
         }
     }
 
@@ -1504,16 +1513,8 @@ impl Transcript {
     /// Claude reports any request it drops: `ApprovalResolved { Cancel }`). `expired`: nothing
     /// can answer it now. Questions already answered keep their state.
     fn withdraw_question(&mut self, env: &Envelope, expired: bool) -> Vec<Change> {
-        let Some(id) = env
-            .request
-            .as_ref()
-            .and_then(|r| self.requests.get(r))
-            .cloned()
-        else {
-            return Vec::new();
-        };
-        match self.items.get_mut(&id).map(|i| &mut i.body) {
-            Some(Body::Question(q))
+        self.update_requested(env.request.as_deref(), |body| match body {
+            Body::Question(q)
                 if matches!(q.state, QuestionState::Pending | QuestionState::Sent) =>
             {
                 q.state = if expired {
@@ -1521,10 +1522,10 @@ impl Transcript {
                 } else {
                     QuestionState::Withdrawn
                 };
-                vec![Change::Updated(id)]
+                true
             }
-            _ => Vec::new(),
-        }
+            _ => false,
+        })
     }
 
     /// Marks every finished reasoning block loaded from history as Replayed (it did not come
@@ -1998,21 +1999,19 @@ impl Transcript {
                 out.push(Change::Added(self.insert(id, body, None)));
             }
             Event::QuestionResolved { answered } => {
-                let target = env
-                    .request
-                    .as_ref()
-                    .and_then(|r| self.requests.get(r))
-                    .cloned();
-                if let Some(id) = target {
-                    if let Some(Body::Question(q)) = self.items.get_mut(&id).map(|i| &mut i.body) {
-                        q.state = if *answered {
-                            QuestionState::Answered
-                        } else {
-                            QuestionState::Withdrawn
-                        };
-                        out.push(Change::Updated(id));
-                    }
-                }
+                out.extend(
+                    self.update_requested(env.request.as_deref(), |body| match body {
+                        Body::Question(q) => {
+                            q.state = if *answered {
+                                QuestionState::Answered
+                            } else {
+                                QuestionState::Withdrawn
+                            };
+                            true
+                        }
+                        _ => false,
+                    }),
+                );
             }
             Event::ModeChanged { mode } => {
                 self.mode = Some(*mode);
@@ -2361,21 +2360,13 @@ impl Transcript {
     }
 
     fn update_approval(&mut self, env: &Envelope, f: impl FnOnce(&mut Approval)) -> Vec<Change> {
-        let Some(id) = env
-            .request
-            .as_ref()
-            .and_then(|r| self.requests.get(r))
-            .cloned()
-        else {
-            return Vec::new();
-        };
-        match self.items.get_mut(&id).map(|i| &mut i.body) {
-            Some(Body::Approval(a)) => {
+        self.update_requested(env.request.as_deref(), |body| match body {
+            Body::Approval(a) => {
                 f(a);
-                vec![Change::Updated(id)]
+                true
             }
-            _ => Vec::new(),
-        }
+            _ => false,
+        })
     }
 }
 
