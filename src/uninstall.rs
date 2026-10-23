@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use agent_core::adapter::Driver;
+use agent_kit::fsutil::effective_uid;
 use agent_kit::uninstall::{self, Elevation, Install, Plan, Report};
 use gtk4::{gio, glib};
 use tracing::{info, warn};
@@ -330,11 +331,6 @@ pub fn inputs() -> uninstall::Inputs {
         uid: effective_uid(),
         home,
     }
-}
-
-fn effective_uid() -> u32 {
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    unsafe { libc::geteuid() }
 }
 
 /// Settings confirmed an uninstall: done by [`after_quit`] once every window has closed.
