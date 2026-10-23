@@ -199,6 +199,8 @@ pub struct Tool {
     pub output: String,
     pub error: Option<String>,
     pub status: ToolStatus,
+    /// A sub-agent's model as its provider reported it ([`Event::SubagentModel`]).
+    pub reported_model: Option<String>,
 }
 
 /// One sub-agent, as the explorer lists it.
@@ -223,9 +225,20 @@ pub struct SubagentSummary {
     /// `Agent` input, a shell launch's `--model`): requested, never confirmed by the provider.
     pub requested_model: Option<String>,
     pub requested_effort: Option<String>,
+    /// The model the provider says the sub-agent runs on, once it has said so.
+    pub reported_model: Option<String>,
 }
 
 impl SubagentSummary {
+    /// What it was asked to do, or a line saying it did not say.
+    pub fn task_text(&self) -> &str {
+        if self.task.is_empty() {
+            "No task reported"
+        } else {
+            &self.task
+        }
+    }
+
     pub fn active(&self) -> bool {
         match self.lifecycle {
             Some(state) => matches!(
@@ -306,6 +319,7 @@ impl SubagentSummary {
             delegation: None,
             requested_model: launch.model,
             requested_effort: None,
+            reported_model: tool.reported_model.clone(),
         })
     }
 
@@ -353,6 +367,7 @@ impl SubagentSummary {
                 .and_then(|value| serde_json::from_value(value.clone()).ok()),
             requested_model: field("model"),
             requested_effort: field("effort"),
+            reported_model: tool.reported_model.clone(),
         }
     }
 }
@@ -1186,6 +1201,7 @@ impl Transcript {
                 },
                 error: None,
                 status,
+                reported_model: None,
             };
             if let Some(item) = self.items.get_mut(&id) {
                 item.body = Body::Tool(tool);
@@ -1351,59 +1367,68 @@ impl Transcript {
 
     /// The user answered an approval card; it shows as sent until the agent confirms.
     pub fn mark_approval_sent(&mut self, request: &str, decision: Decision) -> Vec<Change> {
-        let Some(id) = self.requests.get(request).cloned() else {
-            return Vec::new();
-        };
-        match self.items.get_mut(&id).map(|i| &mut i.body) {
-            Some(Body::Approval(a)) if a.state == ApprovalState::Pending => {
+        self.update_requested(Some(request), |body| match body {
+            Body::Approval(a) if a.state == ApprovalState::Pending => {
                 a.state = ApprovalState::Sent(decision);
-                vec![Change::Updated(id)]
+                true
             }
-            _ => Vec::new(),
-        }
+            _ => false,
+        })
     }
 
     pub fn mark_questions_sent(&mut self, request: &str) -> Vec<Change> {
-        let Some(id) = self.requests.get(request).cloned() else {
-            return Vec::new();
-        };
-        match self.items.get_mut(&id).map(|i| &mut i.body) {
-            Some(Body::Question(q)) if q.state == QuestionState::Pending => {
+        self.update_requested(Some(request), |body| match body {
+            Body::Question(q) if q.state == QuestionState::Pending => {
                 q.state = QuestionState::Sent;
-                vec![Change::Updated(id)]
+                true
             }
-            _ => Vec::new(),
-        }
+            _ => false,
+        })
     }
 
     /// The user submitted or declined a form card; it shows as sent until the agent confirms.
     pub fn mark_form_sent(&mut self, request: &str) -> Vec<Change> {
-        let Some(id) = self.requests.get(request).cloned() else {
-            return Vec::new();
-        };
-        match self.items.get_mut(&id).map(|i| &mut i.body) {
-            Some(Body::Form(f)) if f.state == FormState::Pending => {
+        self.update_requested(Some(request), |body| match body {
+            Body::Form(f) if f.state == FormState::Pending => {
                 f.state = FormState::Sent;
                 f.refused = false;
-                vec![Change::Updated(id)]
+                true
             }
-            _ => Vec::new(),
-        }
+            _ => false,
+        })
     }
 
     /// The agent did not accept the answer just sent: the card is answerable again, with a line
     /// saying so. Does nothing once the form was resolved some other way meanwhile.
     pub fn mark_form_refused(&mut self, request: &str) -> Vec<Change> {
-        let Some(id) = self.requests.get(request).cloned() else {
-            return Vec::new();
-        };
-        match self.items.get_mut(&id).map(|i| &mut i.body) {
-            Some(Body::Form(f)) if f.state == FormState::Sent => {
+        self.update_requested(Some(request), |body| match body {
+            Body::Form(f) if f.state == FormState::Sent => {
                 f.state = FormState::Pending;
                 f.refused = true;
-                vec![Change::Updated(id)]
+                true
             }
-            _ => Vec::new(),
+            _ => false,
+        })
+    }
+
+    /// Applies `f` to the body of the item `request` belongs to: `Updated` when `f` says it
+    /// changed it, nothing for an unknown request.
+    fn update_requested(
+        &mut self,
+        request: Option<&str>,
+        f: impl FnOnce(&mut Body) -> bool,
+    ) -> Vec<Change> {
+        let Some(id) = request.and_then(|r| self.requests.get(r)).cloned() else {
+            return Vec::new();
+        };
+        let changed = self
+            .items
+            .get_mut(&id)
+            .is_some_and(|item| f(&mut item.body));
+        if changed {
+            vec![Change::Updated(id)]
+        } else {
+            Vec::new()
         }
     }
 
@@ -1497,16 +1522,8 @@ impl Transcript {
     /// Claude reports any request it drops: `ApprovalResolved { Cancel }`). `expired`: nothing
     /// can answer it now. Questions already answered keep their state.
     fn withdraw_question(&mut self, env: &Envelope, expired: bool) -> Vec<Change> {
-        let Some(id) = env
-            .request
-            .as_ref()
-            .and_then(|r| self.requests.get(r))
-            .cloned()
-        else {
-            return Vec::new();
-        };
-        match self.items.get_mut(&id).map(|i| &mut i.body) {
-            Some(Body::Question(q))
+        self.update_requested(env.request.as_deref(), |body| match body {
+            Body::Question(q)
                 if matches!(q.state, QuestionState::Pending | QuestionState::Sent) =>
             {
                 q.state = if expired {
@@ -1514,10 +1531,10 @@ impl Transcript {
                 } else {
                     QuestionState::Withdrawn
                 };
-                vec![Change::Updated(id)]
+                true
             }
-            _ => Vec::new(),
-        }
+            _ => false,
+        })
     }
 
     /// Marks every finished reasoning block loaded from history as Replayed (it did not come
@@ -1783,12 +1800,26 @@ impl Transcript {
                         output: String::new(),
                         error: None,
                         status: ToolStatus::Running,
+                        reported_model: None,
                     }),
                 };
                 if matches!(kind, ItemKind::AssistantMessage | ItemKind::Reasoning) {
                     self.open_text = Some(id.clone());
                 }
                 out.push(Change::Added(self.insert(id, body, parent.clone())));
+            }
+            Event::SubagentModel { model } => {
+                let Some(id) = env.item.clone() else {
+                    return out;
+                };
+                if let Some(Body::Tool(tool)) = self.items.get_mut(&id).map(|item| &mut item.body) {
+                    if tool.kind == ItemKind::Subagent
+                        && tool.reported_model.as_deref() != Some(model.as_str())
+                    {
+                        tool.reported_model = Some(model.clone());
+                        out.push(Change::Updated(id));
+                    }
+                }
             }
             Event::ContentDelta { stream, text } => {
                 let id = self.text_target(env, *stream, driver, &mut out);
@@ -1977,21 +2008,19 @@ impl Transcript {
                 out.push(Change::Added(self.insert(id, body, None)));
             }
             Event::QuestionResolved { answered } => {
-                let target = env
-                    .request
-                    .as_ref()
-                    .and_then(|r| self.requests.get(r))
-                    .cloned();
-                if let Some(id) = target {
-                    if let Some(Body::Question(q)) = self.items.get_mut(&id).map(|i| &mut i.body) {
-                        q.state = if *answered {
-                            QuestionState::Answered
-                        } else {
-                            QuestionState::Withdrawn
-                        };
-                        out.push(Change::Updated(id));
-                    }
-                }
+                out.extend(
+                    self.update_requested(env.request.as_deref(), |body| match body {
+                        Body::Question(q) => {
+                            q.state = if *answered {
+                                QuestionState::Answered
+                            } else {
+                                QuestionState::Withdrawn
+                            };
+                            true
+                        }
+                        _ => false,
+                    }),
+                );
             }
             Event::ModeChanged { mode } => {
                 self.mode = Some(*mode);
@@ -2340,21 +2369,13 @@ impl Transcript {
     }
 
     fn update_approval(&mut self, env: &Envelope, f: impl FnOnce(&mut Approval)) -> Vec<Change> {
-        let Some(id) = env
-            .request
-            .as_ref()
-            .and_then(|r| self.requests.get(r))
-            .cloned()
-        else {
-            return Vec::new();
-        };
-        match self.items.get_mut(&id).map(|i| &mut i.body) {
-            Some(Body::Approval(a)) => {
+        self.update_requested(env.request.as_deref(), |body| match body {
+            Body::Approval(a) => {
                 f(a);
-                vec![Change::Updated(id)]
+                true
             }
-            _ => Vec::new(),
-        }
+            _ => false,
+        })
     }
 }
 
@@ -2737,12 +2758,7 @@ mod tests {
     }
 
     fn finish_turn(state: TurnState) -> Envelope {
-        ev(Event::TurnCompleted {
-            state,
-            usage: None,
-            cost_usd: None,
-            error: None,
-        })
+        Envelope::turn_completed(state, None)
     }
 
     fn plans(t: &Transcript) -> Vec<(&[PlanStep], Option<TurnState>)> {
@@ -3271,13 +3287,7 @@ mod tests {
     }
 
     fn started(id: &str, kind: ItemKind, parent: Option<&str>) -> Envelope {
-        Envelope::new(Event::ItemStarted {
-            kind,
-            title: format!("title {id}"),
-            input: None,
-            parent: parent.map(str::to_owned),
-        })
-        .item(id)
+        Envelope::item_started(id, kind, format!("title {id}"), None, parent)
     }
 
     fn delta(id: Option<&str>, stream: StreamKind, text: &str) -> Envelope {
@@ -3313,11 +3323,7 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         };
         assert_eq!(text(&t), "Hello");
-        let snap = Envelope::new(Event::ContentSnapshot {
-            stream: StreamKind::Assistant,
-            text: "Hello, world".into(),
-        })
-        .item("m1");
+        let snap = Envelope::snapshot("m1", StreamKind::Assistant, "Hello, world");
         t.apply(&snap, Driver::Claude);
         assert_eq!(text(&t), "Hello, world");
         // An identical snapshot is not a change.
@@ -3352,13 +3358,7 @@ mod tests {
     fn the_explorer_lists_every_subagent_in_order_with_its_task_and_steps() {
         let mut t = Transcript::new();
         let task = |id: &str, parent: Option<&str>, input: serde_json::Value| {
-            Envelope::new(Event::ItemStarted {
-                kind: ItemKind::Subagent,
-                title: "Task".into(),
-                input: Some(input),
-                parent: parent.map(str::to_owned),
-            })
-            .item(id)
+            Envelope::item_started(id, ItemKind::Subagent, "Task", Some(input), parent)
         };
         t.apply(&started("u", ItemKind::UserMessage, None), Driver::Claude);
         t.apply(
@@ -3397,6 +3397,44 @@ mod tests {
         assert_eq!(list[0].requested_effort.as_deref(), Some("high"));
         assert_eq!(list[1].requested_model, None, "none asked for: none shown");
         assert_eq!(list[1].requested_effort, None);
+        assert_eq!(list[0].reported_model, None, "nothing reported yet");
+    }
+
+    #[test]
+    fn a_subagent_keeps_the_model_its_provider_reported() {
+        let mut t = Transcript::new();
+        t.apply(&started("a", ItemKind::Subagent, None), Driver::Claude);
+        t.apply(&started("b", ItemKind::Subagent, Some("a")), Driver::Claude);
+        t.apply(&started("c", ItemKind::Command, None), Driver::Claude);
+        let report = |id: &str, model: &str| {
+            Envelope::new(Event::SubagentModel {
+                model: model.into(),
+            })
+            .item(id)
+        };
+        assert_eq!(
+            t.apply(&report("b", "claude-haiku-5-5"), Driver::Claude),
+            [Change::Updated("b".into())]
+        );
+        assert!(
+            t.apply(&report("b", "claude-haiku-5-5"), Driver::Claude)
+                .is_empty(),
+            "the same model again changes nothing"
+        );
+        // Not a sub-agent, or no such item: ignored.
+        assert!(t.apply(&report("c", "m"), Driver::Claude).is_empty());
+        assert!(t.apply(&report("gone", "m"), Driver::Claude).is_empty());
+        let list = t.subagents();
+        assert_eq!(list[0].reported_model, None);
+        assert_eq!(list[1].reported_model.as_deref(), Some("claude-haiku-5-5"));
+        assert_eq!(
+            t.apply(&report("b", "claude-sonnet-5-5"), Driver::Claude),
+            [Change::Updated("b".into())]
+        );
+        assert_eq!(
+            t.subagents()[1].reported_model.as_deref(),
+            Some("claude-sonnet-5-5")
+        );
     }
 
     #[test]
@@ -3460,12 +3498,7 @@ mod tests {
         assert!(t.running_drivers(Vec::new()).is_empty());
         t.apply(&started("task", ItemKind::Subagent, None), Driver::Claude);
         assert_eq!(t.running_drivers(Vec::new()), [Driver::Claude]);
-        let done = Envelope::new(Event::ItemCompleted {
-            status: ItemStatus::Completed,
-            output: None,
-            error: None,
-        })
-        .item("task");
+        let done = Envelope::item_completed("task", ItemStatus::Completed, None, None);
         t.apply(&done, Driver::Claude);
         assert!(t.running_drivers(Vec::new()).is_empty());
     }
@@ -3477,13 +3510,13 @@ mod tests {
         let mut t = Transcript::new();
         t.apply(&ev(Event::TurnStarted { model: None }), Driver::Claude);
         let command = |id: &str, line: &str| {
-            Envelope::new(Event::ItemStarted {
-                kind: ItemKind::Command,
-                title: "Bash".into(),
-                input: Some(serde_json::json!({ "command": line })),
-                parent: None,
-            })
-            .item(id)
+            Envelope::item_started(
+                id,
+                ItemKind::Command,
+                "Bash",
+                Some(serde_json::json!({ "command": line })),
+                None,
+            )
         };
         t.apply(&command("ls", "ls -la"), Driver::Claude);
         assert!(t.subagents().is_empty());
@@ -3497,12 +3530,7 @@ mod tests {
         assert_eq!(agents[0].name, "Antigravity · gemini-4-argon (shell)");
         assert_eq!(agents[0].task, "Review the diff");
         assert_eq!(t.running_drivers(Vec::new()), [Driver::Agy]);
-        let done = Envelope::new(Event::ItemCompleted {
-            status: ItemStatus::Completed,
-            output: Some("Looks good.".into()),
-            error: None,
-        })
-        .item("x");
+        let done = Envelope::item_completed("x", ItemStatus::Completed, Some("Looks good."), None);
         t.apply(&done, Driver::Claude);
         assert!(t.running_drivers(Vec::new()).is_empty());
         assert_eq!(t.subagents()[0].status, ToolStatus::Completed);
@@ -3516,12 +3544,7 @@ mod tests {
             &delta(Some("c1"), StreamKind::ToolInput, "{\"command\":"),
             Driver::Claude,
         );
-        let done = Envelope::new(Event::ItemCompleted {
-            status: ItemStatus::Failed,
-            output: Some("boom".into()),
-            error: Some("exit 1".into()),
-        })
-        .item("c1");
+        let done = Envelope::item_completed("c1", ItemStatus::Failed, Some("boom"), Some("exit 1"));
         t.apply(&done, Driver::Claude);
         let item = t.get("c1").expect("c1");
         assert!(item.expanded);
@@ -3537,21 +3560,15 @@ mod tests {
     #[test]
     fn repeated_tool_start_refines_metadata_without_adding_another_card() {
         let mut t = Transcript::new();
-        let pending = Envelope::new(Event::ItemStarted {
-            kind: ItemKind::WebSearch,
-            title: "web search".into(),
-            input: None,
-            parent: None,
-        })
-        .item("ws");
+        let pending = Envelope::item_started("ws", ItemKind::WebSearch, "web search", None, None);
         t.apply(&pending, Driver::Codex);
-        let refined = Envelope::new(Event::ItemStarted {
-            kind: ItemKind::WebSearch,
-            title: "Rust 1.91".into(),
-            input: Some(serde_json::json!({"query": "Rust 1.91"})),
-            parent: None,
-        })
-        .item("ws");
+        let refined = Envelope::item_started(
+            "ws",
+            ItemKind::WebSearch,
+            "Rust 1.91",
+            Some(serde_json::json!({"query": "Rust 1.91"})),
+            None,
+        );
         assert_eq!(
             t.apply(&refined, Driver::Codex),
             [Change::Updated("ws".into())]
@@ -4475,12 +4492,7 @@ mod tests {
     }
 
     fn turn_done() -> Envelope {
-        ev(Event::TurnCompleted {
-            state: TurnState::Completed,
-            usage: None,
-            cost_usd: None,
-            error: None,
-        })
+        Envelope::turn_completed(TurnState::Completed, None)
     }
 
     #[test]
@@ -4633,12 +4645,7 @@ mod tests {
             started("agent", ItemKind::Subagent, None),
             started("agent-read", ItemKind::FileRead, Some("agent")),
             started("done", ItemKind::Command, None),
-            Envelope::new(Event::ItemCompleted {
-                status: ItemStatus::Completed,
-                output: None,
-                error: None,
-            })
-            .item("done"),
+            Envelope::item_completed("done", ItemStatus::Completed, None, None),
             Envelope::new(Event::ApprovalRequested {
                 tool: "Bash".into(),
                 title: None,
@@ -4831,12 +4838,7 @@ mod tests {
         t.apply(&ev(Event::TurnStarted { model: None }), Driver::Claude);
         t.apply(&started("c", ItemKind::Command, None), Driver::Claude);
         t.apply(
-            &Envelope::new(Event::ItemCompleted {
-                status: ItemStatus::Completed,
-                output: None,
-                error: None,
-            })
-            .item("c"),
+            &Envelope::item_completed("c", ItemStatus::Completed, None, None),
             Driver::Claude,
         );
         t.apply(&turn_done(), Driver::Claude);
@@ -4978,13 +4980,13 @@ mod tests {
         t.apply(&started("t1", ItemKind::FileRead, None), Driver::Agy);
 
         // While turn 1 is running, the operator queues a follow-up prompt
-        let q_envelope = Envelope::new(Event::ItemStarted {
-            kind: ItemKind::UserMessage,
-            title: "queued".to_string(),
-            input: Some(serde_json::json!({"queued": true})),
-            parent: None,
-        })
-        .item("q1");
+        let q_envelope = Envelope::item_started(
+            "q1",
+            ItemKind::UserMessage,
+            "queued",
+            Some(serde_json::json!({"queued": true})),
+            None,
+        );
         t.apply(&q_envelope, Driver::Agy);
 
         assert_eq!(t.order(), ["u1", "t1", "q1"]);
@@ -5001,25 +5003,19 @@ mod tests {
         assert_eq!(t.order(), ["u1", "t1", "t2", "r1", "a1", "q1"]);
 
         // Operator queues a second prompt
-        let q2_envelope = Envelope::new(Event::ItemStarted {
-            kind: ItemKind::UserMessage,
-            title: "queued".to_string(),
-            input: Some(serde_json::json!({"queued": true})),
-            parent: None,
-        })
-        .item("q2");
+        let q2_envelope = Envelope::item_started(
+            "q2",
+            ItemKind::UserMessage,
+            "queued",
+            Some(serde_json::json!({"queued": true})),
+            None,
+        );
         t.apply(&q2_envelope, Driver::Agy);
 
         assert_eq!(t.order(), ["u1", "t1", "t2", "r1", "a1", "q1", "q2"]);
 
         // Turn 1 completes and q1 is unqueued
-        let unqueue_q1 = Envelope::new(Event::ItemStarted {
-            kind: ItemKind::UserMessage,
-            title: String::new(),
-            input: None,
-            parent: None,
-        })
-        .item("q1");
+        let unqueue_q1 = Envelope::item_started("q1", ItemKind::UserMessage, "", None, None);
         t.apply(&unqueue_q1, Driver::Agy);
 
         // q1 is now active, q2 is still queued at the end

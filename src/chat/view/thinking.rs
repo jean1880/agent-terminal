@@ -100,7 +100,7 @@ impl ThinkingStrip {
     /// hidden once it settles. `driver`: the thread's agent, whose dot leads; `sub_agents`: the
     /// agents its running sub-agents are on (any route), whose dots are lit beside it.
     pub fn set(&self, activity: &Activity, driver: Driver, sub_agents: &[Driver]) {
-        let agent = super::cards::driver_name(driver);
+        let agent = driver.info().label;
         crate::brand::set_working(&self.dots, driver, sub_agents);
         *self.inner.current_activity.borrow_mut() = activity.clone();
         *self.inner.current_agent.borrow_mut() = agent.to_owned();

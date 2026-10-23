@@ -18,6 +18,7 @@ use gtk4::prelude::*;
 use super::cards::label;
 use super::model::{Body, SubagentSummary, ToolStatus, Transcript};
 use super::payload;
+use super::subagents::set_if_changed;
 
 /// The card's one-line summary: the running ones, then the finished ones still docked.
 pub fn title_text(running: usize, finished: usize, unknown: usize) -> String {
@@ -110,18 +111,15 @@ impl Row {
         state.set_visible(false);
         top.append(&state);
         let name = label("", &["subagent-name"]);
-        name.set_xalign(0.0);
         name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         name.set_max_width_chars(20);
         top.append(&name);
         let task = label("", &["subagent-task", "dim-label"]);
-        task.set_xalign(0.0);
         task.set_hexpand(true);
         task.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         top.append(&task);
         b.append(&top);
         let now = label("", &["subagent-now"]);
-        now.set_xalign(0.0);
         now.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         b.append(&now);
         let row = gtk4::ListBoxRow::new();
@@ -160,41 +158,19 @@ impl Row {
             "{}\n{}\n{}\n{now}\nOpen this worker",
             agent.name,
             super::subagents::identity_text(agent),
-            if agent.task.is_empty() {
-                "No task reported"
-            } else {
-                &agent.task
-            }
+            agent.task_text()
         )));
         self.row.update_property(&[
             gtk4::accessible::Property::Label(&agent.name),
             gtk4::accessible::Property::Description(&format!(
                 "{}; {}; {now}",
                 agent.state_label(),
-                if agent.task.is_empty() {
-                    "No task reported"
-                } else {
-                    &agent.task
-                }
+                agent.task_text()
             )),
         ]);
         set_if_changed(&self.name, &agent.name);
-        set_if_changed(
-            &self.task,
-            if agent.task.is_empty() {
-                "No task reported"
-            } else {
-                &agent.task
-            },
-        );
+        set_if_changed(&self.task, agent.task_text());
         set_if_changed(&self.now, &now);
-    }
-}
-
-/// Leaves a label alone when its text is already right (no relayout while it streams).
-fn set_if_changed(l: &gtk4::Label, text: &str) {
-    if l.text() != text {
-        l.set_text(text);
     }
 }
 
@@ -353,7 +329,7 @@ impl SubagentShelf {
 pub(crate) mod tests {
     use super::*;
     use agent_core::adapter::Driver;
-    use agent_core::event::{Envelope, Event, ItemKind};
+    use agent_core::event::{Envelope, ItemKind};
 
     #[test]
     #[ignore = "native GTK; run alone in an isolated display"]
@@ -400,22 +376,11 @@ pub(crate) mod tests {
         input: serde_json::Value,
         parent: Option<&str>,
     ) -> Envelope {
-        Envelope::new(Event::ItemStarted {
-            kind,
-            title: title.into(),
-            input: Some(input),
-            parent: parent.map(str::to_owned),
-        })
-        .item(id)
+        Envelope::item_started(id, kind, title, Some(input), parent)
     }
 
     fn done(id: &str) -> Envelope {
-        Envelope::new(Event::ItemCompleted {
-            status: agent_core::event::ItemStatus::Completed,
-            output: None,
-            error: None,
-        })
-        .item(id)
+        Envelope::item_completed(id, agent_core::event::ItemStatus::Completed, None, None)
     }
 
     fn subagent(id: &str, name: &str) -> Envelope {

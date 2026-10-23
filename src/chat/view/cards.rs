@@ -63,10 +63,6 @@ pub enum RowEvent {
 
 pub type RowSink = Rc<dyn Fn(RowEvent)>;
 
-pub fn driver_name(driver: Driver) -> &'static str {
-    driver.info().label
-}
-
 /// The CSS class carrying an agent's accent colour.
 pub fn accent_class(driver: Driver) -> &'static str {
     driver.info().accent_class
@@ -501,7 +497,7 @@ impl Row {
                 let head = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
                 head.add_css_class("assistant-head");
                 head.append(&brand_image(*driver));
-                head.append(&label(driver_name(*driver), &["agent-name"]));
+                head.append(&label(driver.info().label, &["agent-name"]));
                 root.append(&head);
                 let md = MarkdownView::new();
                 root.append(md.widget());
@@ -781,10 +777,10 @@ pub fn switch_text(
     match (agent_changed, model) {
         (true, _) if returned => format!(
             "Back in {} · new session from a summary",
-            driver_name(driver)
+            driver.info().label
         ),
-        (true, Some(m)) => format!("Continued in {} · {m}", driver_name(driver)),
-        (true, None) => format!("Continued in {}", driver_name(driver)),
+        (true, Some(m)) => format!("Continued in {} · {m}", driver.info().label),
+        (true, None) => format!("Continued in {}", driver.info().label),
         (false, Some(m)) => format!("Model switched to {m}"),
         (false, None) => "Model switched".to_owned(),
     }
@@ -3066,6 +3062,7 @@ pub(crate) mod tests {
                 output: output.clone(),
                 error: Some("exit status 1".into()),
                 status: ToolStatus::Failed,
+                reported_model: None,
             }),
             expanded: true,
             parent: None,
@@ -3121,6 +3118,7 @@ pub(crate) mod tests {
                 output: String::new(),
                 error: None,
                 status: ToolStatus::Completed,
+                reported_model: None,
             }),
             expanded: false,
             parent: None,
@@ -3748,17 +3746,7 @@ pub(crate) mod tests {
         );
     }
 
-    fn permission_input(entries: Value, network: Value, session_allowed: bool) -> Value {
-        serde_json::json!({
-            "cwd": "/w", "reason": "The build writes its cache", "renderable": true,
-            "entries": entries, "network": network, "session_allowed": session_allowed,
-            "warning": null, "requested": {"fileSystem": {"write": ["/w/out"]}}
-        })
-    }
-
-    fn entry(access: &str, path: &str) -> Value {
-        serde_json::json!({"access": access, "target": {"kind": "path", "path": path}})
-    }
+    use super::super::permission::tests::{path as entry, request_input as permission_input};
 
     const ALL_FOUR: [Decision; 4] = [
         Decision::Allow,

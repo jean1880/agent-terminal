@@ -141,7 +141,6 @@ fn row(listed: &ListedTask) -> gtk4::ListBoxRow {
     b.append(&icon);
     let text = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
     let name = label(&task_name(task), &["subagent-name"]);
-    name.set_xalign(0.0);
     name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
     name.set_width_chars(16);
     name.set_max_width_chars(48);
@@ -152,7 +151,6 @@ fn row(listed: &ListedTask) -> gtk4::ListBoxRow {
         format!("{} · nothing to show", kind_text(task.kind))
     };
     let kind = label(&kind, &["subagent-status", "dim-label"]);
-    kind.set_xalign(0.0);
     text.append(&kind);
     b.append(&text);
     let row = gtk4::ListBoxRow::new();
@@ -187,11 +185,9 @@ impl TaskOutputPanel {
         body.set_margin_start(18);
         body.set_margin_end(18);
         let title = label(&task_name(task), &["subagent-panel-title"]);
-        title.set_xalign(0.0);
         title.set_wrap(true);
         title.set_selectable(true);
         let status = label("Reading output…", &["dim-label"]);
-        status.set_xalign(0.0);
         body.append(&title);
         body.append(&status);
         let buffer = gtk4::TextBuffer::new(None);
@@ -214,7 +210,6 @@ impl TaskOutputPanel {
         super::follow::follow_end(&scroller);
         body.append(&scroller);
         let note = label("", &["dim-label", "caption"]);
-        note.set_xalign(0.0);
         note.set_visible(false);
         body.append(&note);
         let toolbar = adw::ToolbarView::new();

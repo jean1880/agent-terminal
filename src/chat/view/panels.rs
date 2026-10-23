@@ -12,7 +12,7 @@ use agent_core::catalog::{group_for_picker, CatalogModel};
 use gtk4::glib;
 use serde_json::Value;
 
-use super::cards::{accent_class, brand_image, driver_name, label};
+use super::cards::{accent_class, brand_image, label};
 use super::header::gauge_text;
 use super::model::{format_tokens, Gauge};
 use super::payload;
@@ -200,10 +200,6 @@ fn padded(child: &impl IsA<gtk4::Widget>) -> gtk4::Box {
 // ---------------------------------------------------------------------------------------------
 
 /// The group heading for an agent's models.
-fn group_title(driver: Driver) -> &'static str {
-    driver.info().long_label
-}
-
 /// The fallback list, when there is no [`ModelSource`]: the backend's own `ListModels` answer,
 /// all attributed to the current agent.
 fn catalog_from_payload(driver: Driver, entries: Vec<payload::ModelEntry>) -> Vec<CatalogModel> {
@@ -301,7 +297,7 @@ fn model_list(
     let status = Rc::new(status.clone()); // shared by every row's handlers
     let column = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
     for (driver, rows) in groups {
-        let heading_text = label(&group_title(driver).to_uppercase(), &["model-group"]);
+        let heading_text = label(&driver.info().long_label.to_uppercase(), &["model-group"]);
         let heading = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
         heading.add_css_class(accent_class(driver));
         heading.set_halign(gtk4::Align::Start);
@@ -704,7 +700,7 @@ pub fn model_picker(ctx: &PanelCtx) {
         }
         None => show_error(
             &stack,
-            &format!("{} cannot list its models.", driver_name(status.driver)),
+            &format!("{} cannot list its models.", status.driver.info().label),
         ),
     }
     d.present(Some(&ctx.parent));
@@ -757,7 +753,7 @@ fn load_mcp(ctx: &PanelCtx, stack: &gtk4::Stack) {
                     row.set_subtitle(&sub);
                     let dot = label(
                         "●",
-                        &["mcp-dot", &format!("mcp-{}", status_class(&s.status))],
+                        &["mcp-dot", &format!("mcp-{}", mcp_status_class(&s.status))],
                     );
                     row.add_prefix(&dot);
 
@@ -877,7 +873,7 @@ fn reconnect_toast(server: &str, result: &Result<Value, String>) -> adw::Toast {
     toast
 }
 
-fn status_class(status: &str) -> &'static str {
+fn mcp_status_class(status: &str) -> &'static str {
     match status {
         "connected" | "ok" | "running" => "ok",
         "pending" | "connecting" | "needs-auth" => "pending",
@@ -1106,11 +1102,9 @@ pub(crate) mod tests {
     #[test]
     fn a_resolved_request_cancels_its_expiry_timer() {
         crate::testutil::in_loop(|_| {
-            let backend = super::super::tests::SwitchableBackend {
-                status: RefCell::new(super::super::tests::status_of(Driver::Claude)),
-            };
+            let backend = super::super::tests::StubBackend::new(Driver::Claude);
             let requests = Rc::new(Requests::default());
-            let id = requests.ask(&backend, Control::McpStatus, |_| {});
+            let id = requests.ask(&*backend, Control::McpStatus, |_| {});
             let source = requests.timeouts.borrow()[&id].source().clone();
             assert!(!source.is_destroyed());
             requests.resolve(&id, Ok(serde_json::json!({})));
@@ -1123,11 +1117,9 @@ pub(crate) mod tests {
     #[test]
     fn an_expired_request_cancels_its_expiry_timer() {
         crate::testutil::in_loop(|_| {
-            let backend = super::super::tests::SwitchableBackend {
-                status: RefCell::new(super::super::tests::status_of(Driver::Claude)),
-            };
+            let backend = super::super::tests::StubBackend::new(Driver::Claude);
             let requests = Rc::new(Requests::default());
-            let id = requests.ask(&backend, Control::McpStatus, |_| {});
+            let id = requests.ask(&*backend, Control::McpStatus, |_| {});
             let source = requests.timeouts.borrow()[&id].source().clone();
             requests.expire(&id);
             assert!(source.is_destroyed());
@@ -1138,11 +1130,9 @@ pub(crate) mod tests {
     #[test]
     fn dropping_requests_cancels_their_expiry_timers() {
         crate::testutil::in_loop(|_| {
-            let backend = super::super::tests::SwitchableBackend {
-                status: RefCell::new(super::super::tests::status_of(Driver::Claude)),
-            };
+            let backend = super::super::tests::StubBackend::new(Driver::Claude);
             let requests = Rc::new(Requests::default());
-            let id = requests.ask(&backend, Control::McpStatus, |_| {});
+            let id = requests.ask(&*backend, Control::McpStatus, |_| {});
             let source = requests.timeouts.borrow()[&id].source().clone();
             drop(requests);
             assert!(source.is_destroyed());
@@ -1206,42 +1196,15 @@ pub(crate) mod tests {
             &pick,
             &caveats,
         );
-        fn find<T: IsA<gtk4::Widget> + glib::types::StaticType + Clone>(
-            widget: &gtk4::Widget,
-        ) -> Option<T> {
-            if let Ok(value) = widget.clone().downcast::<T>() {
-                return Some(value);
-            }
-            let mut child = widget.first_child();
-            while let Some(w) = child {
-                if let Some(found) = find::<T>(&w) {
-                    return Some(found);
-                }
-                child = w.next_sibling();
-            }
-            None
-        }
-        let row = find::<adw::ActionRow>(&list).expect("model row");
-        let dropdown = find::<gtk4::DropDown>(row.upcast_ref()).expect("effort choice");
-        fn find_class(widget: &gtk4::Widget, class: &str) -> Option<gtk4::Widget> {
-            if widget.has_css_class(class) {
-                return Some(widget.clone());
-            }
-            let mut child = widget.first_child();
-            while let Some(w) = child {
-                if let Some(found) = find_class(&w, class) {
-                    return Some(found);
-                }
-                child = w.next_sibling();
-            }
-            None
-        }
-        let find_apply = |w: &gtk4::Widget| {
-            find_class(w, "effort-apply").and_then(|b| b.downcast::<gtk4::Button>().ok())
-        };
-        let note = find_class(&list, "switch-caveats")
-            .and_then(|l| l.downcast::<gtk4::Label>().ok())
-            .expect("the other agent's group says what a switch costs");
+        let row =
+            crate::testutil::find_first::<adw::ActionRow>(list.upcast_ref()).expect("model row");
+        let dropdown =
+            crate::testutil::find_first::<gtk4::DropDown>(row.upcast_ref()).expect("effort choice");
+        let find_apply =
+            |w: &gtk4::Widget| crate::testutil::find_by_class::<gtk4::Button>(w, "effort-apply");
+        let note =
+            crate::testutil::find_by_class::<gtk4::Label>(list.upcast_ref(), "switch-caveats")
+                .expect("the other agent's group says what a switch costs");
         assert_eq!(note.text(), "costs of Codex");
         let apply = find_apply(row.upcast_ref()).expect("apply button");
         assert!(!apply.is_visible(), "nothing staged, nothing to apply");
@@ -1278,11 +1241,14 @@ pub(crate) mod tests {
         let no_caveats = |_| Vec::new();
         let list = model_list(&models, "", &on_opus, &pick, &no_caveats);
         assert!(
-            find_class(&list, "switch-caveats").is_none(),
+            crate::testutil::find_by_class::<gtk4::Widget>(list.upcast_ref(), "switch-caveats")
+                .is_none(),
             "the current agent's group has nothing to warn of"
         );
-        let row = find::<adw::ActionRow>(&list).expect("model row");
-        let dropdown = find::<gtk4::DropDown>(row.upcast_ref()).expect("effort choice");
+        let row =
+            crate::testutil::find_first::<adw::ActionRow>(list.upcast_ref()).expect("model row");
+        let dropdown =
+            crate::testutil::find_first::<gtk4::DropDown>(row.upcast_ref()).expect("effort choice");
         let apply = find_apply(row.upcast_ref()).expect("apply button");
         row.emit_by_name::<()>("activated", &[]);
         assert_eq!(
@@ -1380,9 +1346,6 @@ pub(crate) mod tests {
             &status(Driver::Claude, Some("gemini-3.1-pro-high"))
         ));
         assert!(!is_current(&m, &status(Driver::Agy, None)));
-        assert_eq!(group_title(Driver::Claude), "Claude");
-        assert_eq!(group_title(Driver::Agy), "Antigravity");
-        assert_eq!(group_title(Driver::Codex), "Codex");
     }
 
     #[test]
@@ -1487,10 +1450,10 @@ pub(crate) mod tests {
 
     #[test]
     fn mcp_status_classes() {
-        assert_eq!(status_class("connected"), "ok");
-        assert_eq!(status_class("disabled"), "off");
-        assert_eq!(status_class("needs-auth"), "pending");
-        assert_eq!(status_class("failed"), "bad");
+        assert_eq!(mcp_status_class("connected"), "ok");
+        assert_eq!(mcp_status_class("disabled"), "off");
+        assert_eq!(mcp_status_class("needs-auth"), "pending");
+        assert_eq!(mcp_status_class("failed"), "bad");
     }
 
     #[test]
@@ -1526,28 +1489,17 @@ pub(crate) mod tests {
     /// Escape in the model picker's search field closes the picker: a `SearchEntry` keeps the key
     /// for its own `stop-search`, so the dialog never saw it.
     pub(crate) fn escape_in_the_pickers_search_closes_it(ctx: &PanelCtx) {
-        fn find<T: IsA<gtk4::Widget>>(widget: &gtk4::Widget) -> Option<T> {
-            if let Some(found) = widget.downcast_ref::<T>() {
-                return Some(found.clone());
-            }
-            let mut child = widget.first_child();
-            while let Some(w) = child {
-                if let Some(found) = find::<T>(&w) {
-                    return Some(found);
-                }
-                child = w.next_sibling();
-            }
-            None
-        }
         model_picker(ctx);
         let root = ctx.parent.root().expect("the view is in a window");
-        let picker = find::<adw::Dialog>(root.upcast_ref()).expect("the picker is presented");
+        let picker = crate::testutil::find_first::<adw::Dialog>(root.upcast_ref())
+            .expect("the picker is presented");
         let closed = Rc::new(Cell::new(false));
         picker.connect_closed({
             let closed = closed.clone();
             move |_| closed.set(true)
         });
-        let search = find::<gtk4::SearchEntry>(picker.upcast_ref()).expect("a search field");
+        let search = crate::testutil::find_first::<gtk4::SearchEntry>(picker.upcast_ref())
+            .expect("a search field");
         let context = glib::MainContext::default();
         // Libadwaita 1.5 ignores a close that lands while the sheet is still opening (CI's
         // Ubuntu 24.04; a user never presses Escape that soon), so let it open first, and press

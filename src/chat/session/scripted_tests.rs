@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::chat::view::model::{Activity, Body, PendingInterruption, Transcript};
-use crate::testutil::{in_loop, pump_until};
+use crate::testutil::{in_loop, open_session, pump_until};
 use agent_core::claude::ClaudeAdapter;
 use agent_core::codex::CodexAdapter;
 use serde_json::{json, Value};
@@ -36,30 +36,13 @@ impl Fixture {
     }
 
     fn open(&self) -> OpenSession {
-        OpenSession {
-            program: "/usr/bin/python3".into(),
-            extra_args: vec![
-                "-I".into(),
-                format!(
-                    "{}/tests/support/scripted_codex.py",
-                    env!("CARGO_MANIFEST_DIR")
-                ),
-                self.dir.path().to_string_lossy().into_owned(),
-            ],
-            cwd: self.dir.path().to_string_lossy().into_owned(),
-            model: Some("synthetic-model".into()),
-            effort: None,
-            mode: Mode::Ask,
-            resume: self
-                .store
-                .provider_threads(&self.thread)
-                .expect("providers")
-                .last()
-                .and_then(|provider| provider.native_id.clone()),
-            new_session_id: None,
-            approval_hook: false,
-            delegation: None,
-        }
+        let resume = self
+            .store
+            .provider_threads(&self.thread)
+            .expect("providers")
+            .last()
+            .and_then(|provider| provider.native_id.clone());
+        scripted_codex(self.dir.path(), Mode::Ask, resume)
     }
 
     fn session(&self) -> Rc<ChatSession> {
@@ -85,11 +68,7 @@ impl Fixture {
     }
 
     fn frames(&self) -> Vec<Value> {
-        std::fs::read_to_string(self.dir.path().join("frames.ndjson"))
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect()
+        recorded_frames(self.dir.path())
     }
 
     fn incoming(&self) -> Vec<Value> {
@@ -157,7 +136,40 @@ impl Fixture {
     }
 }
 
-fn minimal_env(dir: &Path) -> LaunchEnv {
+/// The scripted Codex app-server in `dir` (it records its frames there), on `mode`, resuming
+/// `resume` when set.
+pub(super) fn scripted_codex(dir: &Path, mode: Mode, resume: Option<String>) -> OpenSession {
+    let dir_text = dir.to_string_lossy().into_owned();
+    OpenSession {
+        model: Some("synthetic-model".into()),
+        mode,
+        resume,
+        ..open_session(
+            "/usr/bin/python3",
+            vec![
+                "-I".into(),
+                format!(
+                    "{}/tests/support/scripted_codex.py",
+                    env!("CARGO_MANIFEST_DIR")
+                ),
+                dir_text.clone(),
+            ],
+            dir_text,
+        )
+    }
+}
+
+/// Every frame the scripted app-server in `dir` recorded, in order.
+pub(super) fn recorded_frames(dir: &Path) -> Vec<Value> {
+    std::fs::read_to_string(dir.join("frames.ndjson"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+/// A private environment for a fake process: no inherited variable reaches it.
+pub(super) fn minimal_env(dir: &Path) -> LaunchEnv {
     LaunchEnv {
         // Enumerate names only; never read or copy any inherited credentials into the child.
         unset: std::env::vars_os()

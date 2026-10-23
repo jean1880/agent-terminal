@@ -66,9 +66,13 @@ pub(super) fn identity_text(agent: &SubagentSummary) -> String {
             provenance_text(&delegation.model),
             provenance_text(&delegation.effort)
         ),
+        // The provider reports the model a native sub-agent runs on, never its effort.
         None => format!(
             "{provider} · native · model {} · effort {}",
-            requested_text(agent.requested_model.as_deref()),
+            agent
+                .reported_model
+                .clone()
+                .unwrap_or_else(|| requested_text(agent.requested_model.as_deref())),
             requested_text(agent.requested_effort.as_deref())
         ),
     }
@@ -164,7 +168,6 @@ impl ListRow {
         top.append(&status);
         b.append(&top);
         let task = label("", &["subagent-task", "dim-label"]);
-        task.set_xalign(0.0);
         task.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         // The list takes its rows' natural width: a long task must not widen it past this.
         task.set_max_width_chars(48);
@@ -194,14 +197,7 @@ impl ListRow {
         set_brand(&self.brand, agent.driver);
         set_if_changed(&self.identity, &identity_text(agent));
         set_if_changed(&self.status, &status_text(agent));
-        set_if_changed(
-            &self.task,
-            if agent.task.is_empty() {
-                "No task reported"
-            } else {
-                &agent.task
-            },
-        );
+        set_if_changed(&self.task, agent.task_text());
         let short_id: String = agent
             .id
             .chars()
@@ -216,18 +212,15 @@ impl ListRow {
             gtk4::accessible::Property::Description(&format!(
                 "{}; {}",
                 status_text(agent),
-                if agent.task.is_empty() {
-                    "No task reported"
-                } else {
-                    &agent.task
-                }
+                agent.task_text()
             )),
         ]);
     }
 }
 
-/// Leaves a label alone when its text is already right (no relayout, no lost selection).
-fn set_if_changed(l: &gtk4::Label, text: &str) {
+/// Leaves a label alone when its text is already right (no relayout while it streams, no lost
+/// selection).
+pub(super) fn set_if_changed(l: &gtk4::Label, text: &str) {
     if l.text() != text {
         l.set_text(text);
     }
@@ -465,11 +458,9 @@ impl SubagentPanel {
         body.set_margin_end(18);
 
         let title = label("", &["subagent-panel-title"]);
-        title.set_xalign(0.0);
         title.set_wrap(true);
         title.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
         let status = label("", &["dim-label"]);
-        status.set_xalign(0.0);
         let head = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
         let title_line = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
         let brand = gtk4::Image::new();
@@ -490,7 +481,6 @@ impl SubagentPanel {
         let steps = gtk4::Box::new(gtk4::Orientation::Vertical, 14);
         body.append(&steps);
         let empty = label("No steps yet.", &["dim-label"]);
-        empty.set_xalign(0.0);
         body.append(&empty);
         let (reported, reported_text) = section("Reported");
         body.append(&reported);
@@ -799,6 +789,7 @@ pub(crate) mod tests {
             delegation: None,
             requested_model: None,
             requested_effort: None,
+            reported_model: None,
         }
     }
 
@@ -816,6 +807,24 @@ pub(crate) mod tests {
             identity_text(&native),
             "Claude · native · model sonnet (requested; effective unknown) · effort high \
              (requested; effective unknown)"
+        );
+    }
+
+    #[test]
+    fn a_native_sub_agent_shows_the_model_its_provider_reported() {
+        let mut native = agent("n", ToolStatus::Running);
+        native.driver = Some(agent_core::adapter::Driver::Claude);
+        native.requested_model = Some("sonnet".into());
+        native.requested_effort = Some("high".into());
+        native.reported_model = Some("claude-sonnet-5-5".into());
+        assert_eq!(
+            identity_text(&native),
+            "Claude · native · model claude-sonnet-5-5 · effort high (requested; effective unknown)"
+        );
+        native.requested_effort = None;
+        assert_eq!(
+            identity_text(&native),
+            "Claude · native · model claude-sonnet-5-5 · effort unknown"
         );
     }
 

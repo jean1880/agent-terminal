@@ -32,6 +32,27 @@ pub fn capture_window(window: &gtk4::Window, name: &str) {
     }
 }
 
+/// A session that runs `program` with `extra_args` in `cwd`, in Ask mode, with no model, effort,
+/// resume, hook or delegation: the base every session test changes what it needs on.
+pub fn open_session(
+    program: impl Into<String>,
+    extra_args: Vec<String>,
+    cwd: impl Into<String>,
+) -> agent_core::adapter::OpenSession {
+    agent_core::adapter::OpenSession {
+        program: program.into(),
+        extra_args,
+        cwd: cwd.into(),
+        model: None,
+        effort: None,
+        mode: agent_core::adapter::Mode::Ask,
+        resume: None,
+        new_session_id: None,
+        approval_hook: false,
+        delegation: None,
+    }
+}
+
 /// Runs `body` with a private main context as the thread default, so every test drives its own
 /// loop and tests running in parallel threads never share a context.
 pub fn in_loop<R>(body: impl FnOnce(&glib::MainContext) -> R) -> R {
@@ -270,6 +291,61 @@ pub fn descendants(root: &gtk4::Widget) -> Vec<gtk4::Widget> {
         out.push(widget);
     }
     out
+}
+
+/// The first widget of type `T` at or below `root`, in document order (a widget before its
+/// children, children in order).
+pub fn find_first<T: gtk4::prelude::IsA<gtk4::Widget>>(root: &gtk4::Widget) -> Option<T> {
+    find_where(root, &|_| true)
+}
+
+/// The first widget of type `T` with CSS class `class` at or below `root`, in document order.
+pub fn find_by_class<T: gtk4::prelude::IsA<gtk4::Widget>>(
+    root: &gtk4::Widget,
+    class: &str,
+) -> Option<T> {
+    use gtk4::prelude::*;
+    find_where(root, &|w: &gtk4::Widget| w.has_css_class(class))
+}
+
+fn find_where<T: gtk4::prelude::IsA<gtk4::Widget>>(
+    widget: &gtk4::Widget,
+    keep: &dyn Fn(&gtk4::Widget) -> bool,
+) -> Option<T> {
+    use gtk4::prelude::*;
+    if keep(widget) {
+        if let Some(found) = widget.downcast_ref::<T>() {
+            return Some(found.clone());
+        }
+    }
+    let mut child = widget.first_child();
+    while let Some(w) = child {
+        if let Some(found) = find_where(&w, keep) {
+            return Some(found);
+        }
+        child = w.next_sibling();
+    }
+    None
+}
+
+/// The text of every label at or below `root`.
+pub fn label_texts(root: &gtk4::Widget) -> Vec<String> {
+    use gtk4::prelude::*;
+    descendants(root)
+        .iter()
+        .filter_map(|w| w.downcast_ref::<gtk4::Label>())
+        .map(|l| l.text().to_string())
+        .collect()
+}
+
+/// GTK, libadwaita, the bundled icons and the stylesheet, as the app sets them up: for the
+/// native tests that present windows. Returns the default main context they run on.
+pub fn native_init() -> glib::MainContext {
+    gtk4::init().expect("GTK must be available for the native gate");
+    adw::init().expect("libadwaita init");
+    crate::icons::register();
+    crate::load_css();
+    glib::MainContext::default()
 }
 
 /// Whether pressing `widget` does something by itself: a button, a list row or anything with a

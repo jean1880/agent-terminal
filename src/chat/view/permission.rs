@@ -67,12 +67,7 @@ pub struct Request {
 
 /// Whether `s` is safe to print as a line: no control, bidi or zero-width characters.
 pub(super) fn plain(s: &str) -> bool {
-    !s.chars().any(|c| {
-        c.is_control()
-            || matches!(c,
-                '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}'
-                | '\u{2066}'..='\u{2069}' | '\u{FEFF}' | '\u{E0000}'..='\u{E007F}')
-    })
+    !agent_core::text::has_control_or_bidi(s, &[])
 }
 
 fn special_words(name: &str) -> Option<&'static str> {
@@ -347,19 +342,30 @@ fn parse_entry(raw: &Value) -> Option<Entry> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use serde_json::json;
 
-    fn input(entries: Value, network: Value) -> Value {
+    /// A Codex permission request as the adapter hands it to the card: `entries` and `network`
+    /// in the workspace `/w`, offering "Allow for session" when `session_allowed`.
+    pub(in crate::chat::view) fn request_input(
+        entries: Value,
+        network: Value,
+        session_allowed: bool,
+    ) -> Value {
         json!({
-            "cwd": "/w", "reason": "Build needs the cache", "renderable": true,
-            "entries": entries, "network": network, "session_allowed": true,
-            "warning": null, "requested": {}
+            "cwd": "/w", "reason": "The build writes its cache", "renderable": true,
+            "entries": entries, "network": network, "session_allowed": session_allowed,
+            "warning": null, "requested": {"fileSystem": {"write": ["/w/out"]}}
         })
     }
 
-    fn path(access: &str, p: &str) -> Value {
+    fn input(entries: Value, network: Value) -> Value {
+        request_input(entries, network, true)
+    }
+
+    /// One entry: `access` to the path `p`.
+    pub(in crate::chat::view) fn path(access: &str, p: &str) -> Value {
         json!({"access": access, "target": {"kind": "path", "path": p}})
     }
 

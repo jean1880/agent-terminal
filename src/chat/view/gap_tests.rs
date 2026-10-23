@@ -2,51 +2,10 @@
 //! context gauge. They build real views, so they are `#[ignore]`d and run under a display by
 //! `make test-display` (part of `make check`).
 
-use super::tests::{native_init as init, pump_until, status_of};
+use super::tests::{native_init as init, pump_until, StubBackend};
 use super::*;
 use agent_core::event::{Decision, ItemKind};
 use std::time::{Duration, Instant};
-
-/// A backend that records the controls it is asked for and hands out distinct request ids.
-struct RecordingBackend {
-    status: SessionStatus,
-    controls: RefCell<Vec<(String, Control)>>,
-}
-
-impl RecordingBackend {
-    fn new(driver: Driver) -> Rc<Self> {
-        Rc::new(Self {
-            status: status_of(driver),
-            controls: RefCell::new(Vec::new()),
-        })
-    }
-
-    fn asked(&self, wanted: impl Fn(&Control) -> bool) -> Option<String> {
-        self.controls
-            .borrow()
-            .iter()
-            .find(|(_, c)| wanted(c))
-            .map(|(id, _)| id.clone())
-    }
-}
-
-impl ChatBackend for RecordingBackend {
-    fn send_prompt(&self, _: &str) {}
-    fn interrupt(&self) {}
-    fn respond_approval(&self, _: &str, _: Decision) {}
-    fn answer_questions(&self, _: &str, _: serde_json::Value) {}
-    fn switch(&self, _: Driver, _: Option<String>, _: Option<String>) {}
-    fn reload_session(&self) {}
-    fn set_mode(&self, _: Mode) {}
-    fn control(&self, control: Control) -> String {
-        let id = format!("ctl-{}", self.controls.borrow().len() + 1);
-        self.controls.borrow_mut().push((id.clone(), control));
-        id
-    }
-    fn status(&self) -> SessionStatus {
-        self.status.clone()
-    }
-}
 
 #[test]
 #[ignore = "native GTK; run alone in an isolated display"]
@@ -58,7 +17,7 @@ fn native_at_popover_lists_files_for_all_three_drivers() {
         std::fs::write(tmp.path().join(file), "x").expect("write");
     }
     for driver in Driver::ALL {
-        let backend = RecordingBackend::new(driver);
+        let backend = StubBackend::fixed(driver);
         let view = ChatView::new(backend.clone());
         // The popup needs a toplevel to open on.
         let window = gtk4::Window::new();
@@ -70,7 +29,7 @@ fn native_at_popover_lists_files_for_all_three_drivers() {
         let inner = view.inner().expect("built view");
         inner.composer.set_text("look at @alp");
 
-        if backend.status.capabilities.file_suggestions {
+        if backend.status().capabilities.file_suggestions {
             // The agent answers (Claude): hand the view its reply.
             assert!(
                 pump_until(&ctx, || backend
@@ -120,7 +79,7 @@ fn native_at_popover_lists_files_for_all_three_drivers() {
 fn native_the_context_gauge_is_polled_after_a_turn_for_agents_that_do_not_push_it() {
     let ctx = init();
     for driver in Driver::ALL {
-        let backend = RecordingBackend::new(driver);
+        let backend = StubBackend::fixed(driver);
         let view = ChatView::new(backend.clone());
         view.apply(&Envelope::new(Event::TurnStarted { model: None }));
         view.apply(&Envelope::new(Event::ItemStarted {
@@ -129,12 +88,10 @@ fn native_the_context_gauge_is_polled_after_a_turn_for_agents_that_do_not_push_i
             input: None,
             parent: None,
         }));
-        view.apply(&Envelope::new(Event::TurnCompleted {
-            state: agent_core::event::TurnState::Completed,
-            usage: None,
-            cost_usd: None,
-            error: None,
-        }));
+        view.apply(&Envelope::turn_completed(
+            agent_core::event::TurnState::Completed,
+            None,
+        ));
         let asked = || {
             backend
                 .asked(|c| matches!(c, Control::ContextUsage))
@@ -163,7 +120,7 @@ fn native_the_context_gauge_is_polled_after_a_turn_for_agents_that_do_not_push_i
 fn native_background_tasks_are_listed_and_a_shell_task_shows_its_output() {
     use agent_core::event::{BackgroundTask, BackgroundTaskKind};
     let ctx = init();
-    let backend = RecordingBackend::new(Driver::Claude);
+    let backend = StubBackend::fixed(Driver::Claude);
     let view = ChatView::new(backend.clone());
     let window = gtk4::Window::new();
     window.set_default_size(560, 700);
@@ -281,7 +238,7 @@ fn native_request_cards_wrap_and_never_take_focus() {
         );
     };
     for (width, scale) in [(360, 1.0), (560, 2.0), (560, 1.0)] {
-        let backend = super::tests::AnswerLog::new(Driver::Codex);
+        let backend = StubBackend::fixed(Driver::Codex);
         let view = ChatView::new(backend.clone());
         view.set_text_scale(scale);
         // As the layout matrix hosts a view: in a pane that may shrink it, so the assertions are
@@ -414,19 +371,15 @@ fn native_request_cards_wrap_and_never_take_focus() {
         ] {
             view.apply(&Envelope::new(event).item("a1"));
         }
-        view.apply(
-            &Envelope::new(Event::ContentSnapshot {
-                stream: agent_core::event::StreamKind::Assistant,
-                text: "Which do you prefer?".into(),
-            })
-            .item("a1"),
-        );
-        view.apply(&Envelope::new(Event::TurnCompleted {
-            state: agent_core::event::TurnState::Completed,
-            usage: None,
-            cost_usd: None,
-            error: None,
-        }));
+        view.apply(&Envelope::snapshot(
+            "a1",
+            agent_core::event::StreamKind::Assistant,
+            "Which do you prefer?",
+        ));
+        view.apply(&Envelope::turn_completed(
+            agent_core::event::TurnState::Completed,
+            None,
+        ));
         view.apply(
             &Envelope::new(Event::QuestionRequested {
                 source: agent_core::event::QuestionSource::Reply,

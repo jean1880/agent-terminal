@@ -283,6 +283,13 @@ pub enum Event {
         model: String,
         message: String,
     },
+    /// The model a sub-agent actually runs on, as its provider reports it (`Envelope::item` is the
+    /// sub-agent's item). Sent once it is known and again only when it changes. Claude only (the
+    /// sub-agent's own messages, or its result's `resolvedModel`). An older build reads it as
+    /// [`Event::Unknown`].
+    SubagentModel {
+        model: String,
+    },
     /// Full replacement of the agent's running background tasks (sub-agents, shell commands);
     /// empty once the last one ends. A thread with any is still working after its turn ended.
     /// Claude only (`background_tasks_changed`).
@@ -904,7 +911,11 @@ mod tests {
             operation_id: OperationId::parse("op_opopopop").expect("valid"),
         })
         .item("call-card-1");
-        for env in [message, linked] {
+        let model = Envelope::new(Event::SubagentModel {
+            model: "claude-sonnet-5-5".into(),
+        })
+        .item("toolu_agent");
+        for env in [message, linked, model] {
             let json = serde_json::to_string(&env).expect("ser");
             let back: Envelope = serde_json::from_str(&json).expect("de");
             assert_eq!(back, env);

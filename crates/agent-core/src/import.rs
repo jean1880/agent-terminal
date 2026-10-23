@@ -18,7 +18,7 @@
 //! | `user`, `<local-command-stdout>` / `-stderr` | a `Notice` with the tags stripped |
 //! | `user`, `[Request interrupted…` | a `Notice`; the turn it ends is `Interrupted` |
 //! | `user`, `isCompactSummary` | a `Notice` saying the conversation was compacted (the summary is not shown) |
-//! | `user`, `tool_result` blocks | the adapter completes the matching tool item, except a backgrounded sub-agent's "launched" result (`toolUseResult.isAsync`), which leaves it open across turns |
+//! | `user`, `tool_result` blocks | the adapter completes the matching tool item, except a backgrounded sub-agent's "launched" result (`toolUseResult.isAsync`), which leaves it open across turns; a sub-agent's `toolUseResult.resolvedModel` becomes `SubagentModel` |
 //! | `user`, `origin.kind: "task-notification"` | completes that task's tool item with its `<result>` (else `<summary>`); no user message, no new turn |
 //! | `user`, `isMeta` or only `<local-command-caveat>` / system reminders | skipped |
 //! | `assistant` | the adapter: `AssistantMessage`, `Reasoning`, `Command`, `FileChange`, … items |
@@ -427,7 +427,9 @@ impl ImportSink {
                 self.items += 1;
                 true
             }
-            Event::ContentSnapshot { .. } | Event::ContentDelta { .. } => {
+            Event::ContentSnapshot { .. }
+            | Event::ContentDelta { .. }
+            | Event::SubagentModel { .. } => {
                 env.item.as_ref().is_some_and(|i| self.known.contains(i))
             }
             Event::ItemCompleted { output, error, .. } => {
@@ -1194,6 +1196,26 @@ mod tests {
             .filter(|e| matches!(e.event, Event::TurnCompleted { .. }))
             .count();
         assert_eq!((starts, ends), (2, 2));
+    }
+
+    #[test]
+    fn an_imported_sub_agent_keeps_the_model_its_result_names() {
+        let lines = [
+            r#"{"type":"user","uuid":"u1","message":{"role":"user","content":"look"}}"#,
+            r#"{"type":"assistant","uuid":"a1","message":{"id":"m1","role":"assistant","content":[{"type":"tool_use","id":"toolu_fg","name":"Agent","input":{"description":"Look","prompt":"Look.","model":"haiku"}}]}}"#,
+            r#"{"type":"user","uuid":"u2","message":{"role":"user","content":[{"tool_use_id":"toolu_fg","type":"tool_result","content":[{"type":"text","text":"Seen."}]}]},"toolUseResult":{"status":"completed","agentId":"ag1","resolvedModel":"claude-haiku-5-5"}}"#,
+            // A result for a call this import never saw names no item.
+            r#"{"type":"user","uuid":"u3","message":{"role":"user","content":[{"tool_use_id":"toolu_gone","type":"tool_result","content":"x"}]},"toolUseResult":{"resolvedModel":"claude-opus-5-5"}}"#,
+        ];
+        let out = claude_transcript(lines);
+        let models: Vec<(Option<&str>, &str)> = out
+            .iter()
+            .filter_map(|e| match &e.event {
+                Event::SubagentModel { model } => Some((e.item.as_deref(), model.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(models, [(Some("toolu_fg"), "claude-haiku-5-5")]);
     }
 
     #[test]
