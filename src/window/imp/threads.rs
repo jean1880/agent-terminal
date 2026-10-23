@@ -4032,19 +4032,15 @@ impl AgentTerminalWindow {
 
     /// The "Empty thread discarded" toast, whose Undo creates the thread again from `spec`.
     fn offer_undo_discard(&self, spec: DiscardedThread) {
-        let toast = adw::Toast::builder()
-            .title("Empty thread discarded")
-            .use_markup(false)
-            .button_label("Undo")
-            .timeout(10)
-            .build();
-        let obj = self.obj().downgrade();
-        toast.connect_button_clicked(move |_| {
-            if let Some(window) = obj.upgrade() {
-                window.imp().undo_discard(&spec);
-            }
-        });
-        self.add_toast(toast);
+        self.action_toast(
+            "Empty thread discarded",
+            "Undo",
+            10,
+            adw::ToastPriority::Normal,
+            move |imp| {
+                imp.undo_discard(&spec);
+            },
+        );
     }
 
     /// Creates a discarded blank thread again, through the ordinary creation path: a folder that
@@ -5683,6 +5679,44 @@ impl AgentTerminalWindow {
         }
     }
 
+    /// Shows `title` (plain text, never markup) for `timeout` seconds with a `button` that runs
+    /// `on_click` on this window, held weakly.
+    pub(super) fn action_toast(
+        &self,
+        title: &str,
+        button: &str,
+        timeout: u32,
+        priority: adw::ToastPriority,
+        on_click: impl Fn(&Self) + 'static,
+    ) {
+        let toast = adw::Toast::builder()
+            .title(title)
+            .use_markup(false)
+            .button_label(button)
+            .timeout(timeout)
+            .priority(priority)
+            .build();
+        let obj = self.obj().downgrade();
+        toast.connect_button_clicked(move |_| {
+            if let Some(window) = obj.upgrade() {
+                on_click(window.imp());
+            }
+        });
+        self.add_toast(toast);
+    }
+
+    /// Shows `title` (plain text) until the caller dismisses the returned toast: work that
+    /// takes a moment says it runs.
+    pub(super) fn progress_toast(&self, title: &str) -> adw::Toast {
+        let toast = adw::Toast::builder()
+            .title(title)
+            .use_markup(false)
+            .timeout(0)
+            .build();
+        self.add_toast(toast.clone());
+        toast
+    }
+
     /// Bumps an interactive in-app toast when a thread needs attention and the user is away from it.
     fn bump_thread_attention_toast(&self, page: &adw::TabPage, thread: &str, question: bool) {
         let title = page.title();
@@ -5692,21 +5726,10 @@ impl AgentTerminalWindow {
         } else {
             format!("'{name}' needs approval")
         };
-        let toast = adw::Toast::builder()
-            .title(msg)
-            .use_markup(false)
-            .button_label("Switch")
-            .timeout(10)
-            .priority(adw::ToastPriority::High)
-            .build();
-        let obj = self.obj().downgrade();
         let thread_id = thread.to_owned();
-        toast.connect_button_clicked(move |_| {
-            if let Some(window) = obj.upgrade() {
-                window.imp().open_thread(&thread_id, true);
-            }
+        self.action_toast(&msg, "Switch", 10, adw::ToastPriority::High, move |imp| {
+            imp.open_thread(&thread_id, true);
         });
-        self.add_toast(toast);
     }
 
     /// Withdraws a thread's approval and turn-done notifications.
@@ -6749,19 +6772,13 @@ impl AgentTerminalWindow {
                 self.show_toast("Forked thread: kept the model, effort and safe mode")
             }
             Some(CreationNotice::Compact(source)) => {
-                let toast = adw::Toast::builder()
-                    .title("Compacted into a new thread; kept the model, effort and safe mode")
-                    .use_markup(false)
-                    .button_label("Archive the original")
-                    .timeout(15)
-                    .build();
-                let obj = self.obj().downgrade();
-                toast.connect_button_clicked(move |_| {
-                    if let Some(obj) = obj.upgrade() {
-                        obj.imp().set_thread_archived(&source, true);
-                    }
-                });
-                self.add_toast(toast);
+                self.action_toast(
+                    "Compacted into a new thread; kept the model, effort and safe mode",
+                    "Archive the original",
+                    15,
+                    adw::ToastPriority::Normal,
+                    move |imp| imp.set_thread_archived(&source, true),
+                );
             }
             None => {}
         }

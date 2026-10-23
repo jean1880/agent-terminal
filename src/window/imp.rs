@@ -2913,11 +2913,7 @@ impl AgentTerminalWindow {
         let slug = agent_kit::update::github_slug(env!("CARGO_PKG_REPOSITORY"));
         // The menu closes at once and the answer can take seconds: say the check runs, until
         // its answer replaces this.
-        let checking = adw::Toast::builder()
-            .title("Checking for updates…")
-            .timeout(0)
-            .build();
-        self.add_toast(checking.clone());
+        let checking = self.progress_toast("Checking for updates…");
         glib::MainContext::default().spawn_local(async move {
             let result = match slug {
                 Some(slug) => {
@@ -6503,18 +6499,13 @@ impl AgentTerminalWindow {
                         return;
                     }
                 }
-                let toast = adw::Toast::builder()
-                    .title(format!("Worktree ⎇ {} is clean", info.branch))
-                    .use_markup(false)
-                    .button_label("Remove")
-                    .timeout(10)
-                    .build();
-                toast.connect_button_clicked(glib::clone!(
-                    #[weak]
-                    obj,
-                    move |_| obj.imp().remove_worktree(info.clone())
-                ));
-                obj.imp().add_toast(toast);
+                obj.imp().action_toast(
+                    &format!("Worktree ⎇ {} is clean", info.branch),
+                    "Remove",
+                    10,
+                    adw::ToastPriority::Normal,
+                    move |imp| imp.remove_worktree(info.clone()),
+                );
             }
         ));
     }
@@ -6635,34 +6626,29 @@ impl AgentTerminalWindow {
 
                 let pinned = plan.pinned.commit.clone();
                 // The confirmation is gone and a large tree takes a moment: say it runs.
-                let undoing = adw::Toast::builder()
-                    .title("Undoing changes…")
-                    .timeout(0)
-                    .build();
-                obj.imp().add_toast(undoing.clone());
+                let undoing = obj.imp().progress_toast("Undoing changes…");
                 let done = off_main("the undo", move || crate::restore::apply(&repo, &plan)).await;
                 undoing.dismiss();
                 let imp = obj.imp();
                 match done {
                     Ok(done) if done.mismatched.is_empty() && done.refused.is_empty() => {
                         info!("Restored a tab's working tree; undo point {pinned}");
-                        let toast = adw::Toast::builder()
-                            .title("Changes undone")
-                            .button_label("Undo")
-                            .timeout(15)
-                            .build();
-                        toast.connect_button_clicked(glib::clone!(
-                            #[weak]
-                            obj,
-                            #[weak]
-                            page,
-                            move |_| obj.imp().confirm_restore(
-                                &page,
-                                pinned.clone(),
-                                "how they were before the undo"
-                            )
-                        ));
-                        imp.add_toast(toast);
+                        let page = page.downgrade();
+                        imp.action_toast(
+                            "Changes undone",
+                            "Undo",
+                            15,
+                            adw::ToastPriority::Normal,
+                            move |imp| {
+                                if let Some(page) = page.upgrade() {
+                                    imp.confirm_restore(
+                                        &page,
+                                        pinned.clone(),
+                                        "how they were before the undo",
+                                    );
+                                }
+                            },
+                        );
                     }
                     Ok(done) => {
                         warn!(

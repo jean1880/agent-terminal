@@ -526,19 +526,7 @@ impl AgentTerminalWindow {
         match notice {
             WriteNotice::Toast { text, undo: false } => self.show_toast(&text),
             WriteNotice::Toast { text, undo: true } => {
-                let toast = adw::Toast::builder()
-                    .title(text)
-                    .use_markup(false)
-                    .button_label("Undo")
-                    .timeout(10)
-                    .build();
-                let obj = self.obj().downgrade();
-                toast.connect_button_clicked(move |_| {
-                    if let Some(window) = obj.upgrade() {
-                        undo(window.imp());
-                    }
-                });
-                self.add_toast(toast);
+                self.action_toast(&text, "Undo", 10, adw::ToastPriority::Normal, undo);
             }
             WriteNotice::Failure { heading, body } => present_message(&self.obj(), heading, &body),
         }

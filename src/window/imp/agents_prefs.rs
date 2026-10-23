@@ -520,18 +520,12 @@ impl AgentTerminalWindow {
             .iter()
             .find(|(m, _)| *m == mode)
             .map_or("This mode", |(_, n)| *n);
-        let toast = adw::Toast::builder()
-            .title(format!("{name} for this thread"))
-            .use_markup(false)
-            .button_label(format!("Make Default for {}", driver.info().long_label))
-            .timeout(8)
-            .build();
-        let obj = self.obj();
-        toast.connect_button_clicked(glib::clone!(
-            #[weak]
-            obj,
-            move |_| {
-                let imp = obj.imp();
+        self.action_toast(
+            &format!("{name} for this thread"),
+            &format!("Make Default for {}", driver.info().long_label),
+            8,
+            adw::ToastPriority::Normal,
+            move |imp| {
                 // Ask is the built-in default, stored as none (as the Settings row does).
                 imp.edit_agent_profile(driver, |p| {
                     p.default_mode = Some(mode).filter(|m| *m != Mode::Ask);
@@ -540,9 +534,8 @@ impl AgentTerminalWindow {
                     "New {} threads start in {name}",
                     driver.info().long_label
                 ));
-            }
-        ));
-        self.add_toast(toast);
+            },
+        );
     }
 
     fn agent_profile_now(&self, driver: Driver) -> Profile {
