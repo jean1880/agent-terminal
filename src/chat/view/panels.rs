@@ -12,7 +12,7 @@ use agent_core::catalog::{group_for_picker, CatalogModel};
 use gtk4::glib;
 use serde_json::Value;
 
-use super::cards::{accent_class, brand_image, driver_name, label};
+use super::cards::{accent_class, brand_image, label};
 use super::header::gauge_text;
 use super::model::{format_tokens, Gauge};
 use super::payload;
@@ -200,10 +200,6 @@ fn padded(child: &impl IsA<gtk4::Widget>) -> gtk4::Box {
 // ---------------------------------------------------------------------------------------------
 
 /// The group heading for an agent's models.
-fn group_title(driver: Driver) -> &'static str {
-    driver.info().long_label
-}
-
 /// The fallback list, when there is no [`ModelSource`]: the backend's own `ListModels` answer,
 /// all attributed to the current agent.
 fn catalog_from_payload(driver: Driver, entries: Vec<payload::ModelEntry>) -> Vec<CatalogModel> {
@@ -301,7 +297,7 @@ fn model_list(
     let status = Rc::new(status.clone()); // shared by every row's handlers
     let column = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
     for (driver, rows) in groups {
-        let heading_text = label(&group_title(driver).to_uppercase(), &["model-group"]);
+        let heading_text = label(&driver.info().long_label.to_uppercase(), &["model-group"]);
         let heading = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
         heading.add_css_class(accent_class(driver));
         heading.set_halign(gtk4::Align::Start);
@@ -704,7 +700,7 @@ pub fn model_picker(ctx: &PanelCtx) {
         }
         None => show_error(
             &stack,
-            &format!("{} cannot list its models.", driver_name(status.driver)),
+            &format!("{} cannot list its models.", status.driver.info().label),
         ),
     }
     d.present(Some(&ctx.parent));
@@ -757,7 +753,7 @@ fn load_mcp(ctx: &PanelCtx, stack: &gtk4::Stack) {
                     row.set_subtitle(&sub);
                     let dot = label(
                         "●",
-                        &["mcp-dot", &format!("mcp-{}", status_class(&s.status))],
+                        &["mcp-dot", &format!("mcp-{}", mcp_status_class(&s.status))],
                     );
                     row.add_prefix(&dot);
 
@@ -877,7 +873,7 @@ fn reconnect_toast(server: &str, result: &Result<Value, String>) -> adw::Toast {
     toast
 }
 
-fn status_class(status: &str) -> &'static str {
+fn mcp_status_class(status: &str) -> &'static str {
     match status {
         "connected" | "ok" | "running" => "ok",
         "pending" | "connecting" | "needs-auth" => "pending",
@@ -1350,9 +1346,6 @@ pub(crate) mod tests {
             &status(Driver::Claude, Some("gemini-3.1-pro-high"))
         ));
         assert!(!is_current(&m, &status(Driver::Agy, None)));
-        assert_eq!(group_title(Driver::Claude), "Claude");
-        assert_eq!(group_title(Driver::Agy), "Antigravity");
-        assert_eq!(group_title(Driver::Codex), "Codex");
     }
 
     #[test]
@@ -1457,10 +1450,10 @@ pub(crate) mod tests {
 
     #[test]
     fn mcp_status_classes() {
-        assert_eq!(status_class("connected"), "ok");
-        assert_eq!(status_class("disabled"), "off");
-        assert_eq!(status_class("needs-auth"), "pending");
-        assert_eq!(status_class("failed"), "bad");
+        assert_eq!(mcp_status_class("connected"), "ok");
+        assert_eq!(mcp_status_class("disabled"), "off");
+        assert_eq!(mcp_status_class("needs-auth"), "pending");
+        assert_eq!(mcp_status_class("failed"), "bad");
     }
 
     #[test]

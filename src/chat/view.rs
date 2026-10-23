@@ -1025,7 +1025,7 @@ impl Inner {
             .set_activity(&activity.clone().with_lifecycle(lifecycle));
         let stop_note = status.capabilities.unsupported_note(
             agent_core::caps::Feature::InterruptKeepsProcess,
-            cards::driver_name(status.driver),
+            status.driver.info().label,
         );
         self.thinking.set(&activity, status.driver, &sub_agents);
         self.refresh_background();
@@ -1129,7 +1129,7 @@ impl Inner {
         if mode == Mode::Ask {
             if let Some(note) = caps.unsupported_note(
                 agent_core::caps::Feature::LiveApprovals,
-                cards::driver_name(self.backend.status().driver),
+                self.backend.status().driver.info().label,
             ) {
                 let changes = self.model.borrow_mut().push_notice(note, Tone::Warning);
                 self.handle(changes);
@@ -1315,7 +1315,7 @@ impl Inner {
                         format!(
                             "{} has no compaction command, so the conversation continues in a \
                              new thread with a budgeted summary.",
-                            cards::driver_name(status.driver)
+                            status.driver.info().label
                         ),
                         Tone::Info,
                     );
@@ -1349,7 +1349,7 @@ impl Inner {
             BuiltinAction::NewThread => self.emit(ViewAction::NewThread),
             BuiltinAction::Help => {
                 let changes = self.model.borrow_mut().push_notice(
-                    help_text(&status.capabilities, cards::driver_name(status.driver)),
+                    help_text(&status.capabilities, status.driver.info().label),
                     Tone::Info,
                 );
                 self.handle(changes);
@@ -1377,7 +1377,7 @@ fn unavailable_builtin_note(text: &str, status: &SessionStatus) -> Option<String
     }
     status
         .capabilities
-        .unsupported_note(feature, cards::driver_name(status.driver))
+        .unsupported_note(feature, status.driver.info().label)
 }
 
 /// The `/help` text: the built-ins this agent can back, then the ones it cannot (with why), then
@@ -1575,7 +1575,7 @@ fn placeholder_text(status: &SessionStatus) -> String {
     }
     format!(
         "Message {}  ·  {}",
-        cards::driver_name(status.driver),
+        status.driver.info().label,
         tips.join("  ·  ")
     )
 }
@@ -4332,7 +4332,7 @@ pub(crate) mod tests {
         use agent_core::caps::Capabilities;
         for driver in Driver::ALL {
             let caps = Capabilities::of(driver);
-            let name = cards::driver_name(driver);
+            let name = driver.info().label;
             let help = help_text(&caps, name);
             let status = SessionStatus {
                 driver,

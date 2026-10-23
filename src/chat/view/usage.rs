@@ -14,7 +14,7 @@ use agent_core::event::QuotaWindow;
 use agent_core::quota::{parse_rfc3339, resets_in_text};
 use gtk4::prelude::*;
 
-use super::cards::{accent_class, brand_image, driver_name, label};
+use super::cards::{accent_class, brand_image, label};
 use crate::account_status::{AccountStatus, Snapshot};
 use crate::availability::AgentAvailability;
 use crate::freshness::{
@@ -292,7 +292,7 @@ impl UsageIndicator {
         self.root
             .set_visible(compact_visible(shown, self.filter.get()));
         let label = match self.filter.get() {
-            Some(driver) => format!("Usage for {}; show all agents", driver_name(driver)),
+            Some(driver) => format!("Usage for {}; show all agents", driver.info().label),
             None => "Agent usage; show all agents".to_owned(),
         };
         self.root
@@ -411,7 +411,7 @@ fn compact_form(driver: Driver, snap: &Snapshot, now: i64) -> gtk4::Box {
         b.add_css_class("usage-loading");
         b.append(&crate::brand::drip(driver));
         b.append(&loading_rows(&snap.windows));
-        b.set_tooltip_text(Some(&loading_tooltip(driver_name(driver))));
+        b.set_tooltip_text(Some(&loading_tooltip(driver.info().label)));
         return b;
     }
     b.append(&brand_image(driver));
@@ -419,7 +419,7 @@ fn compact_form(driver: Driver, snap: &Snapshot, now: i64) -> gtk4::Box {
         b.append(&label("signed out", &["usage-text", "usage-crit"]));
         b.set_tooltip_text(Some(&format!(
             "{} is not signed in. {}",
-            driver_name(driver),
+            driver.info().label,
             driver.info().sign_in_hint
         )));
         return b;
@@ -429,7 +429,7 @@ fn compact_form(driver: Driver, snap: &Snapshot, now: i64) -> gtk4::Box {
     let (short, weekly) = split_windows(&snap.windows);
     if state == Freshness::Expired || (short.is_none() && weekly.is_none()) {
         b.append(&label("Unknown", &["usage-text"]));
-        b.set_tooltip_text(Some(&unknown_tooltip(driver_name(driver), read.as_deref())));
+        b.set_tooltip_text(Some(&unknown_tooltip(driver.info().label, read.as_deref())));
         return b;
     }
     let aging = state == Freshness::Aging || snap.refresh_failed;
@@ -438,7 +438,7 @@ fn compact_form(driver: Driver, snap: &Snapshot, now: i64) -> gtk4::Box {
     }
     let rows = gtk4::Box::new(gtk4::Orientation::Vertical, 1);
     rows.set_valign(gtk4::Align::Center);
-    let mut tips = vec![driver_name(driver).to_owned()];
+    let mut tips = vec![driver.info().label.to_owned()];
     for window in [short, weekly] {
         let Some(w) = window else { continue };
         let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 5);
@@ -468,7 +468,7 @@ fn detail_form(driver: Driver, snap: &Snapshot, now: i64) -> gtk4::Box {
     section.add_css_class(accent_class(driver));
     let head = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
     head.append(&brand_image(driver));
-    head.append(&label(driver_name(driver), &["usage-agent"]));
+    head.append(&label(driver.info().label, &["usage-agent"]));
     section.append(&head);
     if snap.signed_out {
         let l = label("Not signed in", &["usage-text", "usage-crit"]);

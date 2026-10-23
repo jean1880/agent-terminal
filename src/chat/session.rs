@@ -574,14 +574,6 @@ pub struct ChatSession {
     inner: Rc<Inner>,
 }
 
-fn driver_name(driver: Driver) -> &'static str {
-    driver.info().key
-}
-
-fn driver_label(driver: Driver) -> &'static str {
-    driver.info().long_label
-}
-
 /// The store a session writes through, and the thread's active provider thread when its caller
 /// has already read it (off the main thread, after the store writer's barrier).
 pub struct SessionStore {
@@ -713,7 +705,7 @@ impl ChatSession {
             }
             _ => match store.create_provider_thread(
                 &thread,
-                driver_name(driver),
+                driver.info().key,
                 open.model.as_deref().unwrap_or("default"),
             ) {
                 Ok(p) => p,
@@ -979,7 +971,7 @@ fn create_provider_thread(
     driver: Driver,
     model: Option<&str>,
 ) -> Result<ProviderThreadId, agent_kit::store::StoreError> {
-    let id = store.add_provider_thread(thread, driver_name(driver), model.unwrap_or("default"))?;
+    let id = store.add_provider_thread(thread, driver.info().key, model.unwrap_or("default"))?;
     store.set_active_provider_thread(thread, &id)?;
     Ok(id)
 }
@@ -1120,7 +1112,7 @@ impl Inner {
                     let previous = self.state.borrow().native_id.clone();
                     let resumed = previous.as_deref() == Some(native_id.as_str());
                     if let Some(old) = previous.filter(|old| old != native_id) {
-                        let driver = driver_name(self.adapter.borrow().driver());
+                        let driver = self.adapter.borrow().driver().info().key;
                         if let Err(e) = self.store.dismiss_native(driver, &old) {
                             warn!(error = %e, "could not record the replaced native session");
                         }
@@ -2401,7 +2393,7 @@ impl Inner {
         let (workspace, cwd) = self.rule_dirs(input, action.as_ref());
         let home = Self::home();
         let ctx = crate::always_allow::Context {
-            driver: driver_name(driver),
+            driver: driver.info().key,
             workspace: &workspace,
             cwd: cwd.as_deref(),
             home: home.as_deref(),
@@ -2570,7 +2562,7 @@ impl Inner {
         let workspace = PathBuf::from(self.open.borrow().cwd.clone());
         let home = Self::home();
         let ctx = crate::always_allow::Context {
-            driver: driver_name(driver),
+            driver: driver.info().key,
             workspace: &workspace,
             cwd: pending.and_then(|(_, cwd, _)| cwd.as_deref()),
             home: home.as_deref(),
@@ -3803,7 +3795,7 @@ impl Inner {
                     &format!(
                         "This delegated agent cannot leave its task's mode ({}); it stays in its \
                          current mode.",
-                        mode_label(child.mode)
+                        child.mode.label()
                     ),
                     true,
                 );
@@ -3954,7 +3946,7 @@ impl Inner {
         let mut out = vec![format!(
             "Continues this thread in {} from a summary of it: reasoning and tool state stay \
              behind.",
-            driver_label(to)
+            to.info().long_label
         )];
         let rules = self.session_rules.borrow().rules.len();
         if rules > 0 {
@@ -4226,7 +4218,7 @@ impl Inner {
         // Queued to the store writer: a refusal there is reported by the writer, not here.
         let new_pt = match self.store.create_provider_thread(
             &self.thread,
-            driver_name(driver),
+            driver.info().key,
             model.as_deref().unwrap_or("default"),
         ) {
             Ok(p) => p,
@@ -4263,9 +4255,9 @@ impl Inner {
         );
         *self.rollback.borrow_mut() = Some(previous);
         let mut text = if carried == 0 {
-            format!("Switched to {}", driver_label(driver))
+            format!("Switched to {}", driver.info().long_label)
         } else {
-            handoff_notice(&format!("in {}", driver_label(driver)), &handoff)
+            handoff_notice(&format!("in {}", driver.info().long_label), &handoff)
         };
         // Session approvals belong to the agent they were given to; Always rules carry.
         if from != driver {
@@ -4328,7 +4320,7 @@ impl Inner {
             self.notice(format!(
                 "Dangerous permissive mode has ended: it lasts for one agent session, so {} \
                      starts in your previous mode.",
-                driver_label(driver)
+                driver.info().long_label
             ));
         }
         let hookless_agy = driver == Driver::Agy && self.approval().is_none();
@@ -4367,8 +4359,8 @@ impl Inner {
     /// fresh launch (and approval socket: the old one closed with its process). The handoff the
     /// new agent was owed is withdrawn: the old agent has the history in its own session.
     fn roll_back(self: &Rc<Self>, previous: Previous, reason: &str) {
-        let failed = driver_label(self.adapter.borrow().driver());
-        let back = driver_label(previous.driver);
+        let failed = self.adapter.borrow().driver().info().long_label;
+        let back = previous.driver.info().long_label;
         let factory = self.factory.borrow().clone();
         let launch = match factory.map(|f| f(previous.driver)) {
             Some(Ok(launch)) => launch,
@@ -4999,15 +4991,6 @@ impl Inner {
 const CHILD_RULE_REFUSED: &str = "a delegated agent keeps rules only for files in its own worktree";
 
 /// A mode as the picker names it, for notices.
-fn mode_label(mode: Mode) -> &'static str {
-    match mode {
-        Mode::Ask => "Ask before edits",
-        Mode::AcceptEdits => "Accept edits",
-        Mode::Plan => "Plan",
-        Mode::Bypass => "Dangerous permissive",
-    }
-}
-
 impl Inner {
     /// Revalidates a pending grant without retaining any borrow across the live gate callback.
     fn child_answer(&self, request: &str, decision: Decision) -> Decision {
@@ -5339,7 +5322,7 @@ pub(crate) fn seeded_handoff_events(handoff: &Handoff, source: &str) -> Vec<Enve
 /// `HandoffSeeded` the new agent's session re-arms from history, then the same notice a live
 /// switch shows. Carrying nothing, only "Switched to <agent>".
 pub(crate) fn switched_handoff_events(handoff: &Handoff, driver: Driver) -> Vec<Envelope> {
-    let label = driver_label(driver);
+    let label = driver.info().long_label;
     if handoff.carried == 0 {
         return vec![Envelope::new(Event::Notice {
             text: format!("Switched to {label}"),
@@ -9239,7 +9222,7 @@ mod tests {
                 None,
             );
             session.set_adapter_factory(Rc::new(|d| {
-                Err(format!("{} is not available", driver_label(d)))
+                Err(format!("{} is not available", d.info().long_label))
             }));
             session.switch(Driver::Claude, Some("opus".into()), None);
             assert!(has(&seen, |e| matches!(e, Event::Error { message }

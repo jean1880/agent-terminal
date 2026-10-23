@@ -7,7 +7,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use agent_core::adapter::{Driver, Mode};
 
-use super::cards::{accent_class, driver_name};
+use super::cards::accent_class;
 use super::model::{format_tokens, Activity, Gauge};
 
 /// Hookless agy cannot enforce a new policy mid-turn without interrupting it.
@@ -44,15 +44,6 @@ fn label(text: &str, classes: &[&str]) -> gtk4::Label {
 /// Dropdown order of the modes. Driven by index both ways; the guard test keeps it complete.
 /// The dangerous one is last, below a divider ([`mode_factory`]).
 pub const MODES: [Mode; 4] = [Mode::Ask, Mode::AcceptEdits, Mode::Plan, Mode::Bypass];
-
-pub fn mode_label(mode: Mode) -> &'static str {
-    match mode {
-        Mode::Ask => "Ask before edits",
-        Mode::AcceptEdits => "Accept edits",
-        Mode::Plan => "Plan",
-        Mode::Bypass => "Dangerous permissive",
-    }
-}
 
 /// The names the narrow header uses, in [`MODES`] order.
 const SHORT_NAMES: [&str; 4] = ["Ask", "Accept", "Plan", "Danger"];
@@ -260,7 +251,7 @@ impl Header {
         chip.set_child(Some(&chip_box));
         root.append(&chip);
 
-        let names: Vec<&str> = MODES.iter().map(|m| mode_label(*m)).collect();
+        let names: Vec<&str> = MODES.iter().map(|m| m.label()).collect();
         let mode = gtk4::DropDown::from_strings(&names);
         mode.set_factory(Some(&mode_factory(false)));
         mode.set_list_factory(Some(&mode_factory(true)));
@@ -437,7 +428,7 @@ impl Header {
                     root.remove_css_class("compact");
                 }
                 if let Some(mode) = mode.upgrade() {
-                    let names: Vec<_> = MODES.iter().map(|m| mode_label(*m)).collect();
+                    let names: Vec<_> = MODES.iter().map(|m| m.label()).collect();
                     set_mode_names(&mode, &guard, &names);
                 }
             }
@@ -501,7 +492,7 @@ impl Header {
         self.last_driver.set(Some(driver));
         self.brand
             .set_from_gicon(&crate::icons::driver_icon(driver));
-        self.agent.set_text(driver_name(driver));
+        self.agent.set_text(driver.info().label);
         let mut model_text = match pending {
             Some(target) => match model {
                 Some(previous) => format!("{previous} → {target} (pending)"),
@@ -524,7 +515,7 @@ impl Header {
         } else {
             self.chip.remove_css_class("pending");
         }
-        let name = format!("{} · {}", driver_name(driver), model_text);
+        let name = format!("{} · {}", driver.info().label, model_text);
         self.chip
             .update_property(&[gtk4::accessible::Property::Label(&name)]);
         self.chip.set_tooltip_text(Some(&format!(
@@ -543,7 +534,7 @@ impl Header {
             self.mode.remove_css_class("mode-danger");
         }
         self.mode
-            .update_property(&[gtk4::accessible::Property::Label(mode_label(mode))]);
+            .update_property(&[gtk4::accessible::Property::Label(mode.label())]);
     }
 
     pub fn set_text_scale(&self, scale: f64) {
@@ -562,12 +553,12 @@ impl Header {
     }
 
     pub fn set_pending_mode(&self, pending: Option<Mode>) {
-        let hint = pending.map(|mode| format!("Next turn: {}", mode_label(mode)));
+        let hint = pending.map(|mode| format!("Next turn: {}", mode.label()));
         let effective = MODES
             .get(self.mode.selected() as usize)
             .copied()
             .unwrap_or(Mode::Ask);
-        let effective_hint = format!("{} (/mode)", mode_label(effective));
+        let effective_hint = format!("{} (/mode)", effective.label());
         self.pending_mode.set_text(hint.as_deref().unwrap_or(""));
         self.pending_mode.set_visible(pending.is_some());
         // The class starts its pulse, so it comes and goes with the hint.
