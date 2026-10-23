@@ -74,6 +74,25 @@ fn illegal(from: WorkerState, input: &WorkerInput) -> LifecycleError {
     }
 }
 
+/// The state a worker is in once its active turn ended as `turn`.
+pub fn worker_state_after(turn: TurnState) -> WorkerState {
+    match turn {
+        TurnState::Completed => WorkerState::Completed,
+        TurnState::Failed => WorkerState::Failed,
+        // The process is alive (an exit is a separate input): idle, not stopped.
+        TurnState::Interrupted => WorkerState::Waiting,
+    }
+}
+
+/// The state a run is in once its turn ended as `turn`.
+pub fn run_state_after(turn: TurnState) -> RunState {
+    match turn {
+        TurnState::Completed => RunState::Completed,
+        TurnState::Interrupted => RunState::Interrupted,
+        TurnState::Failed => RunState::Failed,
+    }
+}
+
 /// One worker transition. `active` is the worker's current run, if any.
 pub fn worker_step(
     state: WorkerState,
@@ -119,12 +138,7 @@ pub fn worker_step(
                 return Err(LifecycleError::StaleRun);
             }
             match state {
-                S::Running | S::Waiting | S::Stopping => Ok(match turn {
-                    TurnState::Completed => S::Completed,
-                    TurnState::Failed => S::Failed,
-                    // The process is alive (an exit is a separate input): idle, not stopped.
-                    TurnState::Interrupted => S::Waiting,
-                }),
+                S::Running | S::Waiting | S::Stopping => Ok(worker_state_after(*turn)),
                 _ => Err(illegal(state, input)),
             }
         }
@@ -232,11 +246,7 @@ pub fn run_step(state: RunState, input: &WorkerInput) -> Result<RunState, Lifecy
             _ => Err(run_illegal(input)),
         },
         WorkerInput::TurnEnded { state: turn, .. } => match state {
-            R::Starting | R::Running | R::Stopping => Ok(match turn {
-                TurnState::Completed => R::Completed,
-                TurnState::Interrupted => R::Interrupted,
-                TurnState::Failed => R::Failed,
-            }),
+            R::Starting | R::Running | R::Stopping => Ok(run_state_after(*turn)),
             _ => Err(run_illegal(input)),
         },
         WorkerInput::CancelRequested { .. }
@@ -291,6 +301,34 @@ mod tests {
         S::Stopping,
         S::Unknown,
     ];
+
+    #[test]
+    fn turn_end_states_match_the_reducers() {
+        for turn in [
+            TurnState::Completed,
+            TurnState::Interrupted,
+            TurnState::Failed,
+        ] {
+            let run = r("aaaaaaaa");
+            let ended = WorkerInput::TurnEnded {
+                run: run.clone(),
+                state: turn,
+            };
+            assert_eq!(
+                worker_step(S::Running, Some(&run), &ended),
+                Ok(worker_state_after(turn))
+            );
+            assert_eq!(
+                run_step(RunState::Running, &ended),
+                Ok(run_state_after(turn))
+            );
+        }
+        assert_eq!(worker_state_after(TurnState::Interrupted), S::Waiting);
+        assert_eq!(
+            run_state_after(TurnState::Interrupted),
+            RunState::Interrupted
+        );
+    }
 
     fn inputs(run: &RunId) -> Vec<WorkerInput> {
         vec![

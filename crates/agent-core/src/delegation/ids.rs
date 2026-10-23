@@ -228,9 +228,37 @@ pub struct AuthorityEpoch(pub u64);
 #[serde(transparent)]
 pub struct ProcessGeneration(pub u64);
 
+impl AuthorityEpoch {
+    /// The epoch a store row holds: a negative value (never written) reads as 0.
+    pub fn from_stored(stored: i64) -> Self {
+        Self(stored.max(0) as u64)
+    }
+}
+
+impl ProcessGeneration {
+    /// The generation after this one.
+    pub fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+
+    /// The generation a store row holds: a negative value (never written) reads as 0.
+    pub fn from_stored(stored: i64) -> Self {
+        Self(stored.max(0) as u64)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stored_counters_clamp_at_zero() {
+        assert_eq!(AuthorityEpoch::from_stored(-3), AuthorityEpoch(0));
+        assert_eq!(AuthorityEpoch::from_stored(4), AuthorityEpoch(4));
+        assert_eq!(ProcessGeneration::from_stored(-1), ProcessGeneration(0));
+        assert_eq!(ProcessGeneration::from_stored(7), ProcessGeneration(7));
+        assert_eq!(ProcessGeneration(7).next(), ProcessGeneration(8));
+    }
 
     #[test]
     fn handles_accept_the_documented_shapes() {

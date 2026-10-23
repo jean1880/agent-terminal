@@ -26,6 +26,7 @@ pub mod model_tags;
 pub mod question_extract;
 pub mod quota;
 pub mod redact;
+pub mod serde_name;
 pub mod shell_words;
 pub mod text;
 pub mod tool_title;
