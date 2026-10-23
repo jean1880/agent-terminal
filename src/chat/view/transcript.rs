@@ -1089,6 +1089,13 @@ impl TranscriptView {
         self.first.set(keep_from);
     }
 
+    /// Rows built as widgets, nested ones included (tests and measurements).
+    #[cfg(test)]
+    pub fn row_count(&self) -> usize {
+        self.rows.borrow().len()
+    }
+
+    /// Top-level rows built as widgets.
     #[cfg(test)]
     pub fn materialised(&self) -> usize {
         let mut n = 0;
