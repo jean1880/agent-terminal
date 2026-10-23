@@ -789,7 +789,7 @@ impl AgentTerminalWindow {
 
         // The rules file and the permission files are read off the main thread; only the newest
         // result is shown.
-        let sync_generation = Rc::new(std::cell::Cell::new(0u64));
+        let sync_generation = Rc::new(crate::window::Generation::new());
         let sync_cb = Rc::new(glib::clone!(
             #[weak]
             warning_row,
@@ -817,8 +817,7 @@ impl AgentTerminalWindow {
                 };
                 let sources = obj.imp().permission_sources();
                 let codex_inputs = obj.imp().codex_inputs();
-                let current = sync_generation.get().wrapping_add(1);
-                sync_generation.set(current);
+                let current = sync_generation.next();
                 let sync_generation = sync_generation.clone();
                 let export_text = export_text.clone();
                 glib::spawn_future_local(glib::clone!(
@@ -873,7 +872,7 @@ impl AgentTerminalWindow {
                         else {
                             return;
                         };
-                        if sync_generation.get() != current {
+                        if !sync_generation.is_current(current) {
                             return;
                         }
                         manage_row.set_subtitle(&blocked.unwrap_or_else(|| {
@@ -1734,20 +1733,19 @@ impl AgentTerminalWindow {
             .build();
         let command_error = validation_row();
         show_validation(&command, &command_error, COMMAND_HELP, None);
-        let generation = Rc::new(std::cell::Cell::new(0u64));
+        let generation = Rc::new(crate::window::Generation::new());
         let detect = Rc::new(glib::clone!(
             #[weak]
             status,
             #[strong]
             generation,
             move |command: String| {
-                let current = generation.get().wrapping_add(1);
-                generation.set(current);
+                let current = generation.next();
                 status.set_subtitle("Checking…");
                 let generation = generation.clone();
                 glib::MainContext::default().spawn_local(async move {
                     let found = off_main("the check", move || detect_agent(&command)).await;
-                    if generation.get() != current {
+                    if !generation.is_current(current) {
                         return;
                     }
                     match found {

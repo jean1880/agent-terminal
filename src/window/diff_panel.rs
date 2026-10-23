@@ -249,7 +249,7 @@ pub struct DiffPanel {
     colours: Rc<RefCell<DiffColours>>,
     /// Bumped by every refresh, so a slow one that finishes after a newer one
     /// cannot overwrite it.
-    generation: Rc<Cell<u64>>,
+    generation: Rc<super::Generation>,
     /// Called with the file to open when a row's "Open in …" is clicked.
     open_handler: Rc<RefCell<Option<OpenHandler>>>,
     /// The diff on show, for the rows' open buttons.
@@ -443,7 +443,7 @@ impl DiffPanel {
             file_rows: Rc::new(Cell::new(0)),
             views: Rc::new(RefCell::new(Vec::new())),
             colours: Rc::new(RefCell::new(colours.clone())),
-            generation: Rc::new(Cell::new(0)),
+            generation: Rc::new(super::Generation::new()),
             open_handler: Rc::new(RefCell::new(None)),
             shown_sides: Rc::new(RefCell::new(None)),
             placed: Rc::new(Cell::new(false)),
@@ -593,7 +593,7 @@ impl DiffPanel {
     /// Shows the branch's pull-request state from a refresh, unless a newer refresh has started.
     /// `None`: not a repository, and no bar at all.
     pub fn show_pr(&self, generation: u64, outcome: Option<Result<PrOutcome, String>>) {
-        if generation != self.generation.get() {
+        if !self.generation.is_current(generation) {
             return;
         }
         let Some(outcome) = outcome else {
@@ -768,15 +768,14 @@ impl DiffPanel {
     /// Marks a refresh as started and returns its generation, which
     /// [`Self::show`] must be given back.
     pub fn begin(&self) -> u64 {
-        let generation = self.generation.get().wrapping_add(1);
-        self.generation.set(generation);
+        let generation = self.generation.next();
         self.summary.set_text("Loading…");
         generation
     }
 
     /// Shows a finished refresh, unless a newer one has started since.
     pub fn show(&self, generation: u64, result: Result<DiffOutcome, String>) {
-        if generation != self.generation.get() {
+        if !self.generation.is_current(generation) {
             return;
         }
         match result {

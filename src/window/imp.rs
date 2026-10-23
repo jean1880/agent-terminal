@@ -1136,7 +1136,7 @@ thread_local! {
 
     /// Counts profile re-resolutions, so a slow one that finishes after a
     /// newer one is discarded rather than applied last.
-    static PROFILE_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static PROFILE_GENERATION: super::Generation = const { super::Generation::new() };
 
     /// Watches config.json for hand edits, once per process.
     static CONFIG_MONITOR: RefCell<Option<gtk4::gio::FileMonitor>> = const { RefCell::new(None) };
@@ -4616,16 +4616,13 @@ impl AgentTerminalWindow {
         // A slow resolution (an -ic probe) can finish after a quicker one
         // started later — for a newer choice, or a newer profile list under
         // auto-detect. Only the latest request may land.
-        let generation = PROFILE_GENERATION.with(|g| {
-            g.set(g.get() + 1);
-            g.get()
-        });
+        let generation = PROFILE_GENERATION.with(super::Generation::next);
         glib::MainContext::default().spawn_local(glib::clone!(
             #[weak]
             obj,
             async move {
                 let resolved = resolve_active_profile(profiles, preferred, path, home, shell).await;
-                if PROFILE_GENERATION.with(std::cell::Cell::get) != generation {
+                if !PROFILE_GENERATION.with(|g| g.is_current(generation)) {
                     debug!("Dropping a profile resolution a newer one has superseded");
                     return;
                 }
@@ -6167,7 +6164,7 @@ impl AgentTerminalWindow {
 
         // Each edit supersedes the check before it: only the newest may
         // enable Create. Checked after a pause, and off the main thread.
-        let generation = std::rc::Rc::new(std::cell::Cell::new(0u64));
+        let generation = std::rc::Rc::new(super::Generation::new());
         let validate = std::rc::Rc::new(glib::clone!(
             #[weak]
             dialog,
@@ -6186,8 +6183,7 @@ impl AgentTerminalWindow {
             #[strong]
             generation,
             move || {
-                let current = generation.get().wrapping_add(1);
-                generation.set(current);
+                let current = generation.next();
                 dialog.set_response_enabled("create", false);
                 let name = branch.text().trim().to_string();
                 let start = base.text().trim().to_string();
@@ -6209,7 +6205,7 @@ impl AgentTerminalWindow {
                         #[weak]
                         problem,
                         move || {
-                            if generation.get() != current {
+                            if !generation.is_current(current) {
                                 return;
                             }
                             glib::MainContext::default().spawn_local(async move {
@@ -6218,7 +6214,7 @@ impl AgentTerminalWindow {
                                     crate::worktree::resolve_base(&main, &start).map(|_| ())
                                 })
                                 .await;
-                                if generation.get() != current {
+                                if !generation.is_current(current) {
                                     return;
                                 }
                                 match checked {
