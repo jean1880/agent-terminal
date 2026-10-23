@@ -1969,11 +1969,28 @@ impl CodexAdapter {
             )));
         };
         self.remember_settled_request(request, form.scope.clone());
-        let mut lines = vec![json!({"id": form.rpc_id, "result": result}).to_string()];
-        if action == FormAction::Cancel {
-            lines.extend(self.interrupt_scope(&form.scope));
+        Ok(self.scoped_reply(
+            &form.rpc_id,
+            result,
+            &form.scope,
+            action == FormAction::Cancel,
+        ))
+    }
+
+    /// The reply to server request `rpc_id`, followed, when `interrupt` is set, by a
+    /// `turn/interrupt` of `scope`'s turn if that is the active one (never another turn).
+    fn scoped_reply(
+        &mut self,
+        rpc_id: &Value,
+        result: Value,
+        scope: &RequestScope,
+        interrupt: bool,
+    ) -> Vec<Action> {
+        let mut lines = vec![json!({"id": rpc_id, "result": result}).to_string()];
+        if interrupt {
+            lines.extend(self.interrupt_scope(scope));
         }
-        Ok(vec![Action::Write(lines)])
+        vec![Action::Write(lines)]
     }
 
     // ---- responses ----
@@ -2065,16 +2082,7 @@ impl CodexAdapter {
                 }
                 config.insert("features.multi_agent".into(), Value::Bool(false));
                 config.insert("features.multi_agent_v2".into(), Value::Bool(false));
-                if method == "thread/resume" {
-                    let mut fallback = params.clone();
-                    if let Some(map) = fallback.as_object_mut() {
-                        map.remove("threadId");
-                        map.remove("excludeTurns");
-                    }
-                    self.resume_fallback = Some(fallback);
-                }
-                let line = self.request(Pending::ThreadStart, &method, params);
-                self.write(line);
+                self.launch_configured_thread(&method, params);
             }
             // The note is a hint: an unreadable config starts the thread without it, rather than
             // failing (and the user's own instructions are never replaced by it alone).
@@ -2090,16 +2098,7 @@ impl CodexAdapter {
                         );
                     }
                 }
-                if method == "thread/resume" {
-                    let mut fallback = params.clone();
-                    if let Some(map) = fallback.as_object_mut() {
-                        map.remove("threadId");
-                        map.remove("excludeTurns");
-                    }
-                    self.resume_fallback = Some(fallback);
-                }
-                let line = self.request(Pending::ThreadStart, &method, params);
-                self.write(line);
+                self.launch_configured_thread(&method, params);
             }
             (Pending::ChildConfig { .. }, None, _) => {
                 self.fail_startup(
@@ -2233,6 +2232,21 @@ impl CodexAdapter {
             // An interrupt with no turn to stop, or an acknowledged compact: nothing to show.
             (Pending::Interrupt | Pending::Compact, _, _) => {}
         }
+    }
+
+    /// Sends the `thread/start` or `thread/resume` a launch configuration was read for. A
+    /// resume keeps a fresh-start copy of `params`, used if Codex kept nothing to resume.
+    fn launch_configured_thread(&mut self, method: &str, params: Value) {
+        if method == "thread/resume" {
+            let mut fallback = params.clone();
+            if let Some(map) = fallback.as_object_mut() {
+                map.remove("threadId");
+                map.remove("excludeTurns");
+            }
+            self.resume_fallback = Some(fallback);
+        }
+        let line = self.request(Pending::ThreadStart, method, params);
+        self.write(line);
     }
 
     fn on_thread_ready(&mut self, result: &Value, out: &mut Vec<Envelope>) {
@@ -2578,12 +2592,12 @@ impl Adapter for CodexAdapter {
                         Decision::Deny => json!({"action": "decline"}),
                         Decision::Cancel => json!({"action": "cancel"}),
                     };
-                    let mut lines =
-                        vec![json!({"id": approval.rpc_id, "result": result}).to_string()];
-                    if decision == Decision::Cancel {
-                        lines.extend(self.interrupt_scope(&approval.scope));
-                    }
-                    return Ok(vec![Action::Write(lines)]);
+                    return Ok(self.scoped_reply(
+                        &approval.rpc_id,
+                        result,
+                        &approval.scope,
+                        decision == Decision::Cancel,
+                    ));
                 }
                 let Some(grant) = rewritten.or(approval.grant) else {
                     let line = json!({
@@ -2602,13 +2616,14 @@ impl Adapter for CodexAdapter {
                         json!({"permissions": {}})
                     }
                 };
-                let mut lines = vec![json!({"id": approval.rpc_id, "result": result}).to_string()];
                 // No refusal value stops a turn here, so Stop turn interrupts it, as the
                 // command approval's `cancel` does.
-                if decision == Decision::Cancel {
-                    lines.extend(self.interrupt_scope(&approval.scope));
-                }
-                Ok(vec![Action::Write(lines)])
+                Ok(self.scoped_reply(
+                    &approval.rpc_id,
+                    result,
+                    &approval.scope,
+                    decision == Decision::Cancel,
+                ))
             }
             Command::Answer { request, answers } => {
                 let Some(question) = self.questions.get(&request).cloned() else {
