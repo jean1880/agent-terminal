@@ -298,20 +298,18 @@ impl Supervisor {
         );
         super::attest::sanitise_identity(&mut identity);
         let plan=SpawnPlan{driver,identity,workspace,launch_json:serde_json::json!({"model":model,"effort":effort,"cwd":child_cwd,"source_repo":lease_plan.as_ref().map(|l|&l.source_repo),"branch":lease_plan.as_ref().map(|l|&l.branch),"base_commit":lease_plan.as_ref().map(|l|&l.base_commit)}).to_string(),cwd:child_cwd.to_string_lossy().into_owned(),state:SpawnState::Starting,process_generation:1};
-        let accept = Accept {
-            principal: caller.clone(),
-            request: ToolRequest::Spawn(r.clone()),
-            resolution: agent_core::delegation::operation::Resolution {
+        let accept = self.accept_request(
+            caller,
+            &root,
+            ToolRequest::Spawn(r.clone()),
+            agent_core::delegation::operation::Resolution {
                 target: None,
                 bound_runs: Vec::new(),
                 base_commit: lease_plan.as_ref().map(|l| l.base_commit.clone()),
             },
-            plan: AcceptPlan::Spawn(Box::new(plan)),
+            AcceptPlan::Spawn(Box::new(plan)),
             warnings,
-            limits: self.limits,
-            live_processes: self.usage(&root).live_processes,
-            dispatching: self.state.borrow().dispatching.clone(),
-        };
+        );
         let (accepted, _) = self.accept(accept, true).await?;
         let accepted = match accepted {
             Accepted::Replay(r) => return super::ops::replay_value(r),

@@ -399,20 +399,18 @@ impl Supervisor {
                 .collect::<Vec<_>>();
             (root, bound)
         };
-        let a = Accept {
-            principal: caller.clone(),
-            request: ToolRequest::Cancel(r.clone()),
-            resolution: Resolution {
+        let a = self.accept_request(
+            caller,
+            &root,
+            ToolRequest::Cancel(r.clone()),
+            Resolution {
                 target: Some(r.worker_id.clone()),
                 bound_runs: bound.clone(),
                 base_commit: None,
             },
-            plan: AcceptPlan::Cancel,
-            warnings: Vec::new(),
-            limits: self.limits,
-            live_processes: self.usage(&root).live_processes,
-            dispatching: self.state.borrow().dispatching.clone(),
-        };
+            AcceptPlan::Cancel,
+            Vec::new(),
+        );
         let (a, _) = self.accept(a, !bound.is_empty()).await?;
         let a = match a {
             Accepted::Replay(r) => return replay_value(r),
@@ -541,19 +539,17 @@ impl Supervisor {
             ));
         }
         let root = self.state.borrow().workers[caller].root.clone();
-        let a = Accept {
-            principal: caller.clone(),
-            request: ToolRequest::Close(r.clone()),
-            resolution: Resolution {
+        let a = self.accept_request(
+            caller,
+            &root,
+            ToolRequest::Close(r.clone()),
+            Resolution {
                 target: Some(r.worker_id.clone()),
                 ..Default::default()
             },
-            plan: AcceptPlan::Close,
-            warnings: Vec::new(),
-            limits: self.limits,
-            live_processes: self.usage(&root).live_processes,
-            dispatching: self.state.borrow().dispatching.clone(),
-        };
+            AcceptPlan::Close,
+            Vec::new(),
+        );
         let (a, _) = self.accept(a, true).await?;
         let a = match a {
             Accepted::Replay(r) => return replay_value(r),
@@ -1559,6 +1555,28 @@ impl Supervisor {
                 return Ok(page);
             }
             glib::timeout_future(Duration::from_millis(25)).await;
+        }
+    }
+    /// `request` from `caller`, ready for [`Self::accept`]: the limits, the live processes of
+    /// `root` and the operations being dispatched are read now.
+    pub(super) fn accept_request(
+        &self,
+        caller: &WorkerId,
+        root: &WorkerId,
+        request: ToolRequest,
+        resolution: Resolution,
+        plan: AcceptPlan,
+        warnings: Vec<Warning>,
+    ) -> Accept {
+        Accept {
+            principal: caller.clone(),
+            request,
+            resolution,
+            plan,
+            warnings,
+            limits: self.limits,
+            live_processes: self.usage(root).live_processes,
+            dispatching: self.state.borrow().dispatching.clone(),
         }
     }
     pub(super) async fn accept(

@@ -142,14 +142,15 @@ impl Supervisor {
             _ => None,
         };
         let root = self.state.borrow().workers[caller].root.clone();
-        let a = Accept {
-            principal: caller.clone(),
-            request: ToolRequest::Send(r.clone()),
-            resolution: agent_core::delegation::operation::Resolution {
+        let a = self.accept_request(
+            caller,
+            &root,
+            ToolRequest::Send(r.clone()),
+            agent_core::delegation::operation::Resolution {
                 target: Some(target.clone()),
                 ..Default::default()
             },
-            plan: AcceptPlan::Send(SendPlan {
+            AcceptPlan::Send(SendPlan {
                 initial: if needs_queue {
                     DeliveryState::QueuedNextTurn
                 } else {
@@ -157,11 +158,8 @@ impl Supervisor {
                 },
                 target_run: live,
             }),
-            warnings: Vec::new(),
-            limits: self.limits,
-            live_processes: self.usage(&root).live_processes,
-            dispatching: self.state.borrow().dispatching.clone(),
-        };
+            Vec::new(),
+        );
         let (accepted, _) = self
             .accept(a, !needs_queue && direction == Direction::ParentToChild)
             .await?;
