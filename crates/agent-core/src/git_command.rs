@@ -155,7 +155,6 @@ fn plain(s: &str) -> bool {
     !crate::text::has_control_or_bidi(s, &['\n'])
 }
 
-
 /// Reads `argv` as a `git` or `gh` command. `None`: it is neither, names no subcommand, or holds
 /// text that is not plain.
 pub fn describe(argv: &[String]) -> Option<GitAction> {

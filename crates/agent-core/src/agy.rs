@@ -45,7 +45,6 @@ static ADAPTER_SEQ: AtomicU64 = AtomicU64::new(0);
 /// The flag the adapter alone decides on (it is the hook's fail-safe, see [`Adapter::argv`]).
 const SKIP_PERMISSIONS: &str = "--dangerously-skip-permissions";
 
-
 /// What a profile argument is to the adapter's launch decisions.
 #[derive(Debug, PartialEq, Eq)]
 enum ProfileArg {

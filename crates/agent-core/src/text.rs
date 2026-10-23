@@ -157,6 +157,9 @@ mod tests {
         assert_eq!(n, "a\nb\nc\nd\ne\nf\ng\n");
         let is_x = |l: &str| l.starts_with('x');
         assert_eq!(quote_matching_lines("x1\ny\n".lines(), is_x), "> x1\ny");
-        assert_eq!(quote_matching_lines("x1\ny\n".split('\n'), is_x), "> x1\ny\n");
+        assert_eq!(
+            quote_matching_lines("x1\ny\n".split('\n'), is_x),
+            "> x1\ny\n"
+        );
     }
 }
