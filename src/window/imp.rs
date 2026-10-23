@@ -1677,53 +1677,84 @@ impl AgentTerminalWindow {
         self.with_page_tab(&page, |t| t.dir.clone())
     }
 
+    /// Adds the window action `name`, which runs `f` (the window held weakly), and returns it.
+    fn add_win_action(&self, name: &str, f: impl Fn(&Self) + 'static) -> gtk4::gio::SimpleAction {
+        let action = gtk4::gio::SimpleAction::new(name, None);
+        let obj = self.obj();
+        action.connect_activate(glib::clone!(
+            #[weak]
+            obj,
+            move |_, _| f(obj.imp())
+        ));
+        obj.add_action(&action);
+        action
+    }
+
+    /// Adds the window action `name`, targeted by a profile name, which runs `f` with that
+    /// profile. A missing name or an unknown profile is logged and does nothing.
+    fn add_profile_action(
+        &self,
+        name: &'static str,
+        f: impl Fn(&Self, Profile) + 'static,
+    ) -> gtk4::gio::SimpleAction {
+        let action = gtk4::gio::SimpleAction::new(name, Some(&String::static_variant_type()));
+        let obj = self.obj();
+        action.connect_activate(glib::clone!(
+            #[weak]
+            obj,
+            move |_, target| {
+                let Some(profile_name) = target.and_then(|t| t.get::<String>()) else {
+                    warn!("{name} activated without a profile name");
+                    return;
+                };
+                let imp = obj.imp();
+                let profile = imp.profile_named(&profile_name);
+                match profile {
+                    Some(profile) => f(imp, profile),
+                    None => warn!("No profile named '{profile_name}'"),
+                }
+            }
+        ));
+        obj.add_action(&action);
+        action
+    }
+
+    /// The configured profile called `name`.
+    fn profile_named(&self, name: &str) -> Option<Profile> {
+        self.config
+            .borrow()
+            .profiles
+            .iter()
+            .find(|p| p.name == name)
+            .cloned()
+    }
+
     /// Sets up GAction handlers for context menu items.
     fn setup_actions(&self) {
         let obj = self.obj();
 
-        // Copy Action
-        let copy_action = gtk4::gio::SimpleAction::new("copy", None);
-        copy_action.connect_activate(glib::clone!(
-            #[weak]
-            obj,
-            move |_, _| {
-                if let Some(terminal) = obj.imp().current_terminal() {
-                    debug!("Action: Copy");
-                    terminal.copy_clipboard_format(Format::Text);
-                } else if let Some(focus) = gtk4::prelude::GtkWindowExt::focus(&obj) {
-                    let _ = focus.activate_action("clipboard.copy", None);
-                }
+        self.add_win_action("copy", |imp| {
+            if let Some(terminal) = imp.current_terminal() {
+                debug!("Action: Copy");
+                terminal.copy_clipboard_format(Format::Text);
+            } else if let Some(focus) = gtk4::prelude::GtkWindowExt::focus(&*imp.obj()) {
+                let _ = focus.activate_action("clipboard.copy", None);
             }
-        ));
-        obj.add_action(&copy_action);
-
-        // Paste Action
-        let paste_action = gtk4::gio::SimpleAction::new("paste", None);
-        paste_action.connect_activate(glib::clone!(
-            #[weak]
-            obj,
-            move |_, _| {
-                if let Some(terminal) = obj.imp().current_terminal() {
-                    debug!("Action: Paste");
-                    terminal.paste_clipboard();
-                } else if let Some(focus) = gtk4::prelude::GtkWindowExt::focus(&obj) {
-                    let _ = focus.activate_action("clipboard.paste", None);
-                }
+        });
+        self.add_win_action("paste", |imp| {
+            if let Some(terminal) = imp.current_terminal() {
+                debug!("Action: Paste");
+                terminal.paste_clipboard();
+            } else if let Some(focus) = gtk4::prelude::GtkWindowExt::focus(&*imp.obj()) {
+                let _ = focus.activate_action("clipboard.paste", None);
             }
-        ));
-        obj.add_action(&paste_action);
+        });
 
         // New Tab Action (bound to Ctrl+Shift+T in main.rs)
-        let new_tab_action = gtk4::gio::SimpleAction::new("new-tab", None);
-        new_tab_action.connect_activate(glib::clone!(
-            #[weak]
-            obj,
-            move |_, _| {
-                debug!("Action: New Tab");
-                obj.imp().new_tab();
-            }
-        ));
-        obj.add_action(&new_tab_action);
+        self.add_win_action("new-tab", |imp| {
+            debug!("Action: New Tab");
+            imp.new_tab();
+        });
 
         // Zoom, search and tab navigation as window actions rather than key
         // handlers on the terminal widget. Anything bound to the terminal is
@@ -1731,73 +1762,38 @@ impl AgentTerminalWindow {
         // search entry — which is why copy, paste and zoom used to stop working
         // in exactly the situations where you would reach for them.
         for (name, delta) in [("zoom-in", 0.1_f64), ("zoom-out", -0.1)] {
-            let action = gtk4::gio::SimpleAction::new(name, None);
-            action.connect_activate(glib::clone!(
-                #[weak]
-                obj,
-                move |_, _| {
-                    let imp = obj.imp();
-                    let current = imp.config.borrow().font_scale;
-                    // Floor rather than clamp to zero: a scale of 0 renders an
-                    // invisible terminal with no obvious way back.
-                    imp.set_font_scale((current + delta).clamp(0.5, 3.0));
-                }
-            ));
-            obj.add_action(&action);
+            self.add_win_action(name, move |imp| {
+                let current = imp.config.borrow().font_scale;
+                // Floor rather than clamp to zero: a scale of 0 renders an
+                // invisible terminal with no obvious way back.
+                imp.set_font_scale((current + delta).clamp(0.5, 3.0));
+            });
         }
-
-        let zoom_reset = gtk4::gio::SimpleAction::new("zoom-reset", None);
-        zoom_reset.connect_activate(glib::clone!(
-            #[weak]
-            obj,
-            move |_, _| obj.imp().set_font_scale(1.0)
-        ));
-        obj.add_action(&zoom_reset);
-
-        let search_action = gtk4::gio::SimpleAction::new("search", None);
-        search_action.connect_activate(glib::clone!(
-            #[weak]
-            obj,
-            move |_, _| obj.imp().toggle_search()
-        ));
-        obj.add_action(&search_action);
-
-        let close_tab = gtk4::gio::SimpleAction::new("close-tab", None);
-        close_tab.connect_activate(glib::clone!(
-            #[weak]
-            obj,
-            move |_, _| {
-                // Through the same door as the sidebar's X, so a running thread asks first.
-                let imp = obj.imp();
-                if let Some(key) = imp.selected_row_key() {
-                    imp.close_row(&key);
-                }
+        self.add_win_action("zoom-reset", |imp| imp.set_font_scale(1.0));
+        self.add_win_action("search", Self::toggle_search);
+        self.add_win_action("close-tab", |imp| {
+            // Through the same door as the sidebar's X, so a running thread asks first.
+            if let Some(key) = imp.selected_row_key() {
+                imp.close_row(&key);
             }
-        ));
-        obj.add_action(&close_tab);
+        });
 
         for (name, forward) in [("next-tab", true), ("previous-tab", false)] {
-            let action = gtk4::gio::SimpleAction::new(name, None);
-            action.connect_activate(glib::clone!(
-                #[weak]
-                obj,
-                move |_, _| {
-                    if let Some(view) = obj.imp().tab_view.borrow().as_ref() {
-                        // select_next_page stops at the end; wrap explicitly so
-                        // cycling works the way it does in every other terminal.
-                        let moved = if forward {
-                            view.select_next_page()
-                        } else {
-                            view.select_previous_page()
-                        };
-                        if !moved && view.n_pages() > 0 {
-                            let wrap = if forward { 0 } else { view.n_pages() - 1 };
-                            view.set_selected_page(&view.nth_page(wrap));
-                        }
+            self.add_win_action(name, move |imp| {
+                if let Some(view) = imp.tab_view.borrow().as_ref() {
+                    // select_next_page stops at the end; wrap explicitly so
+                    // cycling works the way it does in every other terminal.
+                    let moved = if forward {
+                        view.select_next_page()
+                    } else {
+                        view.select_previous_page()
+                    };
+                    if !moved && view.n_pages() > 0 {
+                        let wrap = if forward { 0 } else { view.n_pages() - 1 };
+                        view.set_selected_page(&view.nth_page(wrap));
                     }
                 }
-            ));
-            obj.add_action(&action);
+            });
         }
 
         // Alt+1..9 jump straight to a tab. Parameterised so one action covers all
@@ -1830,75 +1826,27 @@ impl AgentTerminalWindow {
         // by profile name rather than index, so the menus stay correct if the
         // profile list changes underneath them.
         for (name, in_folder) in [("new-tab-profile", false), ("new-tab-folder-profile", true)] {
-            let action = gtk4::gio::SimpleAction::new(name, Some(&String::static_variant_type()));
-            action.connect_activate(glib::clone!(
-                #[weak]
-                obj,
-                move |_, target| {
-                    let Some(profile_name) = target.and_then(|t| t.get::<String>()) else {
-                        warn!("{name} activated without a profile name");
-                        return;
-                    };
-                    let imp = obj.imp();
-                    let profile = imp
-                        .config
-                        .borrow()
-                        .profiles
-                        .iter()
-                        .find(|p| p.name == profile_name)
-                        .cloned();
-                    match profile {
-                        Some(profile) if in_folder => imp.new_tab_in_folder(Some(profile)),
-                        Some(profile) => imp.new_tab_with_profile(&profile),
-                        None => warn!("No profile named '{profile_name}'"),
-                    }
+            self.add_profile_action(name, move |imp, profile| {
+                if in_folder {
+                    imp.new_tab_in_folder(Some(profile));
+                } else {
+                    imp.new_tab_with_profile(&profile);
                 }
-            ));
-            obj.add_action(&action);
+            });
         }
 
         // New Thread in Isolated Git Worktree, as the active profile or a named one.
         // Disabled (greyed out in menus) if git is not installed on the system.
-        let new_tab_worktree = gtk4::gio::SimpleAction::new("new-tab-worktree", None);
         let git_available = agent_kit::git::git_installed();
-        new_tab_worktree.set_enabled(git_available);
-        new_tab_worktree.connect_activate(glib::clone!(
-            #[weak]
-            obj,
-            move |_, _| {
-                debug!("Action: New Thread in Isolated Git Worktree");
-                obj.imp().new_tab_in_worktree(None);
-            }
-        ));
-        obj.add_action(&new_tab_worktree);
-        let new_tab_worktree_as = gtk4::gio::SimpleAction::new(
-            "new-tab-worktree-profile",
-            Some(&String::static_variant_type()),
-        );
-        new_tab_worktree_as.set_enabled(git_available);
-        new_tab_worktree_as.connect_activate(glib::clone!(
-            #[weak]
-            obj,
-            move |_, target| {
-                let Some(profile_name) = target.and_then(|t| t.get::<String>()) else {
-                    warn!("new-tab-worktree-profile activated without a profile name");
-                    return;
-                };
-                let imp = obj.imp();
-                let profile = imp
-                    .config
-                    .borrow()
-                    .profiles
-                    .iter()
-                    .find(|p| p.name == profile_name)
-                    .cloned();
-                match profile {
-                    Some(profile) => imp.new_tab_in_worktree(Some(profile)),
-                    None => warn!("No profile named '{profile_name}'"),
-                }
-            }
-        ));
-        obj.add_action(&new_tab_worktree_as);
+        self.add_win_action("new-tab-worktree", |imp| {
+            debug!("Action: New Thread in Isolated Git Worktree");
+            imp.new_tab_in_worktree(None);
+        })
+        .set_enabled(git_available);
+        self.add_profile_action("new-tab-worktree-profile", |imp, profile| {
+            imp.new_tab_in_worktree(Some(profile));
+        })
+        .set_enabled(git_available);
 
         // Ctrl+Alt+1..9 open the Nth profile, so switching CLI (e.g. to Gemini
         // when Claude runs out of tokens) needs no menu. Indexed because an
@@ -1927,64 +1875,29 @@ impl AgentTerminalWindow {
         // Restart Session Action. restart_tab already existed with exactly the
         // right semantics but was reachable only as a side effect of closing the
         // settings dialog — there was no way to ask for it directly.
-        let restart_action = gtk4::gio::SimpleAction::new("restart-tab", None);
-        restart_action.connect_activate(glib::clone!(
-            #[weak]
-            obj,
-            move |_, _| {
-                debug!("Action: Restart Session");
-                let imp = obj.imp();
-                let page = imp.selected_page();
-                if let Some(page) = page {
-                    imp.restart_tab(&page);
-                }
+        self.add_win_action("restart-tab", |imp| {
+            debug!("Action: Restart Session");
+            if let Some(page) = imp.selected_page() {
+                imp.restart_tab(&page);
             }
-        ));
-        obj.add_action(&restart_action);
+        });
 
         // Checkpoint the current tab's working tree now, whatever the setting:
         // asking is an explicit choice.
-        let checkpoint_action = gtk4::gio::SimpleAction::new("checkpoint-now", None);
-        checkpoint_action.connect_activate(glib::clone!(
-            #[weak]
-            obj,
-            move |_, _| {
-                debug!("Action: Checkpoint Now");
-                let imp = obj.imp();
-                let page = imp.selected_page();
-                if let Some(page) = page {
-                    imp.request_checkpoint(&page, true);
-                }
+        self.add_win_action("checkpoint-now", |imp| {
+            debug!("Action: Checkpoint Now");
+            if let Some(page) = imp.selected_page() {
+                imp.request_checkpoint(&page, true);
             }
-        ));
-        obj.add_action(&checkpoint_action);
-
-        let toggle_diff = gtk4::gio::SimpleAction::new("toggle-diff", None);
-        toggle_diff.connect_activate(glib::clone!(
-            #[weak]
-            obj,
-            move |_, _| {
-                debug!("Action: Toggle Diff Panel");
-                obj.imp().toggle_diff_panel();
-            }
-        ));
-        obj.add_action(&toggle_diff);
+        });
+        self.add_win_action("toggle-diff", |imp| {
+            debug!("Action: Toggle Diff Panel");
+            imp.toggle_diff_panel();
+        });
 
         // 3.0: the thread sidebar and a thread's terminal drawer.
-        let toggle_sidebar = gtk4::gio::SimpleAction::new("toggle-sidebar", None);
-        toggle_sidebar.connect_activate(glib::clone!(
-            #[weak]
-            obj,
-            move |_, _| obj.imp().toggle_sidebar()
-        ));
-        obj.add_action(&toggle_sidebar);
-        let toggle_drawer = gtk4::gio::SimpleAction::new("toggle-drawer", None);
-        toggle_drawer.connect_activate(glib::clone!(
-            #[weak]
-            obj,
-            move |_, _| obj.imp().toggle_drawer()
-        ));
-        obj.add_action(&toggle_drawer);
+        self.add_win_action("toggle-sidebar", Self::toggle_sidebar);
+        self.add_win_action("toggle-drawer", Self::toggle_drawer);
 
         // New Thread With <agent>, by driver key.
         let new_thread_agent =
@@ -2001,13 +1914,7 @@ impl AgentTerminalWindow {
         ));
         obj.add_action(&new_thread_agent);
 
-        let review = gtk4::gio::SimpleAction::new("review-environment", None);
-        review.connect_activate(glib::clone!(
-            #[weak]
-            obj,
-            move |_, _| obj.imp().review_current_environment()
-        ));
-        obj.add_action(&review);
+        self.add_win_action("review-environment", Self::review_current_environment);
 
         // New Terminal Thread as <profile>: the 2.x terminal page, for any profile.
         let new_terminal = gtk4::gio::SimpleAction::new(
@@ -2022,14 +1929,7 @@ impl AgentTerminalWindow {
                     return;
                 };
                 let imp = obj.imp();
-                let profile = imp
-                    .config
-                    .borrow()
-                    .profiles
-                    .iter()
-                    .find(|p| p.name == name)
-                    .cloned();
-                match profile {
+                match imp.profile_named(&name) {
                     Some(profile) => {
                         let dir = profile_tab_dir(profile.dir.as_deref(), imp.current_dir());
                         imp.add_terminal_tab(Some(&profile), dir.as_deref());
@@ -2041,50 +1941,24 @@ impl AgentTerminalWindow {
         obj.add_action(&new_terminal);
 
         // New Tab in Folder Action (opens a folder picker)
-        let new_tab_folder_action = gtk4::gio::SimpleAction::new("new-tab-folder", None);
-        new_tab_folder_action.connect_activate(glib::clone!(
-            #[weak]
-            obj,
-            move |_, _| {
-                debug!("Action: New Tab in Folder");
-                obj.imp().new_tab_in_folder(None);
-            }
-        ));
-        obj.add_action(&new_tab_folder_action);
+        self.add_win_action("new-tab-folder", |imp| {
+            debug!("Action: New Tab in Folder");
+            imp.new_tab_in_folder(None);
+        });
 
         // Resume Session Action (prompts for a session ID)
-        let resume_action = gtk4::gio::SimpleAction::new("resume-session", None);
-        resume_action.connect_activate(glib::clone!(
-            #[weak]
-            obj,
-            move |_, _| {
-                debug!("Action: Resume Session");
-                obj.imp().show_session_browser(None);
-            }
-        ));
-        obj.add_action(&resume_action);
-
-        let preferences_action = gtk4::gio::SimpleAction::new("preferences", None);
-        preferences_action.connect_activate(glib::clone!(
-            #[weak]
-            obj,
-            move |_, _| {
-                debug!("Action: Preferences");
-                obj.imp().show_preferences();
-            }
-        ));
-        obj.add_action(&preferences_action);
-
-        let shortcuts_action = gtk4::gio::SimpleAction::new("shortcuts", None);
-        shortcuts_action.connect_activate(glib::clone!(
-            #[weak]
-            obj,
-            move |_, _| {
-                debug!("Action: Keyboard Shortcuts");
-                obj.imp().show_shortcuts();
-            }
-        ));
-        obj.add_action(&shortcuts_action);
+        self.add_win_action("resume-session", |imp| {
+            debug!("Action: Resume Session");
+            imp.show_session_browser(None);
+        });
+        self.add_win_action("preferences", |imp| {
+            debug!("Action: Preferences");
+            imp.show_preferences();
+        });
+        self.add_win_action("shortcuts", |imp| {
+            debug!("Action: Keyboard Shortcuts");
+            imp.show_shortcuts();
+        });
 
         let updates_action = gtk4::gio::SimpleAction::new("check-updates", None);
         updates_action.connect_activate(glib::clone!(
@@ -5391,13 +5265,7 @@ impl AgentTerminalWindow {
     /// named in the new session's opening prompt. The source tab is left as it
     /// is, so its session can be resumed once its quota resets.
     fn continue_in(&self, target_name: &str) {
-        let target = self
-            .config
-            .borrow()
-            .profiles
-            .iter()
-            .find(|p| p.name == target_name)
-            .cloned();
+        let target = self.profile_named(target_name);
         // A thread hands itself over in place: budgeted, fenced, redacted, shown as a switch
         // divider. That needs no prompt arguments (the handoff rides on the next message), so it
         // comes before the check a terminal tab's hand-off needs. Ceiling: the switch launches
@@ -5441,14 +5309,10 @@ impl AgentTerminalWindow {
                 warn!("Hand-off asked for a tab that is not tracked");
                 return;
             };
-            let source = tab.profile.as_deref().and_then(|name| {
-                self.config
-                    .borrow()
-                    .profiles
-                    .iter()
-                    .find(|p| p.name == name)
-                    .cloned()
-            });
+            let source = tab
+                .profile
+                .as_deref()
+                .and_then(|name| self.profile_named(name));
             let since_ms = tab
                 .started_at
                 .duration_since(std::time::UNIX_EPOCH)
