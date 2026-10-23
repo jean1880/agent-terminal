@@ -172,6 +172,7 @@ impl Worker {
             delegation,
             requested_model: None,
             requested_effort: None,
+            reported_model: None,
         }
     }
 }

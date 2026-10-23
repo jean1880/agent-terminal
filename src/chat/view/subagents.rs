@@ -66,9 +66,13 @@ pub(super) fn identity_text(agent: &SubagentSummary) -> String {
             provenance_text(&delegation.model),
             provenance_text(&delegation.effort)
         ),
+        // The provider reports the model a native sub-agent runs on, never its effort.
         None => format!(
             "{provider} · native · model {} · effort {}",
-            requested_text(agent.requested_model.as_deref()),
+            agent
+                .reported_model
+                .clone()
+                .unwrap_or_else(|| requested_text(agent.requested_model.as_deref())),
             requested_text(agent.requested_effort.as_deref())
         ),
     }
@@ -799,6 +803,7 @@ pub(crate) mod tests {
             delegation: None,
             requested_model: None,
             requested_effort: None,
+            reported_model: None,
         }
     }
 
@@ -816,6 +821,24 @@ pub(crate) mod tests {
             identity_text(&native),
             "Claude · native · model sonnet (requested; effective unknown) · effort high \
              (requested; effective unknown)"
+        );
+    }
+
+    #[test]
+    fn a_native_sub_agent_shows_the_model_its_provider_reported() {
+        let mut native = agent("n", ToolStatus::Running);
+        native.driver = Some(agent_core::adapter::Driver::Claude);
+        native.requested_model = Some("sonnet".into());
+        native.requested_effort = Some("high".into());
+        native.reported_model = Some("claude-sonnet-5-5".into());
+        assert_eq!(
+            identity_text(&native),
+            "Claude · native · model claude-sonnet-5-5 · effort high (requested; effective unknown)"
+        );
+        native.requested_effort = None;
+        assert_eq!(
+            identity_text(&native),
+            "Claude · native · model claude-sonnet-5-5 · effort unknown"
         );
     }
 

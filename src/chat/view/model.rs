@@ -199,6 +199,8 @@ pub struct Tool {
     pub output: String,
     pub error: Option<String>,
     pub status: ToolStatus,
+    /// A sub-agent's model as its provider reported it ([`Event::SubagentModel`]).
+    pub reported_model: Option<String>,
 }
 
 /// One sub-agent, as the explorer lists it.
@@ -223,6 +225,8 @@ pub struct SubagentSummary {
     /// `Agent` input, a shell launch's `--model`): requested, never confirmed by the provider.
     pub requested_model: Option<String>,
     pub requested_effort: Option<String>,
+    /// The model the provider says the sub-agent runs on, once it has said so.
+    pub reported_model: Option<String>,
 }
 
 impl SubagentSummary {
@@ -306,6 +310,7 @@ impl SubagentSummary {
             delegation: None,
             requested_model: launch.model,
             requested_effort: None,
+            reported_model: tool.reported_model.clone(),
         })
     }
 
@@ -353,6 +358,7 @@ impl SubagentSummary {
                 .and_then(|value| serde_json::from_value(value.clone()).ok()),
             requested_model: field("model"),
             requested_effort: field("effort"),
+            reported_model: tool.reported_model.clone(),
         }
     }
 }
@@ -1186,6 +1192,7 @@ impl Transcript {
                 },
                 error: None,
                 status,
+                reported_model: None,
             };
             if let Some(item) = self.items.get_mut(&id) {
                 item.body = Body::Tool(tool);
@@ -1783,12 +1790,26 @@ impl Transcript {
                         output: String::new(),
                         error: None,
                         status: ToolStatus::Running,
+                        reported_model: None,
                     }),
                 };
                 if matches!(kind, ItemKind::AssistantMessage | ItemKind::Reasoning) {
                     self.open_text = Some(id.clone());
                 }
                 out.push(Change::Added(self.insert(id, body, parent.clone())));
+            }
+            Event::SubagentModel { model } => {
+                let Some(id) = env.item.clone() else {
+                    return out;
+                };
+                if let Some(Body::Tool(tool)) = self.items.get_mut(&id).map(|item| &mut item.body) {
+                    if tool.kind == ItemKind::Subagent
+                        && tool.reported_model.as_deref() != Some(model.as_str())
+                    {
+                        tool.reported_model = Some(model.clone());
+                        out.push(Change::Updated(id));
+                    }
+                }
             }
             Event::ContentDelta { stream, text } => {
                 let id = self.text_target(env, *stream, driver, &mut out);
@@ -3397,6 +3418,44 @@ mod tests {
         assert_eq!(list[0].requested_effort.as_deref(), Some("high"));
         assert_eq!(list[1].requested_model, None, "none asked for: none shown");
         assert_eq!(list[1].requested_effort, None);
+        assert_eq!(list[0].reported_model, None, "nothing reported yet");
+    }
+
+    #[test]
+    fn a_subagent_keeps_the_model_its_provider_reported() {
+        let mut t = Transcript::new();
+        t.apply(&started("a", ItemKind::Subagent, None), Driver::Claude);
+        t.apply(&started("b", ItemKind::Subagent, Some("a")), Driver::Claude);
+        t.apply(&started("c", ItemKind::Command, None), Driver::Claude);
+        let report = |id: &str, model: &str| {
+            Envelope::new(Event::SubagentModel {
+                model: model.into(),
+            })
+            .item(id)
+        };
+        assert_eq!(
+            t.apply(&report("b", "claude-haiku-5-5"), Driver::Claude),
+            [Change::Updated("b".into())]
+        );
+        assert!(
+            t.apply(&report("b", "claude-haiku-5-5"), Driver::Claude)
+                .is_empty(),
+            "the same model again changes nothing"
+        );
+        // Not a sub-agent, or no such item: ignored.
+        assert!(t.apply(&report("c", "m"), Driver::Claude).is_empty());
+        assert!(t.apply(&report("gone", "m"), Driver::Claude).is_empty());
+        let list = t.subagents();
+        assert_eq!(list[0].reported_model, None);
+        assert_eq!(list[1].reported_model.as_deref(), Some("claude-haiku-5-5"));
+        assert_eq!(
+            t.apply(&report("b", "claude-sonnet-5-5"), Driver::Claude),
+            [Change::Updated("b".into())]
+        );
+        assert_eq!(
+            t.subagents()[1].reported_model.as_deref(),
+            Some("claude-sonnet-5-5")
+        );
     }
 
     #[test]
