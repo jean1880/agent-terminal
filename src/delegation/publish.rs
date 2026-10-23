@@ -148,12 +148,9 @@ impl Publisher {
         let result = completion.as_ref().and_then(|c| c.result.clone());
         let job = move |s: &agent_kit::store::Store| {
             if let Some(mut completion) = completion {
-                let terminal = s.delegation_run(completion.run.as_str())?.is_some_and(|r| {
-                    matches!(
-                        r.state.as_str(),
-                        "completed" | "interrupted" | "failed" | "unknown"
-                    )
-                });
+                let terminal = s
+                    .delegation_run(completion.run.as_str())?
+                    .is_some_and(|r| r.settled());
                 if !terminal {
                     if let Some(link) = completion.event.links.first() {
                         if s.delegation_worker(link.worker.as_str())?

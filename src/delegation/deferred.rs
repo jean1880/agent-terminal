@@ -691,21 +691,7 @@ impl Supervisor {
             .write("end undelivered delegated run", None, true, move |s| {
                 s.atomically(|s| {
                     let at = super::supervisor::now();
-                    if s.delegation_run(run.as_str())?.is_some_and(|r| {
-                        !matches!(
-                            r.state.as_str(),
-                            "completed" | "interrupted" | "failed" | "unknown"
-                        )
-                    }) {
-                        s.set_delegation_run_state(
-                            run.as_str(),
-                            run_state,
-                            None,
-                            Some(&reason),
-                            None,
-                            at,
-                        )?;
-                    }
+                    s.end_delegation_run_if_open(run.as_str(), run_state, Some(&reason), at)?;
                     if let Some(state) = worker_state {
                         if s.delegation_worker(worker.as_str())?
                             .is_some_and(|w| w.state != "closed")

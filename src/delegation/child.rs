@@ -677,21 +677,7 @@ impl Supervisor {
                 let mut published = None;
                 let at = super::supervisor::now();
                 if let Some(run) = run {
-                    if s.delegation_run(run.as_str())?.is_some_and(|r| {
-                        !matches!(
-                            r.state.as_str(),
-                            "completed" | "interrupted" | "failed" | "unknown"
-                        )
-                    }) {
-                        s.set_delegation_run_state(
-                            run.as_str(),
-                            "failed",
-                            None,
-                            Some(&e.message),
-                            None,
-                            at,
-                        )?;
-                    }
+                    s.end_delegation_run_if_open(run.as_str(), "failed", Some(&e.message), at)?;
                 }
                 if s.delegation_worker(worker.as_str())?
                     .is_some_and(|w| w.state != "closed")
@@ -747,21 +733,12 @@ impl Supervisor {
                 .durable("interrupt stopped delegated runs", move |s| {
                     let at = super::supervisor::now();
                     for run in &runs {
-                        if s.delegation_run(run.as_str())?.is_some_and(|r| {
-                            !matches!(
-                                r.state.as_str(),
-                                "completed" | "interrupted" | "failed" | "unknown"
-                            )
-                        }) {
-                            s.set_delegation_run_state(
-                                run.as_str(),
-                                "interrupted",
-                                None,
-                                Some("stopped"),
-                                None,
-                                at,
-                            )?;
-                        }
+                        s.end_delegation_run_if_open(
+                            run.as_str(),
+                            "interrupted",
+                            Some("stopped"),
+                            at,
+                        )?;
                     }
                     Ok(())
                 })
