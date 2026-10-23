@@ -786,25 +786,8 @@ impl Supervisor {
         });
     }
     pub(super) fn queue_human(self: &Rc<Self>, worker: &WorkerId, text: &str) {
-        let caller = {
-            let state = self.state.borrow();
-            state.workers.get(worker).and_then(|w| w.row.parent())
-        };
-        let Some(caller) = caller else {
-            return;
-        };
-        let worker = worker.clone();
         let text = text.to_owned();
-        let sup = self.clone();
-        gtk4::glib::spawn_future_local(async move {
-            let key = agent_core::delegation::IdempotencyKey::parse(&format!(
-                "human-{}",
-                gtk4::glib::uuid_string_random()
-            ))
-            .ok();
-            let Some(key) = key else {
-                return;
-            };
+        self.act_as_parent(worker, |sup, caller, worker, key| async move {
             let r = SendRequest {
                 target: Target::Worker(worker),
                 text,
@@ -815,9 +798,7 @@ impl Supervisor {
                 expected_authority_epoch: None,
                 idempotency_key: key,
             };
-            if let Err(e) = sup.send_worker(&caller, r).await {
-                (sup.services.report)(&e.to_string());
-            }
+            sup.send_worker(&caller, r).await
         });
     }
 }

@@ -626,40 +626,46 @@ impl Supervisor {
         if !self.scope_is_current(scope) {
             return;
         }
-        let worker = scope.worker.clone();
-        let caller = self.state.borrow().workers[&worker].row.parent();
-        let Some(caller) = caller else {
-            return;
-        };
         let expected_run_id = scope.run.clone();
-        let sup = self.clone();
-        glib::spawn_future_local(async move {
-            let Ok(key) = agent_core::delegation::IdempotencyKey::parse(&format!(
-                "human-{}",
-                glib::uuid_string_random()
-            )) else {
-                return;
-            };
+        self.act_as_parent(&scope.worker, move |sup, caller, worker, key| async move {
             let r = CancelRequest {
                 worker_id: worker,
                 expected_run_id,
                 expected_authority_epoch: None,
                 idempotency_key: key,
             };
-            if let Err(e) = sup.cancel_worker_call(&caller, r).await {
-                (sup.services.report)(&e.to_string());
-            }
+            sup.cancel_worker_call(&caller, r).await
         });
     }
     pub(crate) fn close_human(self: &Rc<Self>, scope: &agent_core::delegation::scope::Scope) {
         if !self.scope_is_current(scope) {
             return;
         }
-        let worker = scope.worker.clone();
-        let caller = self.state.borrow().workers[&worker].row.parent();
+        self.act_as_parent(&scope.worker, |sup, caller, worker, key| async move {
+            let r = CloseRequest {
+                worker_id: worker,
+                expected_authority_epoch: None,
+                idempotency_key: key,
+            };
+            sup.close_worker_call(&caller, r).await
+        });
+    }
+    /// Runs `act` for the user, as `worker`'s parent, under a fresh `human-<uuid>` key, and
+    /// reports a refusal. A worker with no parent (a root) is left alone.
+    pub(super) fn act_as_parent<F, Fut>(self: &Rc<Self>, worker: &WorkerId, act: F)
+    where
+        F: FnOnce(Rc<Self>, WorkerId, WorkerId, agent_core::delegation::IdempotencyKey) -> Fut
+            + 'static,
+        Fut: std::future::Future<Output = Result<Value, ToolError>>,
+    {
+        let caller = {
+            let state = self.state.borrow();
+            state.workers.get(worker).and_then(|w| w.row.parent())
+        };
         let Some(caller) = caller else {
             return;
         };
+        let worker = worker.clone();
         let sup = self.clone();
         glib::spawn_future_local(async move {
             let Ok(key) = agent_core::delegation::IdempotencyKey::parse(&format!(
@@ -668,12 +674,7 @@ impl Supervisor {
             )) else {
                 return;
             };
-            let r = CloseRequest {
-                worker_id: worker,
-                expected_authority_epoch: None,
-                idempotency_key: key,
-            };
-            if let Err(e) = sup.close_worker_call(&caller, r).await {
+            if let Err(e) = act(sup.clone(), caller, worker, key).await {
                 (sup.services.report)(&e.to_string());
             }
         });
