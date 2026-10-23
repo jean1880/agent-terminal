@@ -862,11 +862,18 @@ impl Inner {
                 }
             }
         });
-        // A dialog needs a window to sit on; a view that is not in one (yet) has nowhere to show it.
-        if let Some(parent) = self.widget.upgrade().filter(|w| w.root().is_some()) {
-            adw::prelude::AdwDialogExt::present(panel.dialog(), Some(&parent));
-        }
+        self.present_dialog(panel.dialog());
         *self.subagent_panel.borrow_mut() = Some(panel);
+    }
+
+    /// Presents `dialog` on the view's window. False when the view is not in one (yet): a dialog
+    /// needs a window to sit on.
+    pub(super) fn present_dialog(&self, dialog: &adw::Dialog) -> bool {
+        let Some(parent) = self.widget.upgrade().filter(|w| w.root().is_some()) else {
+            return false;
+        };
+        adw::prelude::AdwDialogExt::present(dialog, Some(&parent));
+        true
     }
 
     /// Where a background task leads: its sub-agent's panel, or its output (`None`: nothing).
@@ -913,10 +920,9 @@ impl Inner {
     /// the dialog closes or the task has ended (then once more, for its last lines).
     fn open_task_output(self: &Rc<Self>, task: &BackgroundTask) {
         let panel = background::TaskOutputPanel::new(task);
-        let Some(parent) = self.widget.upgrade().filter(|w| w.root().is_some()) else {
+        if !self.present_dialog(panel.dialog()) {
             return;
-        };
-        adw::prelude::AdwDialogExt::present(panel.dialog(), Some(&parent));
+        }
         *self.task_panel.borrow_mut() = Some(panel.clone());
         if self.poll_task_output(&panel) == glib::ControlFlow::Break {
             return;

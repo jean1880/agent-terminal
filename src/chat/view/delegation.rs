@@ -582,9 +582,7 @@ impl Inner {
                 }
             }
         });
-        if let Some(view) = self.widget.upgrade().filter(|view| view.root().is_some()) {
-            adw::prelude::AdwDialogExt::present(inspector.panel.dialog(), Some(&view));
-        }
+        self.present_dialog(inspector.panel.dialog());
         true
     }
 
