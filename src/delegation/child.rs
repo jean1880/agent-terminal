@@ -560,18 +560,7 @@ impl Supervisor {
             inherited,
             driver: spec.driver,
             task_mode: spec.mode,
-            home: resolved
-                .env
-                .env
-                .iter()
-                .rev()
-                .find(|(name, _)| name == "HOME")
-                .map(|(_, value)| PathBuf::from(value))
-                .or_else(|| {
-                    (!resolved.env.unset.iter().any(|name| name == "HOME"))
-                        .then(|| std::env::var_os("HOME").map(PathBuf::from))
-                        .flatten()
-                }),
+            home: authority_home(&resolved.env),
             live,
         }));
         let publisher = Rc::new(super::publish::Publisher::new(
@@ -834,5 +823,65 @@ impl Supervisor {
             });
         }
         self.notify_registry();
+    }
+}
+
+/// The home whose dotfiles a child's authority keeps out of automatic grants: the one its
+/// approval socket proves ([`crate::agent_home::effective_home`]), else the raw value it is
+/// given, so a home that cannot be proven never turns the protection off.
+fn authority_home(env: &crate::agent_proc::AgentEnv) -> Option<PathBuf> {
+    crate::agent_home::effective_home(env).or_else(|| raw_home(env, std::env::var_os("HOME")))
+}
+
+/// The child's `HOME` as given: the profile's last value, else `inherited` unless the profile
+/// unsets it.
+fn raw_home(
+    env: &crate::agent_proc::AgentEnv,
+    inherited: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    env.env
+        .iter()
+        .rev()
+        .find(|(name, _)| name == "HOME")
+        .map(|(_, value)| PathBuf::from(value))
+        .or_else(|| {
+            (!env.unset.iter().any(|name| name == "HOME"))
+                .then(|| inherited.map(PathBuf::from))
+                .flatten()
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent_proc::AgentEnv;
+
+    #[test]
+    fn an_unprovable_home_keeps_the_raw_value_for_the_dotfile_protection() {
+        for value in ["/app/../profile", "relative", ""] {
+            let env = AgentEnv {
+                env: vec![("HOME".into(), value.into())],
+                unset: vec![],
+            };
+            assert_eq!(crate::agent_home::effective_home(&env), None, "{value}");
+            assert_eq!(authority_home(&env), Some(PathBuf::from(value)), "{value}");
+        }
+        let proven = AgentEnv {
+            env: vec![("HOME".into(), "/profile/home".into())],
+            unset: vec!["HOME".into()],
+        };
+        assert_eq!(authority_home(&proven), Some("/profile/home".into()));
+    }
+
+    #[test]
+    fn the_raw_home_is_the_last_profile_value_else_the_inherited_one_unless_unset() {
+        let mut env = AgentEnv::default();
+        assert_eq!(raw_home(&env, Some("/app".into())), Some("/app".into()));
+        assert_eq!(raw_home(&env, None), None);
+        env.unset.push("HOME".into());
+        assert_eq!(raw_home(&env, Some("/app".into())), None);
+        env.env.push(("HOME".into(), "/first".into()));
+        env.env.push(("HOME".into(), "/last".into()));
+        assert_eq!(raw_home(&env, Some("/app".into())), Some("/last".into()));
     }
 }
