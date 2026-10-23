@@ -147,6 +147,18 @@ impl<R: AsyncRead, W: AsyncWrite> BoundedTransport<R, W> {
     }
 }
 
+impl<R, W: AsyncWrite + Unpin> BoundedTransport<R, W> {
+    /// Writes a reply the transport answers by itself. A reply that cannot be written means the
+    /// transport is dead: it is marked ended and `None` is returned.
+    async fn reply_or_end(&mut self, value: Value) -> Option<()> {
+        if write_value(&self.writer, value).await.is_err() {
+            self.ended = true;
+            return None;
+        }
+        Some(())
+    }
+}
+
 async fn write_value<W: AsyncWrite + Unpin>(
     writer: &Arc<Mutex<Option<W>>>,
     value: Value,
@@ -355,16 +367,12 @@ where
                 continue;
             }
             if !bounded_wire_ids(&line) {
-                if write_value(
-                    &self.writer,
-                    rpc_error(-32600, "request id exceeds 256 encoded bytes", Value::Null),
-                )
-                .await
-                .is_err()
-                {
-                    self.ended = true;
-                    return None;
-                }
+                self.reply_or_end(rpc_error(
+                    -32600,
+                    "request id exceeds 256 encoded bytes",
+                    Value::Null,
+                ))
+                .await?;
                 continue;
             }
             let value: Value = match serde_json::from_slice(&line) {
@@ -376,32 +384,20 @@ where
                 }
             };
             if !bounded_ids(&value) {
-                if write_value(
-                    &self.writer,
-                    rpc_error(-32600, "request id exceeds 256 encoded bytes", Value::Null),
-                )
-                .await
-                .is_err()
-                {
-                    self.ended = true;
-                    return None;
-                }
+                self.reply_or_end(rpc_error(
+                    -32600,
+                    "request id exceeds 256 encoded bytes",
+                    Value::Null,
+                ))
+                .await?;
                 continue;
             }
             if value
                 .get("id")
                 .is_some_and(|id| !id.is_string() && id.as_i64().is_none())
             {
-                if write_value(
-                    &self.writer,
-                    rpc_error(-32600, "invalid MCP request id", Value::Null),
-                )
-                .await
-                .is_err()
-                {
-                    self.ended = true;
-                    return None;
-                }
+                self.reply_or_end(rpc_error(-32600, "invalid MCP request id", Value::Null))
+                    .await?;
                 continue;
             }
             if value.get("method").and_then(Value::as_str) == Some("notifications/cancelled") {
@@ -432,15 +428,12 @@ where
                             .is_none()
                         {
                             if let Some(id) = value.get("id") {
-                                if write_value(
-                                    &self.writer,
-                                    rpc_error(-32602, "unknown delegation tool", id.clone()),
-                                )
-                                .await
-                                .is_err()
-                                {
-                                    return None;
-                                }
+                                self.reply_or_end(rpc_error(
+                                    -32602,
+                                    "unknown delegation tool",
+                                    id.clone(),
+                                ))
+                                .await?;
                             }
                             continue;
                         }
@@ -458,16 +451,8 @@ where
                             result["resultType"] = json!("complete");
                         }
                         if let Some(id) = value.get("id") {
-                            if write_value(
-                                &self.writer,
-                                json!({"jsonrpc":"2.0", "id":id, "result":result}),
-                            )
-                            .await
-                            .is_err()
-                            {
-                                self.ended = true;
-                                return None;
-                            }
+                            self.reply_or_end(json!({"jsonrpc":"2.0", "id":id, "result":result}))
+                                .await?;
                         }
                         continue;
                     }
@@ -486,16 +471,12 @@ where
                             Some(_) => -32601,
                             None => -32600,
                         };
-                        if write_value(
-                            &self.writer,
-                            rpc_error(code, "unsupported or invalid MCP request", id),
-                        )
-                        .await
-                        .is_err()
-                        {
-                            self.ended = true;
-                            return None;
-                        }
+                        self.reply_or_end(rpc_error(
+                            code,
+                            "unsupported or invalid MCP request",
+                            id,
+                        ))
+                        .await?;
                     }
                     continue;
                 }
@@ -514,16 +495,12 @@ where
                     }
                 };
                 if !admitted {
-                    if write_value(
-                        &self.writer,
-                        rpc_error(-32000, "too many pending MCP requests or duplicate id", id),
-                    )
-                    .await
-                    .is_err()
-                    {
-                        self.ended = true;
-                        return None;
-                    }
+                    self.reply_or_end(rpc_error(
+                        -32000,
+                        "too many pending MCP requests or duplicate id",
+                        id,
+                    ))
+                    .await?;
                     continue;
                 }
                 if value.get("method").and_then(Value::as_str) == Some("tools/call") {
@@ -538,5 +515,48 @@ where
         self.ended = true;
         self.writer.lock().await.take();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Feeds `input` to a transport whose reader has gone, and reports what two receives see.
+    fn receive_twice_with_a_dead_peer(input: &str) -> (bool, bool) {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let (output, peer) = tokio::io::duplex(64);
+                drop(peer);
+                let mut transport = BoundedTransport::with_io(input.as_bytes(), output);
+                let first = Transport::<RoleServer>::receive(&mut transport).await;
+                let second = Transport::<RoleServer>::receive(&mut transport).await;
+                (first.is_some(), second.is_some())
+            })
+    }
+
+    #[test]
+    fn a_reply_that_cannot_be_written_ends_the_transport() {
+        let ping = "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"ping\"}\n";
+        let replied_by_the_transport = [
+            // An unknown tool with arguments that are not an object.
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"nope\",\"arguments\":3}}\n",
+            // A known tool with arguments that are not an object.
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"cross_agent_list\",\"arguments\":3}}\n",
+            // An id that is neither a string nor an integer.
+            "{\"jsonrpc\":\"2.0\",\"id\":1.5,\"method\":\"ping\"}\n",
+        ];
+        for request in replied_by_the_transport {
+            let input = format!("{request}{ping}");
+            assert_eq!(
+                receive_twice_with_a_dead_peer(&input),
+                (false, false),
+                "{request}"
+            );
+        }
     }
 }
