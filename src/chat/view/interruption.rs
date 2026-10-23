@@ -128,24 +128,7 @@ impl InterruptionShelf {
             let active = active.clone();
             let sink = sink.clone();
             allow_btn.connect_clicked(move |_| {
-                // Copied out before the sink runs: answering resolves the approval at once,
-                // which updates this shelf (`update` replaces `active`) while still in here.
-                // A permission request is never allowed from here: the shelf cuts its list.
-                let request = match active.borrow().as_ref() {
-                    Some(PendingInterruption::Approval { request, tool, .. })
-                        if tool != permission::TOOL =>
-                    {
-                        Some(request.clone())
-                    }
-                    _ => None,
-                };
-                if let Some(request) = request {
-                    sink(RowEvent::Approve {
-                        request,
-                        decision: Decision::Allow,
-                        custom_rule: None,
-                    });
-                }
+                answer_active(&active, &sink, Decision::Allow);
             });
         }
 
@@ -153,27 +136,7 @@ impl InterruptionShelf {
             let active = active.clone();
             let sink = sink.clone();
             deny_btn.connect_clicked(move |_| {
-                // Copied out before the sink runs (see the Allow button).
-                let answer = match active.borrow().as_ref() {
-                    Some(PendingInterruption::Approval {
-                        request, options, ..
-                    }) => {
-                        let decision = if options.contains(&Decision::Deny) {
-                            Decision::Deny
-                        } else {
-                            Decision::Cancel
-                        };
-                        Some((request.clone(), decision))
-                    }
-                    _ => None,
-                };
-                if let Some((request, decision)) = answer {
-                    sink(RowEvent::Approve {
-                        request,
-                        decision,
-                        custom_rule: None,
-                    });
-                }
+                answer_active(&active, &sink, Decision::Deny);
             });
         }
 
@@ -225,33 +188,7 @@ impl InterruptionShelf {
     /// button does. False when no approval is pending or it does not offer `decision`: the
     /// keyboard shortcut then lets its key through.
     pub fn answer(&self, decision: Decision) -> bool {
-        // Copied out before the sink runs: answering updates this shelf re-entrantly.
-        let answer = match self.active.borrow().as_ref() {
-            Some(PendingInterruption::Approval {
-                request,
-                tool,
-                options,
-                ..
-            }) => {
-                let decision = match decision {
-                    Decision::Deny if !options.contains(&Decision::Deny) => Decision::Cancel,
-                    d => d,
-                };
-                let refusal = matches!(decision, Decision::Deny | Decision::Cancel);
-                (options.contains(&decision) && (refusal || tool != permission::TOOL))
-                    .then(|| (request.clone(), decision))
-            }
-            _ => None,
-        };
-        let Some((request, decision)) = answer else {
-            return false;
-        };
-        (self.sink)(RowEvent::Approve {
-            request,
-            decision,
-            custom_rule: None,
-        });
-        true
+        answer_active(&self.active, &self.sink, decision)
     }
 
     pub fn update(&self, transcript: &Transcript) {
@@ -324,19 +261,7 @@ impl InterruptionShelf {
                     let decision = *d;
                     b.connect_clicked(move |_| {
                         popover.popdown();
-                        let request = match active.borrow().as_ref() {
-                            Some(PendingInterruption::Approval { request, .. }) => {
-                                Some(request.clone())
-                            }
-                            _ => None,
-                        };
-                        if let Some(request) = request {
-                            sink(RowEvent::Approve {
-                                request,
-                                decision,
-                                custom_rule: None,
-                            });
-                        }
+                        answer_active(&active, &sink, decision);
                     });
                     self.more_box.append(&b);
                 }
@@ -480,6 +405,45 @@ impl InterruptionShelf {
 /// A fixed place on the shelf for `button`: a stack of the button and an empty page, the same
 /// size, so a button that is not offered leaves its space empty rather than letting its
 /// neighbours slide into it. Shown or emptied with [`place`].
+/// Answers the approval in `active` with `decision` through `sink`: a permission request (a list
+/// of places) is never allowed from the shelf, only denied or stopped, since the shelf cuts its
+/// list, and Deny falls back to Cancel where the approval offers no Deny. False when no approval
+/// is pending or it does not offer `decision`.
+fn answer_active(
+    active: &RefCell<Option<PendingInterruption>>,
+    sink: &RowSink,
+    decision: Decision,
+) -> bool {
+    // Copied out before the sink runs: answering resolves the approval at once, which updates
+    // the shelf (`update` replaces `active`) while still in here.
+    let answer = match active.borrow().as_ref() {
+        Some(PendingInterruption::Approval {
+            request,
+            tool,
+            options,
+            ..
+        }) => {
+            let decision = match decision {
+                Decision::Deny if !options.contains(&Decision::Deny) => Decision::Cancel,
+                d => d,
+            };
+            let refusal = matches!(decision, Decision::Deny | Decision::Cancel);
+            (options.contains(&decision) && (refusal || tool != permission::TOOL))
+                .then(|| (request.clone(), decision))
+        }
+        _ => None,
+    };
+    let Some((request, decision)) = answer else {
+        return false;
+    };
+    sink(RowEvent::Approve {
+        request,
+        decision,
+        custom_rule: None,
+    });
+    true
+}
+
 fn slot(button: &impl IsA<gtk4::Widget>) -> gtk4::Stack {
     let stack = gtk4::Stack::new();
     stack.set_hhomogeneous(true);
