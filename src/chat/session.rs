@@ -142,6 +142,9 @@ struct PendingStart {
     generation: u64,
     writes: Vec<String>,
     prompts: Vec<QueuedPrompt>,
+    /// Sub-agent news riding on those messages: settled once the writes reach a process, given
+    /// back (by being dropped) when they never do.
+    news: Vec<TakenNews>,
 }
 
 fn delegation_redirect_names(spec: &SpawnSpec) -> Vec<String> {
@@ -1529,6 +1532,7 @@ impl Inner {
             generation,
             writes: Vec::new(),
             prompts: Vec::new(),
+            news: Vec::new(),
         });
         self.state.borrow_mut().alive = true;
         self.notify_lifecycle();
@@ -1576,7 +1580,13 @@ impl Inner {
         if self.generation.get() != generation || self.stopping.get() {
             return;
         }
-        self.spawn_spec_with_writes(generation, spec, pending.writes, pending.prompts);
+        self.spawn_spec_with_writes(
+            generation,
+            spec,
+            pending.writes,
+            pending.prompts,
+            pending.news,
+        );
     }
 
     /// The hook could not be proven right before a start: agy runs without the skip flag and
@@ -1631,7 +1641,7 @@ impl Inner {
     }
 
     fn spawn_spec(self: &Rc<Self>, generation: u64, spec: SpawnSpec) {
-        self.spawn_spec_with_writes(generation, spec, Vec::new(), Vec::new());
+        self.spawn_spec_with_writes(generation, spec, Vec::new(), Vec::new(), Vec::new());
     }
 
     fn spawn_spec_with_writes(
@@ -1640,10 +1650,11 @@ impl Inner {
         mut spec: SpawnSpec,
         writes: Vec<String>,
         prompts: Vec<QueuedPrompt>,
+        news: Vec<TakenNews>,
     ) {
         if self.adapter.borrow().driver() != Driver::Agy || self.hooks.is_none() {
             self.spawn_spec_now(generation, spec, None);
-            self.flush_or_keep(generation, writes, prompts);
+            self.flush_or_keep(generation, writes, prompts, news);
             return;
         }
         let Some(hooks) = self.hooks.clone() else {
@@ -1691,6 +1702,7 @@ impl Inner {
             generation,
             writes,
             prompts,
+            news,
         });
         self.state.borrow_mut().alive = true;
         let cwd = spec.cwd.clone();
@@ -1762,19 +1774,30 @@ impl Inner {
                 return;
             }
             inner.spawn_spec_now(generation, spec, Some(facts));
-            inner.flush_or_keep(generation, pending.writes, pending.prompts);
+            inner.flush_or_keep(generation, pending.writes, pending.prompts, pending.news);
         });
     }
 
     /// After a held start's spawn: its writes go to the process, or, when it did not spawn (a
     /// failed spawn may already have rolled back to the previous agent), the messages behind
     /// them are queued again.
-    fn flush_or_keep(&self, generation: u64, writes: Vec<String>, prompts: Vec<QueuedPrompt>) {
+    fn flush_or_keep(
+        &self,
+        generation: u64,
+        writes: Vec<String>,
+        prompts: Vec<QueuedPrompt>,
+        news: Vec<TakenNews>,
+    ) {
         let spawned = self.generation.get() == generation
             && self.proc.borrow().as_ref().is_some_and(|p| p.is_alive());
         if spawned {
             self.flush_start_writes(generation, writes);
+            for news in news {
+                self.news_delivered(news);
+            }
         } else {
+            // Given back before the messages are queued again, so the resend can take it.
+            drop(news);
             self.keep_unsent_prompts(prompts);
         }
     }
@@ -3305,13 +3328,19 @@ impl Inner {
             })
             .item(item.clone()),
         );
-        if self.root_prompt_allowed()
-            && self.command(Command::Steer {
-                text: text.to_owned(),
-            })
-        {
-            self.remember_pre_init_prompt(text, None);
-            return;
+        if self.root_prompt_allowed() {
+            // Held sub-agent news rides on a live message as on any other the user sends.
+            let news = self.news_for_prompt(text, false);
+            let sent = news.as_ref().map_or_else(
+                || text.to_owned(),
+                |news| agent_core::delegation::wake::with_user_prompt(news.text(), text),
+            );
+            let accepted = self.command(Command::Steer { text: sent.clone() });
+            self.settle_news(news, accepted);
+            if accepted {
+                self.remember_pre_init_prompt(&sent, None);
+                return;
+            }
         }
         // Refused: it waits for the turn to end, as a message sent mid-turn always did.
         self.deliver(
@@ -3401,7 +3430,7 @@ impl Inner {
         let news = self.news_for_prompt(text, handoff.is_some());
         let sent = match (&handoff, &news) {
             (Some(h), _) => provider_message_with_handoff(&h.summary, &h.fence, text),
-            (None, Some(news)) => agent_core::delegation::wake::with_user_prompt(&news.text, text),
+            (None, Some(news)) => agent_core::delegation::wake::with_user_prompt(news.text(), text),
             (None, None) => text.to_owned(),
         };
         self.prompt_in_flight.set(true);
@@ -3604,7 +3633,7 @@ impl Inner {
             let sent = match (&handoff, &news) {
                 (Some(h), _) => provider_message_with_handoff(&h.summary, &h.fence, &queued.text),
                 (None, Some(news)) => {
-                    agent_core::delegation::wake::with_user_prompt(&news.text, &queued.text)
+                    agent_core::delegation::wake::with_user_prompt(news.text(), &queued.text)
                 }
                 (None, None) => queued.text.clone(),
             };

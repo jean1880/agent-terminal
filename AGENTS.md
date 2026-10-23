@@ -196,8 +196,9 @@ Architectural mandates, standards, and workflows for this codebase.
   the user speaks) or its thread closes. A root in dangerous permissive mode is never woken
   (`ParentState::Unattended`): the news is kept, the thread is told once per new item that it
   waits, nothing retries it on a timer, and it goes, framed the same way, with the user's next
-  message (never a slash command, never beside a handoff) or as an ordinary wake once the mode
-  is left.
+  message, a live one mid-turn included (never a slash command, never beside a handoff), or as
+  an ordinary wake once the mode is left. It is spent, and its notice posted, only once that
+  message reaches a process; a message that never does gives it back, exactly once.
 - **A folder grant is session-only and never wider than its card**: "Allow for session" on an
   edit keeps the file's folder (`always_allow::session_folder`): inside the workspace, or at
   least two levels inside home outside it; never `/`, home or above, and nothing when home is

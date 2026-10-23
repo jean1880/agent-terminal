@@ -1059,6 +1059,7 @@ fn shutdown_cancels_a_pending_proof_even_if_the_process_is_already_dead() {
             generation,
             writes: vec!["must not reach a replacement process".to_owned()],
             prompts: Vec::new(),
+            news: Vec::new(),
         });
         let process_generation = session.process_generation();
         session.shutdown(false);
@@ -1921,13 +1922,13 @@ impl crate::chat::session::HeldNews for FakeNews {
         self.taken.set(self.taken.get() + 1);
         let (slot, back) = (self.text.clone(), self.given_back.clone());
         let kept = text.clone();
-        Some(crate::chat::session::TakenNews {
+        Some(crate::chat::session::TakenNews::new(
             text,
-            give_back: Box::new(move || {
+            Box::new(move || {
                 *slot.borrow_mut() = Some(kept);
                 back.set(back.get() + 1);
             }),
-        })
+        ))
     }
 
     fn release(&self) {
@@ -2038,6 +2039,131 @@ fn a_root_in_dangerous_permissive_mode_takes_news_only_with_the_users_message() 
         assert_eq!(news.released.get(), 1);
         assert_eq!(session.wake_with("news after"), WakeOutcome::Started);
         assert!(pump_until(ctx, 10, || prompts().contains("news after")));
+        session.shutdown(false);
+    });
+}
+
+/// Held news riding on a message written into a start still waiting on its launch check is
+/// not spent there: the launch is refused, the news is given back once and no notice is left;
+/// the message's resend, once the agent starts, carries it and posts its notice once.
+#[test]
+fn held_news_in_a_refused_launch_is_given_back_once_and_goes_with_the_resend() {
+    in_loop(|ctx| {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let thread = fresh(&store, &tmp.path().to_string_lossy());
+        let (sink, seen) = make_sink();
+        let hooks = Rc::new(TestHooks::default());
+        hooks.refuse_spawn.set(true);
+        let session = ChatSession::with_options(
+            Box::new(AgyAdapter::new("agy")),
+            scripted(tmp.path(), "cat > \"$D/stdin.log\""),
+            SessionStore::from(store),
+            thread,
+            sink,
+            Err(None),
+            LaunchEnv::default(),
+            SessionOptions {
+                generation_base: ProcessGeneration(0),
+                hooks: Some(hooks.clone()),
+                child: None,
+            },
+        );
+        let notices = || {
+            seen.borrow()
+                .iter()
+                .filter(
+                    |e| matches!(&e.event, Event::Notice { text } if text.contains("held news")),
+                )
+                .count()
+        };
+        session.confirm_mode(Mode::Bypass);
+        let news = Rc::new(FakeNews::default());
+        *news.text.borrow_mut() = Some("[agent-terminal] held news".into());
+        session.hold_news_for_user(news.clone());
+
+        session.send_prompt("the kept message");
+        assert_eq!(news.taken.get(), 1);
+        assert_eq!(news.given_back.get(), 0, "held with the start's writes");
+        assert_eq!(
+            notices(),
+            0,
+            "not posted before the write reaches a process"
+        );
+        assert!(pump_until(ctx, 10, || !session.status().alive));
+        assert_eq!(
+            news.given_back.get(),
+            1,
+            "given back when the launch is refused"
+        );
+        assert_eq!(notices(), 0, "and no notice is left behind");
+
+        hooks.refuse_spawn.set(false);
+        session.send_prompt("the next message");
+        let written = || std::fs::read_to_string(tmp.path().join("stdin.log")).unwrap_or_default();
+        assert!(pump_until(ctx, 10, || written().contains("the kept message")));
+        assert!(pump_until(ctx, 10, || notices() == 1));
+        let stdin = written();
+        assert_eq!(stdin.matches("held news").count(), 1, "{stdin:?}");
+        assert_eq!(news.taken.get(), 2);
+        assert_eq!(news.given_back.get(), 1, "given back exactly once");
+        session.shutdown(false);
+    });
+}
+
+/// A message the user writes while a turn runs (live input) carries held news like any other:
+/// framed ahead of it, shown as the app's notice, and taken from the supervisor.
+#[test]
+fn held_news_rides_on_a_live_message_written_mid_turn() {
+    in_loop(|ctx| {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let thread = fresh(&store, &dir.path().to_string_lossy());
+        let (sink, seen) = make_sink();
+        let hooks = Rc::new(TestHooks::default());
+        let session = ChatSession::with_options(
+            Box::new(agent_core::claude::ClaudeAdapter::new()),
+            super::idle_claude(dir.path()),
+            SessionStore::from(store),
+            thread,
+            sink,
+            Err(None),
+            bare_env(dir.path()),
+            SessionOptions {
+                generation_base: ProcessGeneration(0),
+                hooks: Some(hooks.clone()),
+                child: None,
+            },
+        );
+        let prompts =
+            || std::fs::read_to_string(dir.path().join("prompts.log")).unwrap_or_default();
+        assert!(pump_until(ctx, 10, || has(&seen, |e| matches!(
+            e,
+            Event::TurnCompleted { .. }
+        )) && session.status().alive
+            && !session.status().running_turn));
+        session.confirm_mode(Mode::Bypass);
+        session.send_prompt("start a turn");
+        assert!(session.status().running_turn);
+        let news = Rc::new(FakeNews::default());
+        *news.text.borrow_mut() = Some("[agent-terminal] held news".into());
+        session.hold_news_for_user(news.clone());
+
+        session.steer_prompt("and one more thing");
+        assert_eq!(news.taken.get(), 1);
+        assert_eq!(news.given_back.get(), 0);
+        assert!(pump_until(ctx, 10, || prompts().contains("and one more thing")));
+        let line = prompts()
+            .lines()
+            .find(|l| l.contains("and one more thing"))
+            .map(str::to_owned)
+            .unwrap_or_default();
+        assert!(line.contains("held news"), "{line}");
+        assert!(line.contains("The user's message follows."), "{line}");
+        assert!(has(&seen, |e| matches!(
+            e,
+            Event::Notice { text } if text == "[agent-terminal] held news"
+        )));
         session.shutdown(false);
     });
 }

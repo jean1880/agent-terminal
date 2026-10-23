@@ -86,12 +86,41 @@ pub(crate) trait HeldNews {
     fn release(&self);
 }
 
-/// News taken from the supervisor's queue to ride on a user's prompt.
+/// News taken from the supervisor's queue to ride on a user's prompt. Dropped without
+/// [`Self::delivered`] (the prompt never reached a process, whichever path dropped it), it is
+/// given back exactly once.
 pub(crate) struct TakenNews {
-    /// The framed news (`wake::frame`).
-    pub text: String,
-    /// Puts it back: the prompt carrying it never reached the agent.
-    pub give_back: Box<dyn FnOnce()>,
+    text: String,
+    give_back: Option<Box<dyn FnOnce()>>,
+}
+
+impl TakenNews {
+    /// `text` (the framed news, `wake::frame`), and how to put it back in the queue.
+    pub(crate) fn new(text: String, give_back: Box<dyn FnOnce()>) -> Self {
+        Self {
+            text,
+            give_back: Some(give_back),
+        }
+    }
+
+    /// The framed news.
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// It reached the agent: never given back. Returns the text, for its notice.
+    fn delivered(mut self) -> String {
+        self.give_back = None;
+        std::mem::take(&mut self.text)
+    }
+}
+
+impl Drop for TakenNews {
+    fn drop(&mut self) {
+        if let Some(give_back) = self.give_back.take() {
+            give_back();
+        }
+    }
 }
 
 impl ChatSession {
@@ -326,18 +355,41 @@ impl Inner {
         news.take()
     }
 
-    /// The prompt carrying `news` was `sent`: the news is posted as the app's notice, as a wake
-    /// is. Not sent: it goes back to the supervisor, and no notice is left behind.
+    /// The prompt carrying `news` was accepted (`sent`) or not. Not sent: it goes back to the
+    /// supervisor, and no notice is left behind. Accepted into a start still waiting on its
+    /// checks (`PendingStart`): it stays with that start's writes, settled when they reach a
+    /// process or given back when they never do. Written to a process: posted as the app's
+    /// notice, as a wake is.
     pub(super) fn settle_news(&self, news: Option<TakenNews>, sent: bool) {
         let Some(news) = news else {
             return;
         };
-        if sent {
-            info!("the user's message carries its sub-agents' held news");
-            self.emit(Envelope::new(Event::Notice { text: news.text }));
-        } else {
-            (news.give_back)();
+        if !sent {
+            drop(news);
+            return;
         }
+        let live = self.proc.borrow().as_ref().is_some_and(|p| p.is_alive());
+        let news = if live {
+            Some(news)
+        } else {
+            match self.starting.borrow_mut().as_mut() {
+                Some(pending) => {
+                    pending.news.push(news);
+                    None
+                }
+                None => Some(news),
+            }
+        };
+        if let Some(news) = news {
+            self.news_delivered(news);
+        }
+    }
+
+    /// `news` reached the agent's process: posted as the app's notice.
+    pub(super) fn news_delivered(&self, news: TakenNews) {
+        info!("the user's message carries its sub-agents' held news");
+        let text = news.delivered();
+        self.emit(Envelope::new(Event::Notice { text }));
     }
 
     /// The agent confirmed `mode`: once it is out of dangerous permissive mode, news held for

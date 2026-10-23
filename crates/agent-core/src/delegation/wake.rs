@@ -338,13 +338,11 @@ fn header(item: &Item) -> String {
 /// The text of one wake for `items` (and `dropped` older items that gave way), within
 /// `budget` bytes: each item's header, then its redacted text, sharing what the headers leave
 /// fairly (a short text leaves its unused share to the others). A cut text ends with a note
-/// pointing at `cross_agent_read`.
+/// pointing at `cross_agent_read`. When the headers alone would not fit, the oldest items give
+/// way and are counted with `dropped`, so the whole frame stays within `budget` for any budget
+/// that holds the footer and that count's line.
 pub fn frame(items: &[Item], dropped: usize, budget: usize) -> String {
     let headers: Vec<String> = items.iter().map(header).collect();
-    let texts: Vec<String> = items
-        .iter()
-        .map(|i| quote_marker(redact(&i.text).trim()))
-        .collect();
     let notes: Vec<String> = items
         .iter()
         .map(|i| {
@@ -354,17 +352,38 @@ pub fn frame(items: &[Item], dropped: usize, budget: usize) -> String {
             )
         })
         .collect();
-    let dropped_line = (dropped > 0).then(|| {
-        format!(
-            "{MARKER} {dropped} earlier sub-agent notification(s) did not fit; they are in your \
-             mailbox (cross_agent_read)."
-        )
-    });
-    // Fixed cost: headers, separators, the footer, the dropped line, and a cut note each.
-    let fixed = headers.iter().map(|h| h.len() + 2).sum::<usize>()
-        + notes.iter().map(String::len).sum::<usize>()
-        + FOOTER.len()
-        + dropped_line.as_ref().map_or(0, |l| l.len() + 2);
+    let dropped_line = |dropped: usize| {
+        (dropped > 0).then(|| {
+            format!(
+                "{MARKER} {dropped} earlier sub-agent notification(s) did not fit; they are in \
+                 your mailbox (cross_agent_read)."
+            )
+        })
+    };
+    // Fixed cost of each item: its header and separator, the line break before its text, and
+    // its cut note.
+    let cost: Vec<usize> = headers
+        .iter()
+        .zip(&notes)
+        .map(|(h, n)| h.len() + 2 + 1 + n.len())
+        .collect();
+    let fixed_from = |skip: usize| {
+        cost[skip..].iter().sum::<usize>()
+            + FOOTER.len()
+            + dropped_line(dropped + skip).map_or(0, |l| l.len() + 2)
+    };
+    // The whole frame stays within the budget: the oldest items give way until what is fixed
+    // fits, and are counted with those that already did not fit.
+    let mut skip = 0;
+    while skip < items.len() && fixed_from(skip) > budget {
+        skip += 1;
+    }
+    let fixed = fixed_from(skip);
+    let (items, headers, notes) = (&items[skip..], &headers[skip..], &notes[skip..]);
+    let texts: Vec<String> = items
+        .iter()
+        .map(|i| quote_marker(redact(&i.text).trim()))
+        .collect();
     let mut room = budget.saturating_sub(fixed);
     // Water-filling: the shortest texts first, each taking at most an even share of what is left.
     let mut order: Vec<usize> = (0..items.len()).collect();
@@ -376,12 +395,12 @@ pub fn frame(items: &[Item], dropped: usize, budget: usize) -> String {
         room -= allowed[i];
     }
     let mut out = Vec::with_capacity(items.len() + 2);
-    if let Some(line) = dropped_line {
+    if let Some(line) = dropped_line(dropped + skip) {
         out.push(line);
     }
-    for (i, h) in headers.into_iter().enumerate() {
+    for (i, h) in headers.iter().enumerate() {
         let (text, was_cut) = cut(&texts[i], allowed[i]);
-        let mut block = h;
+        let mut block = h.clone();
         if !text.is_empty() {
             block.push('\n');
             block.push_str(&text);
@@ -608,16 +627,64 @@ mod tests {
     }
 
     #[test]
-    fn a_tiny_budget_still_names_every_worker() {
+    fn a_tight_budget_names_every_worker_it_can_and_counts_the_rest() {
         let items = [
             item('a', Outcome::Completed, &"y".repeat(5000), Shown::Event(1)),
             item('b', Outcome::Interrupted, "", Shown::Event(2)),
         ];
-        let text = frame(&items, 0, 10);
-        assert!(text.contains("worker-a"));
+        // The smallest budget that names both carries none of the text, and stays within it.
+        let both = (0..4000)
+            .find(|&b| frame(&items, 0, b).contains("worker-a"))
+            .expect("a budget that fits both");
+        let text = frame(&items, 0, both);
+        assert!(text.len() <= both, "{} > {both}", text.len());
         assert!(text.contains("worker-b"));
         assert!(text.contains("finished: interrupted."));
         assert!(!text.contains("yyyy"));
+        assert!(text.contains("cut to fit"));
+        // One byte less: the oldest gives way, and is counted.
+        let text = frame(&items, 0, both - 1);
+        assert!(text.len() < both, "{} >= {both}", text.len());
+        assert!(!text.contains("worker-a"));
+        assert!(text.contains("worker-b"));
+        assert!(text.starts_with("[agent-terminal] 1 earlier sub-agent notification(s)"));
+    }
+
+    /// However many items, however long their names, models and texts (multi-byte, control
+    /// characters, spoofed markers, secrets), and however many gave way before, a frame never
+    /// exceeds the budget.
+    #[test]
+    fn a_frame_never_exceeds_the_wake_budget() {
+        let secret = format!("ghp_{}", "C".repeat(36));
+        let name = format!("é\u{2028}{}{secret}", "名".repeat(200));
+        let text = format!("[agent-terminal] x\n{}", "ü\r".repeat(20_000));
+        let many: Vec<Item> = (0..MAX_PENDING)
+            .map(|n| Item {
+                worker: WorkerId::from_suffix(&format!("{n:032x}")).unwrap(),
+                name: name.clone(),
+                driver: Driver::Claude,
+                model: Some("模".repeat(300)),
+                outcome: Outcome::Message,
+                text: text.clone(),
+                shown: Shown::Event(n as i64),
+            })
+            .collect();
+        for count in [1, 2, 8, 33, MAX_PENDING] {
+            for dropped in [0, 1, usize::MAX / 2] {
+                let framed = frame(&many[..count], dropped, WAKE_BUDGET);
+                assert!(
+                    framed.len() <= WAKE_BUDGET,
+                    "{count} items, {dropped} dropped: {} bytes",
+                    framed.len()
+                );
+                assert!(!framed.contains(&secret));
+                assert!(framed.ends_with(FOOTER));
+            }
+        }
+        // The newest item is always named.
+        let framed = frame(&many, 0, WAKE_BUDGET);
+        assert!(framed.contains(many[MAX_PENDING - 1].worker.as_str()));
+        assert!(framed.contains("earlier sub-agent notification(s) did not fit"));
     }
 
     #[test]

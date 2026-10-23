@@ -16,7 +16,7 @@ use agent_core::delegation::{MessageId, WorkerId};
 use gtk4::glib;
 use std::rc::{Rc, Weak};
 use std::time::Duration;
-use tracing::info;
+use tracing::{info, warn};
 
 /// How long news waits for more before it is offered: sub-agents finishing close together
 /// share one wake turn.
@@ -268,19 +268,25 @@ impl Supervisor {
         let text = wake::frame(&items, dropped, wake::WAKE_BUDGET);
         let weak = self.weak.clone();
         let root = root.clone();
-        Some(TakenNews {
+        Some(TakenNews::new(
             text,
-            give_back: Box::new(move || {
+            Box::new(move || {
                 let Some(sup) = weak.upgrade() else {
                     return;
                 };
                 let count = items.len();
-                if let Some(queue) = sup.state.borrow_mut().wakes.get_mut(&root) {
+                // Given back when it is dropped, which may be anywhere: never panic on a borrow.
+                let Ok(mut state) = sup.state.try_borrow_mut() else {
+                    warn!(%root, items = count, "sub-agent news could not be put back; it stays in the mailbox");
+                    return;
+                };
+                if let Some(queue) = state.wakes.get_mut(&root) {
                     queue.restore(items, dropped);
                 }
+                drop(state);
                 info!(%root, items = count, "sub-agent news put back: the user's message was not sent");
             }),
-        })
+        ))
     }
 }
 
