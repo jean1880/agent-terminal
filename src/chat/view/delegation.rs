@@ -1022,22 +1022,18 @@ pub(crate) mod tests {
             feed(
                 &mut workers,
                 &scope,
-                Envelope::new(Event::ItemStarted {
-                    kind: ItemKind::AssistantMessage,
-                    title: String::new(),
-                    input: None,
-                    parent: None,
-                })
-                .item("same-native-item"),
+                Envelope::item_started(
+                    "same-native-item",
+                    ItemKind::AssistantMessage,
+                    "",
+                    None,
+                    None,
+                ),
             );
             feed(
                 &mut workers,
                 &scope,
-                Envelope::new(Event::ContentDelta {
-                    stream: StreamKind::Assistant,
-                    text: text.into(),
-                })
-                .item("same-native-item"),
+                Envelope::delta("same-native-item", StreamKind::Assistant, text),
             );
             feed(
                 &mut workers,
@@ -1051,12 +1047,7 @@ pub(crate) mod tests {
             feed(
                 &mut workers,
                 &scope,
-                Envelope::new(Event::TurnCompleted {
-                    state: TurnState::Completed,
-                    usage: None,
-                    cost_usd: None,
-                    error: None,
-                }),
+                Envelope::turn_completed(TurnState::Completed, None),
             );
         }
         assert!(
@@ -1179,12 +1170,7 @@ pub(crate) mod tests {
         feed(
             &mut workers,
             &wrong,
-            Envelope::new(Event::TurnCompleted {
-                state: TurnState::Completed,
-                usage: None,
-                cost_usd: None,
-                error: None,
-            }),
+            Envelope::turn_completed(TurnState::Completed, None),
         );
         assert!(
             workers.worker("w_workerAA").expect("worker").histories[0]
@@ -1272,13 +1258,13 @@ pub(crate) mod tests {
         let scope1 = scope("w_workerAA", 1, "r_firstRun");
         subscriber.scoped(&ScopedEnvelope {
             scope: scope1.clone(),
-            envelope: Envelope::new(Event::ItemStarted {
-                kind: ItemKind::FileChange,
-                title: "Edit child file".into(),
-                input: Some(json!({"file_path":"child.rs"})),
-                parent: None,
-            })
-            .item("native-edit"),
+            envelope: Envelope::item_started(
+                "native-edit",
+                ItemKind::FileChange,
+                "Edit child file",
+                Some(json!({"file_path":"child.rs"})),
+                None,
+            ),
         });
         subscriber.scoped(&ScopedEnvelope {
             scope: scope1.clone(),

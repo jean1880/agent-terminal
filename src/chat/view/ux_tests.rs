@@ -87,15 +87,13 @@ fn native_ux_matrix() {
                 format!("src/{}.rs", "c".repeat(900)),
             ),
         ] {
-            history.push(
-                Envelope::new(Event::ItemStarted {
-                    kind,
-                    title: text.clone(),
-                    input: Some(serde_json::json!({"command": text, "file_path": text})),
-                    parent: None,
-                })
-                .item(id),
-            );
+            history.push(Envelope::item_started(
+                id,
+                kind,
+                text.clone(),
+                Some(serde_json::json!({"command": text, "file_path": text})),
+                None,
+            ));
         }
         // Text that cannot be broken on its own must wrap or ellipsize, never widen the thread
         // A switch divider with a 900-char model, a question with a 300-char
@@ -141,42 +139,34 @@ fn native_ux_matrix() {
             })
             .request("wide-question"),
         ]);
-        history.push(
-            Envelope::new(Event::ItemStarted {
-                kind: ItemKind::AssistantMessage,
-                title: String::new(),
-                input: None,
-                parent: None,
-            })
-            .item("markdown"),
-        );
-        history.push(
-            Envelope::new(Event::ContentSnapshot {
-                stream: StreamKind::Assistant,
-                text: format!(
-                    "A link: https://example.invalid/{}\n\n```rust\n{}\n```",
-                    "d".repeat(900),
-                    "e".repeat(900)
-                ),
-            })
-            .item("markdown"),
-        );
-        history.push(
-            Envelope::new(Event::ItemStarted {
-                kind: ItemKind::UserMessage,
-                title: String::new(),
-                input: None,
-                parent: None,
-            })
-            .item("user"),
-        );
-        history.push(
-            Envelope::new(Event::ContentSnapshot {
-                stream: StreamKind::Assistant,
-                text: format!("Visible message {}", "f".repeat(900)),
-            })
-            .item("user"),
-        );
+        history.push(Envelope::item_started(
+            "markdown",
+            ItemKind::AssistantMessage,
+            "",
+            None,
+            None,
+        ));
+        history.push(Envelope::snapshot(
+            "markdown",
+            StreamKind::Assistant,
+            format!(
+                "A link: https://example.invalid/{}\n\n```rust\n{}\n```",
+                "d".repeat(900),
+                "e".repeat(900)
+            ),
+        ));
+        history.push(Envelope::item_started(
+            "user",
+            ItemKind::UserMessage,
+            "",
+            None,
+            None,
+        ));
+        history.push(Envelope::snapshot(
+            "user",
+            StreamKind::Assistant,
+            format!("Visible message {}", "f".repeat(900)),
+        ));
         view.replay(&history);
         let side = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         side.set_size_request(140, -1);
@@ -373,13 +363,7 @@ fn ancestor<T: IsA<gtk4::Widget>>(w: &impl IsA<gtk4::Widget>) -> T {
 }
 
 fn item_started(id: &str, kind: ItemKind, title: &str, input: serde_json::Value) -> Envelope {
-    Envelope::new(Event::ItemStarted {
-        kind,
-        title: title.into(),
-        input: Some(input),
-        parent: None,
-    })
-    .item(id)
+    Envelope::item_started(id, kind, title, Some(input), None)
 }
 
 /// Presses the visible text of every click target of the view and asserts its effect.
@@ -399,30 +383,20 @@ fn native_click_matrix() {
             "Bash",
             serde_json::json!({"command": "cargo test --workspace"}),
         ),
-        Envelope::new(Event::ItemCompleted {
-            status: agent_core::event::ItemStatus::Completed,
-            output: Some("ok".into()),
-            error: None,
-        })
-        .item("cmd"),
-        Envelope::new(Event::ItemStarted {
-            kind: ItemKind::Reasoning,
-            title: String::new(),
-            input: None,
-            parent: None,
-        })
-        .item("think"),
-        Envelope::new(Event::ContentSnapshot {
-            stream: StreamKind::Reasoning,
-            text: "Weighing the options.".into(),
-        })
-        .item("think"),
-        Envelope::new(Event::ItemCompleted {
-            status: agent_core::event::ItemStatus::Completed,
-            output: None,
-            error: None,
-        })
-        .item("think"),
+        Envelope::item_completed(
+            "cmd",
+            agent_core::event::ItemStatus::Completed,
+            Some("ok"),
+            None,
+        ),
+        Envelope::item_started("think", ItemKind::Reasoning, "", None, None),
+        Envelope::snapshot("think", StreamKind::Reasoning, "Weighing the options."),
+        Envelope::item_completed(
+            "think",
+            agent_core::event::ItemStatus::Completed,
+            None,
+            None,
+        ),
     ];
     // A plan and a running sub-agent: the header's counter and a row on the shelf.
     let mut working = vec![
@@ -702,18 +676,12 @@ fn native_click_matrix() {
 
     // The composer's send button sends the draft; a code block's Copy button confirms.
     let code = vec![
-        Envelope::new(Event::ItemStarted {
-            kind: ItemKind::AssistantMessage,
-            title: String::new(),
-            input: None,
-            parent: None,
-        })
-        .item("answer"),
-        Envelope::new(Event::ContentSnapshot {
-            stream: StreamKind::Assistant,
-            text: "Here:\n\n```rust\nfn main() {}\n```".into(),
-        })
-        .item("answer"),
+        Envelope::item_started("answer", ItemKind::AssistantMessage, "", None, None),
+        Envelope::snapshot(
+            "answer",
+            StreamKind::Assistant,
+            "Here:\n\n```rust\nfn main() {}\n```",
+        ),
     ];
     let (window, view) = shown_view(1100, &code, &ctx);
     let inner = view.inner().expect("view");
@@ -895,15 +863,13 @@ fn native_queue_stays_pinned_and_contained() {
         assert_eq!(queued.len(), 2, "two queued rows at {width}px");
         assert!(queued.iter().all(|l| l.is_selectable()));
         // A new reply lands above the queue, not below it.
-        view.apply(
-            &Envelope::new(Event::ItemStarted {
-                kind: ItemKind::AssistantMessage,
-                title: String::new(),
-                input: None,
-                parent: None,
-            })
-            .item("late-reply"),
-        );
+        view.apply(&Envelope::item_started(
+            "late-reply",
+            ItemKind::AssistantMessage,
+            "",
+            None,
+            None,
+        ));
         let model = inner.model.borrow();
         let order = model.order();
         assert_eq!(
@@ -949,21 +915,15 @@ fn native_quick_reply_chips_fill_the_composer_and_send_nothing() {
         ] {
             view.apply(&Envelope::new(event).item("a1"));
         }
-        view.apply(
-            &Envelope::new(Event::ContentSnapshot {
-                stream: StreamKind::Assistant,
-                text:
-                    "Two layouts fit.\n\nWhich do you prefer?\n\n- Tabs on top\n- Tabs on the side"
-                        .into(),
-            })
-            .item("a1"),
-        );
-        view.apply(&Envelope::new(Event::TurnCompleted {
-            state: agent_core::event::TurnState::Completed,
-            usage: None,
-            cost_usd: None,
-            error: None,
-        }));
+        view.apply(&Envelope::snapshot(
+            "a1",
+            StreamKind::Assistant,
+            "Two layouts fit.\n\nWhich do you prefer?\n\n- Tabs on top\n- Tabs on the side",
+        ));
+        view.apply(&Envelope::turn_completed(
+            agent_core::event::TurnState::Completed,
+            None,
+        ));
         view.apply(
             &Envelope::new(Event::QuestionRequested {
                 source: agent_core::event::QuestionSource::Reply,

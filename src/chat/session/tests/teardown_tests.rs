@@ -1,12 +1,7 @@
 use super::*;
 
 fn turn_completed(session: &ChatSession, state: TurnState) {
-    session.inner.emit(Envelope::new(Event::TurnCompleted {
-        state,
-        usage: None,
-        cost_usd: None,
-        error: None,
-    }));
+    session.inner.emit(Envelope::turn_completed(state, None));
 }
 
 fn queued_session(driver: Driver, log: &Log) -> (Rc<Store>, ThreadId, Rc<ChatSession>, Seen) {

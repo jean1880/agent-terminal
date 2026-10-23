@@ -88,12 +88,10 @@ fn native_the_context_gauge_is_polled_after_a_turn_for_agents_that_do_not_push_i
             input: None,
             parent: None,
         }));
-        view.apply(&Envelope::new(Event::TurnCompleted {
-            state: agent_core::event::TurnState::Completed,
-            usage: None,
-            cost_usd: None,
-            error: None,
-        }));
+        view.apply(&Envelope::turn_completed(
+            agent_core::event::TurnState::Completed,
+            None,
+        ));
         let asked = || {
             backend
                 .asked(|c| matches!(c, Control::ContextUsage))
@@ -373,19 +371,15 @@ fn native_request_cards_wrap_and_never_take_focus() {
         ] {
             view.apply(&Envelope::new(event).item("a1"));
         }
-        view.apply(
-            &Envelope::new(Event::ContentSnapshot {
-                stream: agent_core::event::StreamKind::Assistant,
-                text: "Which do you prefer?".into(),
-            })
-            .item("a1"),
-        );
-        view.apply(&Envelope::new(Event::TurnCompleted {
-            state: agent_core::event::TurnState::Completed,
-            usage: None,
-            cost_usd: None,
-            error: None,
-        }));
+        view.apply(&Envelope::snapshot(
+            "a1",
+            agent_core::event::StreamKind::Assistant,
+            "Which do you prefer?",
+        ));
+        view.apply(&Envelope::turn_completed(
+            agent_core::event::TurnState::Completed,
+            None,
+        ));
         view.apply(
             &Envelope::new(Event::QuestionRequested {
                 source: agent_core::event::QuestionSource::Reply,

@@ -659,39 +659,19 @@ fn started(
     input: Option<Value>,
     parent: Option<&str>,
 ) -> Envelope {
-    Envelope::new(Event::ItemStarted {
-        kind,
-        title: title.into(),
-        input,
-        parent: parent.map(str::to_owned),
-    })
-    .item(id)
+    Envelope::item_started(id, kind, title, input, parent)
 }
 
 fn snapshot(id: &str, stream: StreamKind, text: &str) -> Envelope {
-    Envelope::new(Event::ContentSnapshot {
-        stream,
-        text: text.into(),
-    })
-    .item(id)
+    Envelope::snapshot(id, stream, text)
 }
 
 fn completed(id: &str, status: ItemStatus, output: Option<&str>, error: Option<&str>) -> Envelope {
-    Envelope::new(Event::ItemCompleted {
-        status,
-        output: output.map(str::to_owned),
-        error: error.map(str::to_owned),
-    })
-    .item(id)
+    Envelope::item_completed(id, status, output, error)
 }
 
 fn turn_done(state: TurnState, error: Option<&str>) -> Envelope {
-    Envelope::new(Event::TurnCompleted {
-        state,
-        usage: None,
-        cost_usd: None,
-        error: error.map(str::to_owned),
-    })
+    Envelope::turn_completed(state, error)
 }
 
 /// Streams `text` as deltas of about `chunk` words every `ms` milliseconds.
@@ -703,21 +683,17 @@ fn stream(id: &str, stream: StreamKind, text: &str, chunk: usize, ms: u32) -> Ve
         buf.push_str(piece);
         words += 1;
         if words >= chunk {
-            steps.push(Step::Emit(
-                Envelope::new(Event::ContentDelta {
-                    stream,
-                    text: std::mem::take(&mut buf),
-                })
-                .item(id),
-            ));
+            steps.push(Step::Emit(Envelope::delta(
+                id,
+                stream,
+                std::mem::take(&mut buf),
+            )));
             steps.push(Step::Wait(ms));
             words = 0;
         }
     }
     if !buf.is_empty() {
-        steps.push(Step::Emit(
-            Envelope::new(Event::ContentDelta { stream, text: buf }).item(id),
-        ));
+        steps.push(Step::Emit(Envelope::delta(id, stream, buf)));
     }
     steps
 }
@@ -1163,7 +1139,7 @@ fn diff_review_script() -> Vec<Step> {
             {"path":"src/config_test.rs","kind":{"type":"update"},"diff":"@@ -1 +1 @@\n-assert!(path.exists());\n+assert_eq!(read_config(&path)?, expected);\n"}
         ])), None)),
         Step::Emit(completed("demo-edit", ItemStatus::Completed, None, None)),
-        Step::Emit(Envelope::new(Event::TurnCompleted { state: TurnState::Completed, error: None, usage: None, cost_usd: None })),
+        Step::Emit(Envelope::turn_completed(TurnState::Completed, None)),
     ]
 }
 

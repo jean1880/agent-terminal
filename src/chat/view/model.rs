@@ -2758,12 +2758,7 @@ mod tests {
     }
 
     fn finish_turn(state: TurnState) -> Envelope {
-        ev(Event::TurnCompleted {
-            state,
-            usage: None,
-            cost_usd: None,
-            error: None,
-        })
+        Envelope::turn_completed(state, None)
     }
 
     fn plans(t: &Transcript) -> Vec<(&[PlanStep], Option<TurnState>)> {
@@ -3292,13 +3287,7 @@ mod tests {
     }
 
     fn started(id: &str, kind: ItemKind, parent: Option<&str>) -> Envelope {
-        Envelope::new(Event::ItemStarted {
-            kind,
-            title: format!("title {id}"),
-            input: None,
-            parent: parent.map(str::to_owned),
-        })
-        .item(id)
+        Envelope::item_started(id, kind, format!("title {id}"), None, parent)
     }
 
     fn delta(id: Option<&str>, stream: StreamKind, text: &str) -> Envelope {
@@ -3334,11 +3323,7 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         };
         assert_eq!(text(&t), "Hello");
-        let snap = Envelope::new(Event::ContentSnapshot {
-            stream: StreamKind::Assistant,
-            text: "Hello, world".into(),
-        })
-        .item("m1");
+        let snap = Envelope::snapshot("m1", StreamKind::Assistant, "Hello, world");
         t.apply(&snap, Driver::Claude);
         assert_eq!(text(&t), "Hello, world");
         // An identical snapshot is not a change.
@@ -3373,13 +3358,7 @@ mod tests {
     fn the_explorer_lists_every_subagent_in_order_with_its_task_and_steps() {
         let mut t = Transcript::new();
         let task = |id: &str, parent: Option<&str>, input: serde_json::Value| {
-            Envelope::new(Event::ItemStarted {
-                kind: ItemKind::Subagent,
-                title: "Task".into(),
-                input: Some(input),
-                parent: parent.map(str::to_owned),
-            })
-            .item(id)
+            Envelope::item_started(id, ItemKind::Subagent, "Task", Some(input), parent)
         };
         t.apply(&started("u", ItemKind::UserMessage, None), Driver::Claude);
         t.apply(
@@ -3519,12 +3498,7 @@ mod tests {
         assert!(t.running_drivers(Vec::new()).is_empty());
         t.apply(&started("task", ItemKind::Subagent, None), Driver::Claude);
         assert_eq!(t.running_drivers(Vec::new()), [Driver::Claude]);
-        let done = Envelope::new(Event::ItemCompleted {
-            status: ItemStatus::Completed,
-            output: None,
-            error: None,
-        })
-        .item("task");
+        let done = Envelope::item_completed("task", ItemStatus::Completed, None, None);
         t.apply(&done, Driver::Claude);
         assert!(t.running_drivers(Vec::new()).is_empty());
     }
@@ -3536,13 +3510,13 @@ mod tests {
         let mut t = Transcript::new();
         t.apply(&ev(Event::TurnStarted { model: None }), Driver::Claude);
         let command = |id: &str, line: &str| {
-            Envelope::new(Event::ItemStarted {
-                kind: ItemKind::Command,
-                title: "Bash".into(),
-                input: Some(serde_json::json!({ "command": line })),
-                parent: None,
-            })
-            .item(id)
+            Envelope::item_started(
+                id,
+                ItemKind::Command,
+                "Bash",
+                Some(serde_json::json!({ "command": line })),
+                None,
+            )
         };
         t.apply(&command("ls", "ls -la"), Driver::Claude);
         assert!(t.subagents().is_empty());
@@ -3556,12 +3530,7 @@ mod tests {
         assert_eq!(agents[0].name, "Antigravity · gemini-4-argon (shell)");
         assert_eq!(agents[0].task, "Review the diff");
         assert_eq!(t.running_drivers(Vec::new()), [Driver::Agy]);
-        let done = Envelope::new(Event::ItemCompleted {
-            status: ItemStatus::Completed,
-            output: Some("Looks good.".into()),
-            error: None,
-        })
-        .item("x");
+        let done = Envelope::item_completed("x", ItemStatus::Completed, Some("Looks good."), None);
         t.apply(&done, Driver::Claude);
         assert!(t.running_drivers(Vec::new()).is_empty());
         assert_eq!(t.subagents()[0].status, ToolStatus::Completed);
@@ -3575,12 +3544,7 @@ mod tests {
             &delta(Some("c1"), StreamKind::ToolInput, "{\"command\":"),
             Driver::Claude,
         );
-        let done = Envelope::new(Event::ItemCompleted {
-            status: ItemStatus::Failed,
-            output: Some("boom".into()),
-            error: Some("exit 1".into()),
-        })
-        .item("c1");
+        let done = Envelope::item_completed("c1", ItemStatus::Failed, Some("boom"), Some("exit 1"));
         t.apply(&done, Driver::Claude);
         let item = t.get("c1").expect("c1");
         assert!(item.expanded);
@@ -3596,21 +3560,15 @@ mod tests {
     #[test]
     fn repeated_tool_start_refines_metadata_without_adding_another_card() {
         let mut t = Transcript::new();
-        let pending = Envelope::new(Event::ItemStarted {
-            kind: ItemKind::WebSearch,
-            title: "web search".into(),
-            input: None,
-            parent: None,
-        })
-        .item("ws");
+        let pending = Envelope::item_started("ws", ItemKind::WebSearch, "web search", None, None);
         t.apply(&pending, Driver::Codex);
-        let refined = Envelope::new(Event::ItemStarted {
-            kind: ItemKind::WebSearch,
-            title: "Rust 1.91".into(),
-            input: Some(serde_json::json!({"query": "Rust 1.91"})),
-            parent: None,
-        })
-        .item("ws");
+        let refined = Envelope::item_started(
+            "ws",
+            ItemKind::WebSearch,
+            "Rust 1.91",
+            Some(serde_json::json!({"query": "Rust 1.91"})),
+            None,
+        );
         assert_eq!(
             t.apply(&refined, Driver::Codex),
             [Change::Updated("ws".into())]
@@ -4534,12 +4492,7 @@ mod tests {
     }
 
     fn turn_done() -> Envelope {
-        ev(Event::TurnCompleted {
-            state: TurnState::Completed,
-            usage: None,
-            cost_usd: None,
-            error: None,
-        })
+        Envelope::turn_completed(TurnState::Completed, None)
     }
 
     #[test]
@@ -4692,12 +4645,7 @@ mod tests {
             started("agent", ItemKind::Subagent, None),
             started("agent-read", ItemKind::FileRead, Some("agent")),
             started("done", ItemKind::Command, None),
-            Envelope::new(Event::ItemCompleted {
-                status: ItemStatus::Completed,
-                output: None,
-                error: None,
-            })
-            .item("done"),
+            Envelope::item_completed("done", ItemStatus::Completed, None, None),
             Envelope::new(Event::ApprovalRequested {
                 tool: "Bash".into(),
                 title: None,
@@ -4890,12 +4838,7 @@ mod tests {
         t.apply(&ev(Event::TurnStarted { model: None }), Driver::Claude);
         t.apply(&started("c", ItemKind::Command, None), Driver::Claude);
         t.apply(
-            &Envelope::new(Event::ItemCompleted {
-                status: ItemStatus::Completed,
-                output: None,
-                error: None,
-            })
-            .item("c"),
+            &Envelope::item_completed("c", ItemStatus::Completed, None, None),
             Driver::Claude,
         );
         t.apply(&turn_done(), Driver::Claude);
@@ -5037,13 +4980,13 @@ mod tests {
         t.apply(&started("t1", ItemKind::FileRead, None), Driver::Agy);
 
         // While turn 1 is running, the operator queues a follow-up prompt
-        let q_envelope = Envelope::new(Event::ItemStarted {
-            kind: ItemKind::UserMessage,
-            title: "queued".to_string(),
-            input: Some(serde_json::json!({"queued": true})),
-            parent: None,
-        })
-        .item("q1");
+        let q_envelope = Envelope::item_started(
+            "q1",
+            ItemKind::UserMessage,
+            "queued",
+            Some(serde_json::json!({"queued": true})),
+            None,
+        );
         t.apply(&q_envelope, Driver::Agy);
 
         assert_eq!(t.order(), ["u1", "t1", "q1"]);
@@ -5060,25 +5003,19 @@ mod tests {
         assert_eq!(t.order(), ["u1", "t1", "t2", "r1", "a1", "q1"]);
 
         // Operator queues a second prompt
-        let q2_envelope = Envelope::new(Event::ItemStarted {
-            kind: ItemKind::UserMessage,
-            title: "queued".to_string(),
-            input: Some(serde_json::json!({"queued": true})),
-            parent: None,
-        })
-        .item("q2");
+        let q2_envelope = Envelope::item_started(
+            "q2",
+            ItemKind::UserMessage,
+            "queued",
+            Some(serde_json::json!({"queued": true})),
+            None,
+        );
         t.apply(&q2_envelope, Driver::Agy);
 
         assert_eq!(t.order(), ["u1", "t1", "t2", "r1", "a1", "q1", "q2"]);
 
         // Turn 1 completes and q1 is unqueued
-        let unqueue_q1 = Envelope::new(Event::ItemStarted {
-            kind: ItemKind::UserMessage,
-            title: String::new(),
-            input: None,
-            parent: None,
-        })
-        .item("q1");
+        let unqueue_q1 = Envelope::item_started("q1", ItemKind::UserMessage, "", None, None);
         t.apply(&unqueue_q1, Driver::Agy);
 
         // q1 is now active, q2 is still queued at the end

@@ -353,7 +353,7 @@ impl SubagentShelf {
 pub(crate) mod tests {
     use super::*;
     use agent_core::adapter::Driver;
-    use agent_core::event::{Envelope, Event, ItemKind};
+    use agent_core::event::{Envelope, ItemKind};
 
     #[test]
     #[ignore = "native GTK; run alone in an isolated display"]
@@ -400,22 +400,11 @@ pub(crate) mod tests {
         input: serde_json::Value,
         parent: Option<&str>,
     ) -> Envelope {
-        Envelope::new(Event::ItemStarted {
-            kind,
-            title: title.into(),
-            input: Some(input),
-            parent: parent.map(str::to_owned),
-        })
-        .item(id)
+        Envelope::item_started(id, kind, title, Some(input), parent)
     }
 
     fn done(id: &str) -> Envelope {
-        Envelope::new(Event::ItemCompleted {
-            status: agent_core::event::ItemStatus::Completed,
-            output: None,
-            error: None,
-        })
-        .item(id)
+        Envelope::item_completed(id, agent_core::event::ItemStatus::Completed, None, None)
     }
 
     fn subagent(id: &str, name: &str) -> Envelope {

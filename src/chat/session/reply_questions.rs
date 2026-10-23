@@ -208,21 +208,11 @@ mod tests {
     use super::*;
 
     fn started(kind: ItemKind, id: &str) -> Envelope {
-        Envelope::new(Event::ItemStarted {
-            kind,
-            title: String::new(),
-            input: None,
-            parent: None,
-        })
-        .item(id)
+        Envelope::item_started(id, kind, "", None, None)
     }
 
     fn text(id: &str, text: &str) -> Envelope {
-        Envelope::new(Event::ContentDelta {
-            stream: StreamKind::Assistant,
-            text: text.into(),
-        })
-        .item(id)
+        Envelope::delta(id, StreamKind::Assistant, text)
     }
 
     const ASKS: &str = "Which do you prefer?\n\n- Keep it\n- Drop it";
@@ -285,13 +275,8 @@ mod tests {
 
     #[test]
     fn a_sub_agents_message_is_not_the_reply() {
-        let nested = Envelope::new(Event::ItemStarted {
-            kind: ItemKind::AssistantMessage,
-            title: String::new(),
-            input: None,
-            parent: Some("tool1".into()),
-        })
-        .item("sub");
+        let nested =
+            Envelope::item_started("sub", ItemKind::AssistantMessage, "", None, Some("tool1"));
         let t = turn(&[
             started(ItemKind::AssistantMessage, "a1"),
             text("a1", "Done."),
@@ -349,11 +334,7 @@ mod tests {
 
     #[test]
     fn a_snapshot_replaces_the_deltas() {
-        let snapshot = Envelope::new(Event::ContentSnapshot {
-            stream: StreamKind::Assistant,
-            text: ASKS.into(),
-        })
-        .item("a1");
+        let snapshot = Envelope::snapshot("a1", StreamKind::Assistant, ASKS);
         let t = turn(&[
             started(ItemKind::AssistantMessage, "a1"),
             text("a1", "partial"),
@@ -428,28 +409,15 @@ mod session_tests {
                 .request("q1"),
             );
         }
-        emit(
-            Envelope::new(Event::ItemStarted {
-                kind: ItemKind::AssistantMessage,
-                title: String::new(),
-                input: None,
-                parent: None,
-            })
-            .item("a1"),
-        );
-        emit(
-            Envelope::new(Event::ContentDelta {
-                stream: StreamKind::Assistant,
-                text: text.into(),
-            })
-            .item("a1"),
-        );
-        emit(Envelope::new(Event::TurnCompleted {
-            state,
-            usage: None,
-            cost_usd: None,
-            error: None,
-        }));
+        emit(Envelope::item_started(
+            "a1",
+            ItemKind::AssistantMessage,
+            "",
+            None,
+            None,
+        ));
+        emit(Envelope::delta("a1", StreamKind::Assistant, text));
+        emit(Envelope::turn_completed(state, None));
     }
 
     fn reply_offers(seen: &Seen) -> Vec<Envelope> {
