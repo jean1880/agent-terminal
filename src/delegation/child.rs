@@ -56,10 +56,8 @@ impl Supervisor {
                     && w.readback.ready
                     && !w.generations.is_empty()
                     && w.row.delegation_status != "rebind_required"
-                    && w.token.as_ref().is_some_and(|t| {
-                        t.epoch.0 == state.roots[&w.root].row.authority_epoch.max(0) as u64
-                    }),
-                ProcessGeneration(w.generation.0 + 1),
+                    && state.token_current(w),
+                w.generation.next(),
             )
         };
         if ready {
@@ -300,20 +298,18 @@ impl Supervisor {
         );
         super::attest::sanitise_identity(&mut identity);
         let plan=SpawnPlan{driver,identity,workspace,launch_json:serde_json::json!({"model":model,"effort":effort,"cwd":child_cwd,"source_repo":lease_plan.as_ref().map(|l|&l.source_repo),"branch":lease_plan.as_ref().map(|l|&l.branch),"base_commit":lease_plan.as_ref().map(|l|&l.base_commit)}).to_string(),cwd:child_cwd.to_string_lossy().into_owned(),state:SpawnState::Starting,process_generation:1};
-        let accept = Accept {
-            principal: caller.clone(),
-            request: ToolRequest::Spawn(r.clone()),
-            resolution: agent_core::delegation::operation::Resolution {
+        let accept = self.accept_request(
+            caller,
+            &root,
+            ToolRequest::Spawn(r.clone()),
+            agent_core::delegation::operation::Resolution {
                 target: None,
                 bound_runs: Vec::new(),
                 base_commit: lease_plan.as_ref().map(|l| l.base_commit.clone()),
             },
-            plan: AcceptPlan::Spawn(Box::new(plan)),
+            AcceptPlan::Spawn(Box::new(plan)),
             warnings,
-            limits: self.limits,
-            live_processes: self.usage(&root).live_processes,
-            dispatching: self.state.borrow().dispatching.clone(),
-        };
+        );
         let (accepted, _) = self.accept(accept, true).await?;
         let accepted = match accepted {
             Accepted::Replay(r) => return super::ops::replay_value(r),
@@ -681,21 +677,7 @@ impl Supervisor {
                 let mut published = None;
                 let at = super::supervisor::now();
                 if let Some(run) = run {
-                    if s.delegation_run(run.as_str())?.is_some_and(|r| {
-                        !matches!(
-                            r.state.as_str(),
-                            "completed" | "interrupted" | "failed" | "unknown"
-                        )
-                    }) {
-                        s.set_delegation_run_state(
-                            run.as_str(),
-                            "failed",
-                            None,
-                            Some(&e.message),
-                            None,
-                            at,
-                        )?;
-                    }
+                    s.end_delegation_run_if_open(run.as_str(), "failed", Some(&e.message), at)?;
                 }
                 if s.delegation_worker(worker.as_str())?
                     .is_some_and(|w| w.state != "closed")
@@ -751,21 +733,12 @@ impl Supervisor {
                 .durable("interrupt stopped delegated runs", move |s| {
                     let at = super::supervisor::now();
                     for run in &runs {
-                        if s.delegation_run(run.as_str())?.is_some_and(|r| {
-                            !matches!(
-                                r.state.as_str(),
-                                "completed" | "interrupted" | "failed" | "unknown"
-                            )
-                        }) {
-                            s.set_delegation_run_state(
-                                run.as_str(),
-                                "interrupted",
-                                None,
-                                Some("stopped"),
-                                None,
-                                at,
-                            )?;
-                        }
+                        s.end_delegation_run_if_open(
+                            run.as_str(),
+                            "interrupted",
+                            Some("stopped"),
+                            at,
+                        )?;
                     }
                     Ok(())
                 })

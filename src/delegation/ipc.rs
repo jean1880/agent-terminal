@@ -28,7 +28,12 @@ use super::seam::{CallDispatcher, ConnId, RuntimeDir};
 /// `sun_path` holds 108 bytes, NUL included.
 const MAX_SOCKET_PATH: usize = 107;
 
-/// The listener on `<rundir>/delegation-<app_pid>.sock` and its connections.
+/// The app's delegation socket in `dir`: `delegation-<app_pid>.sock`.
+pub(crate) fn socket_path(dir: &RuntimeDir, app_pid: u32) -> PathBuf {
+    dir.path().join(format!("delegation-{app_pid}.sock"))
+}
+
+/// The listener on [`socket_path`] and its connections.
 pub(crate) struct IpcServer {
     path: PathBuf,
     /// The socket file this server made, so only that file is ever unlinked.
@@ -97,13 +102,12 @@ impl IpcServer {
         dispatcher: Rc<dyn CallDispatcher>,
     ) -> Result<Rc<Self>, String> {
         use std::os::unix::fs::PermissionsExt;
-        let path = dir.path().join(format!("delegation-{app_pid}.sock"));
+        let path = socket_path(dir, app_pid);
         if path.as_os_str().len() > MAX_SOCKET_PATH {
             return Err("the delegation socket path is too long".to_owned());
         }
         // The verified runtime directory is owned by this uid (`rundir::verified`).
-        // SAFETY: `geteuid` has no preconditions and cannot fail.
-        let our_uid = unsafe { libc::geteuid() };
+        let our_uid = agent_kit::fsutil::effective_uid();
         let found = lstat(&path)?.map(|m| Found {
             symlink: m.file_type().is_symlink(),
             socket: m.file_type().is_socket(),

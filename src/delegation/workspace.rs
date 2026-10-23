@@ -256,36 +256,8 @@ pub(crate) fn scope(lease: &WorktreeLease) -> WorkspaceScope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_kit::test_support::git;
     use std::fs;
-    use std::process::Command;
-
-    fn git(dir: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .args([
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "-c",
-                "commit.gpgsign=false",
-                "-c",
-                "core.hooksPath=/dev/null",
-                "-c",
-                "init.defaultBranch=main",
-            ])
-            .args(args)
-            .current_dir(dir)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .output()
-            .expect("git runs");
-        assert!(
-            output.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8_lossy(&output.stdout).trim().to_owned()
-    }
 
     /// `<tmp>/work/main` with two commits; `None` without git.
     fn new_repo() -> Option<(tempfile::TempDir, PathBuf)> {

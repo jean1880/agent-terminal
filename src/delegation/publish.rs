@@ -1,6 +1,6 @@
 //! One sanitisation boundary feeds persistence, inspection and subscribers.
 use super::seam::ChildPublish;
-use super::supervisor::Supervisor;
+use super::supervisor::{Supervisor, HISTORY_BYTES, HISTORY_EVENTS};
 use agent_core::delegation::scope::{Scope, ScopedEnvelope};
 use agent_core::delegation::wire::EventCategory;
 use agent_core::delegation::{ProcessGeneration, WorkerId};
@@ -96,10 +96,7 @@ impl Publisher {
             let mut result = self.result.borrow_mut();
             if result.len() > 16384 {
                 let suffix = "\n[result truncated; inspect the worker transcript]";
-                let mut end = 16384 - suffix.len();
-                while !result.is_char_boundary(end) {
-                    end -= 1;
-                }
+                let end = agent_core::text::truncate_bytes(&result, 16384 - suffix.len()).len();
                 result.truncate(end);
                 result.push_str(suffix);
             }
@@ -109,20 +106,8 @@ impl Publisher {
             {
                 Some(Completion {
                     run: run.clone(),
-                    state: match state {
-                        TurnState::Completed => {
-                            agent_core::delegation::lifecycle::RunState::Completed
-                        }
-                        TurnState::Interrupted => {
-                            agent_core::delegation::lifecycle::RunState::Interrupted
-                        }
-                        TurnState::Failed => agent_core::delegation::lifecycle::RunState::Failed,
-                    },
-                    worker_state: match state {
-                        TurnState::Completed => agent_core::event::WorkerState::Completed,
-                        TurnState::Interrupted => agent_core::event::WorkerState::Waiting,
-                        TurnState::Failed => agent_core::event::WorkerState::Failed,
-                    },
+                    state: agent_core::delegation::lifecycle::run_state_after(*state),
+                    worker_state: agent_core::delegation::lifecycle::worker_state_after(*state),
                     reason: None,
                     usage_json: usage.as_ref().and_then(|u| serde_json::to_string(u).ok()),
                     result: Some(std::mem::take(&mut *self.result.borrow_mut())),
@@ -135,7 +120,7 @@ impl Publisher {
             None
         };
         let bytes = serde_json::to_vec(&event.envelope)
-            .map_or(4 * 1024 * 1024, |v| v.len())
+            .map_or(HISTORY_BYTES, |v| v.len())
             .saturating_add(event.links.len() * 512)
             .saturating_add(
                 completion
@@ -143,8 +128,8 @@ impl Publisher {
                     .and_then(|c| c.result.as_ref())
                     .map_or(0, String::len),
             );
-        if self.pending.borrow().len() >= 4096
-            || self.pending_bytes.get().saturating_add(bytes) > 4 * 1024 * 1024
+        if self.pending.borrow().len() >= HISTORY_EVENTS
+            || self.pending_bytes.get().saturating_add(bytes) > HISTORY_BYTES
         {
             self.failed.set(true);
             sup.fail_worker(
@@ -160,12 +145,9 @@ impl Publisher {
         let result = completion.as_ref().and_then(|c| c.result.clone());
         let job = move |s: &agent_kit::store::Store| {
             if let Some(mut completion) = completion {
-                let terminal = s.delegation_run(completion.run.as_str())?.is_some_and(|r| {
-                    matches!(
-                        r.state.as_str(),
-                        "completed" | "interrupted" | "failed" | "unknown"
-                    )
-                });
+                let terminal = s
+                    .delegation_run(completion.run.as_str())?
+                    .is_some_and(|r| r.settled());
                 if !terminal {
                     if let Some(link) = completion.event.links.first() {
                         if s.delegation_worker(link.worker.as_str())?
@@ -289,7 +271,7 @@ impl Publisher {
                 continue;
             }
             let stream =
-                super::supervisor::parse_enum(&key.stream).unwrap_or(StreamKind::Assistant);
+                agent_core::serde_name::parse_lenient(&key.stream).unwrap_or(StreamKind::Assistant);
             let env = Envelope::new(if out.replace {
                 Event::ContentSnapshot {
                     stream,
@@ -429,11 +411,7 @@ impl Supervisor {
                     invocation: None,
                 });
             }
-            current = node
-                .row
-                .parent_id
-                .as_deref()
-                .and_then(|p| WorkerId::parse(p).ok());
+            current = node.row.parent();
         }
         // Every publication needs a link; token deltas have no public-page category and use
         // the ordinary backing transcript append below instead.
@@ -504,12 +482,9 @@ impl Supervisor {
                         if w.run.as_ref() == scope.run.as_ref() {
                             w.last_run = w.run.take();
                         }
-                        w.row.state = match state {
-                            TurnState::Completed => "completed",
-                            TurnState::Interrupted => "waiting",
-                            TurnState::Failed => "failed",
-                        }
-                        .into();
+                        w.row.state = super::supervisor::enum_value(
+                            &agent_core::delegation::lifecycle::worker_state_after(*state),
+                        );
                     }
                     Event::ContentSnapshot {
                         stream: StreamKind::Assistant,
@@ -519,13 +494,9 @@ impl Supervisor {
                         stream: StreamKind::Assistant,
                         text,
                     } => {
-                        let mut text = agent_core::redact::redact(text);
-                        let mut end = 512.min(text.len());
-                        while !text.is_char_boundary(end) {
-                            end -= 1;
-                        }
-                        text.truncate(end);
-                        w.row.last_activity = Some(text);
+                        let text = agent_core::redact::redact(text);
+                        w.row.last_activity =
+                            Some(agent_core::text::truncate_bytes(&text, 512).to_owned());
                     }
                     Event::SessionStarted { native_id, .. } => {
                         let worker = worker.clone();
@@ -623,20 +594,10 @@ impl Supervisor {
                 link.run = Some(run.clone());
             }
         }
-        let run_state = match state {
-            TurnState::Completed => agent_core::delegation::lifecycle::RunState::Completed,
-            TurnState::Interrupted => agent_core::delegation::lifecycle::RunState::Interrupted,
-            TurnState::Failed => agent_core::delegation::lifecycle::RunState::Failed,
-        };
-        let worker_state = match state {
-            TurnState::Completed => agent_core::event::WorkerState::Completed,
-            TurnState::Interrupted => agent_core::event::WorkerState::Waiting,
-            TurnState::Failed => agent_core::event::WorkerState::Failed,
-        };
         let mut completion = Completion {
             run,
-            state: run_state,
-            worker_state,
+            state: agent_core::delegation::lifecycle::run_state_after(state),
+            worker_state: agent_core::delegation::lifecycle::worker_state_after(state),
             reason: None,
             usage_json: usage,
             result,
@@ -678,12 +639,9 @@ impl Supervisor {
                 {
                     w.last_run = w.run.take();
                     if w.row.state != "closed" {
-                        w.row.state = match state {
-                            TurnState::Completed => "completed",
-                            TurnState::Interrupted => "waiting",
-                            TurnState::Failed => "failed",
-                        }
-                        .into();
+                        w.row.state = super::supervisor::enum_value(
+                            &agent_core::delegation::lifecycle::worker_state_after(state),
+                        );
                     }
                 }
                 sup.drain_deferred(&worker);

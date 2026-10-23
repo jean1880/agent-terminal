@@ -5,36 +5,6 @@
 use super::*;
 use agent_core::delegation::{Cursor, MessageId};
 
-async fn call_err(sup: &Rc<Supervisor>, conn: ConnId, id: u64, request: ToolRequest) -> ToolError {
-    let call = agent_core::delegation::ipc::Call {
-        id,
-        tool: request.tool(),
-        args: request.args_value(),
-        timeout_ms: 1000,
-        invocation: None,
-    };
-    match sup.call(conn, call).await {
-        agent_core::delegation::ipc::CallOutcome::Ok(v) => panic!("tool succeeded: {v}"),
-        agent_core::delegation::ipc::CallOutcome::Err(e) => e,
-    }
-}
-
-fn spawned(receipt: &Value) -> WorkerId {
-    WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap()
-}
-
-fn configure_agy(sup: &Rc<Supervisor>, home: &std::path::Path) {
-    let state = home.join(".config/agent-terminal/delegation");
-    let preview = agent_kit::delegation_config::preview(
-        home,
-        &state,
-        &sup.services.bridge_command,
-        agent_kit::delegation_config::Action::Configure,
-    )
-    .unwrap();
-    agent_kit::delegation_config::apply(preview).unwrap();
-}
-
 /// The stored dispatch state of an operation, once it has left `accepted`/`dispatch_reserved`.
 async fn settled_dispatch(sup: &Rc<Supervisor>, operation: &str) -> (String, Option<String>) {
     let mut out = None;
@@ -173,15 +143,7 @@ fn a_failed_dispatch_ends_the_run_so_list_and_cancel_agree() {
         std::fs::remove_file(dir.path().join("hold-bootstrap")).unwrap();
         let (state, _) = settled_dispatch(&sup, receipt["operation_id"].as_str().unwrap()).await;
         assert_eq!(state, "failed");
-        pump_until(|| {
-            sup.services
-                .handle
-                .reader()
-                .delegation_run(&run)
-                .unwrap()
-                .is_some_and(|r| r.state == "failed")
-        })
-        .await;
+        pump_until(|| run_state(&sup, &run).is_some_and(|s| s == "failed")).await;
         std::fs::remove_file(dir.path().join("opted-out")).unwrap();
         pump_until(|| !sup.state.borrow().roots[&root].revoking).await;
         connect(&sup, &root, ConnId(42)).await;
@@ -210,10 +172,8 @@ fn a_failed_dispatch_ends_the_run_so_list_and_cancel_agree() {
             ConnId(42),
             2,
             ToolRequest::Cancel(CancelRequest {
-                worker_id: worker.clone(),
                 expected_run_id: Some(agent_core::delegation::RunId::parse(&run).unwrap()),
-                expected_authority_epoch: None,
-                idempotency_key: IdempotencyKey::parse("stale-cancel").unwrap(),
+                ..cancel_request(&worker, "stale-cancel")
             }),
         )
         .await;
@@ -255,13 +215,11 @@ fn list_reports_the_run_cancel_would_target() {
             ConnId(43),
             2,
             ToolRequest::Cancel(CancelRequest {
-                worker_id: worker.clone(),
                 expected_run_id: Some(
                     agent_core::delegation::RunId::parse(entry["run_id"].as_str().unwrap())
                         .unwrap(),
                 ),
-                expected_authority_epoch: None,
-                idempotency_key: IdempotencyKey::parse("listed-cancel").unwrap(),
+                ..cancel_request(&worker, "listed-cancel")
             }),
         )
         .await;
@@ -292,12 +250,7 @@ fn a_task_that_never_starts_is_a_stall_with_a_reason() {
             .is_some_and(|r| r.contains("did not start")));
         assert!(sup.state.borrow().workers[&worker].run.is_none());
         pump_until(|| {
-            sup.services
-                .handle
-                .reader()
-                .delegation_run(&run)
-                .unwrap()
-                .is_some_and(|r| matches!(r.state.as_str(), "failed" | "interrupted"))
+            run_state(&sup, &run).is_some_and(|s| matches!(s.as_str(), "failed" | "interrupted"))
         })
         .await;
         stop(&sup).await;
@@ -373,16 +326,7 @@ fn a_cursor_error_names_its_filter_and_a_refused_read_keeps_its_key() {
             &sup,
             ConnId(45),
             3,
-            ToolRequest::Send(SendRequest {
-                target: Target::Parent,
-                text: "report".into(),
-                kind: agent_core::delegation::mailbox::MessageKind::Report,
-                reply_to: None,
-                delivery: Delivery::NextTurn,
-                expected_run_id: None,
-                expected_authority_epoch: None,
-                idempotency_key: IdempotencyKey::parse("cursor-report").unwrap(),
-            }),
+            ToolRequest::Send(report_to_parent("report", "cursor-report")),
         )
         .await;
         let message = MessageId::parse(report["message_id"].as_str().unwrap()).unwrap();
@@ -444,16 +388,7 @@ fn a_cursor_error_names_its_filter_and_a_refused_read_keeps_its_key() {
 }
 
 fn follow_up(worker: &WorkerId, key: &str) -> SendRequest {
-    SendRequest {
-        target: Target::Worker(worker.clone()),
-        text: "follow-up".into(),
-        kind: agent_core::delegation::mailbox::MessageKind::Instruction,
-        reply_to: None,
-        delivery: Delivery::NextTurn,
-        expected_run_id: None,
-        expected_authority_epoch: None,
-        idempotency_key: IdempotencyKey::parse(key).unwrap(),
-    }
+    instruction(worker, "follow-up", key)
 }
 
 /// A follow-up's run starts with the state its predecessor left (`waiting` after an
@@ -541,12 +476,7 @@ fn a_cancel_between_taking_the_task_and_delivering_it_stays_a_cancel() {
         assert_eq!(state, "failed");
         assert!(error.unwrap().contains("stale_run"));
         pump_until(|| {
-            sup.services
-                .handle
-                .reader()
-                .delegation_run(run.as_str())
-                .unwrap()
-                .is_some_and(|r| r.state != "reserved" && r.state != "starting")
+            run_state(&sup, run.as_str()).is_some_and(|s| s != "reserved" && s != "starting")
         })
         .await;
         let ended = sup
