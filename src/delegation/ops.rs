@@ -1662,18 +1662,7 @@ impl Supervisor {
     pub(super) fn record_fact(&self, op: OperationId, fact: DispatchFact) {
         self.services
             .write("record delegated dispatch", None, true, move |s| {
-                let target = match &fact {
-                    DispatchFact::Submitted => "submitted",
-                    DispatchFact::Confirmed => "confirmed",
-                    DispatchFact::Unknown => "unknown",
-                    DispatchFact::Failed(_) => "failed",
-                };
-                if s.delegation_operation(op.as_str())?
-                    .is_some_and(|o| o.dispatch_state == target)
-                {
-                    return Ok(());
-                }
-                s.record_delegation_dispatch(&op, &fact)?;
+                s.record_delegation_dispatch_once(&op, &fact)?;
                 Ok(())
             });
     }

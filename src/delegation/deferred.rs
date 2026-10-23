@@ -700,12 +700,7 @@ impl Supervisor {
                         }
                     }
                     // As `record_fact` does: a fact already recorded is not recorded again.
-                    if !s
-                        .delegation_operation(operation.as_str())?
-                        .is_some_and(|o| o.dispatch_state == "failed")
-                    {
-                        s.record_delegation_dispatch(&operation, &fact)?;
-                    }
+                    s.record_delegation_dispatch_once(&operation, &fact)?;
                     Ok(())
                 })
             });
