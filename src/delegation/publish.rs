@@ -96,10 +96,7 @@ impl Publisher {
             let mut result = self.result.borrow_mut();
             if result.len() > 16384 {
                 let suffix = "\n[result truncated; inspect the worker transcript]";
-                let mut end = 16384 - suffix.len();
-                while !result.is_char_boundary(end) {
-                    end -= 1;
-                }
+                let end = agent_core::text::truncate_bytes(&result, 16384 - suffix.len()).len();
                 result.truncate(end);
                 result.push_str(suffix);
             }
@@ -497,13 +494,9 @@ impl Supervisor {
                         stream: StreamKind::Assistant,
                         text,
                     } => {
-                        let mut text = agent_core::redact::redact(text);
-                        let mut end = 512.min(text.len());
-                        while !text.is_char_boundary(end) {
-                            end -= 1;
-                        }
-                        text.truncate(end);
-                        w.row.last_activity = Some(text);
+                        let text = agent_core::redact::redact(text);
+                        w.row.last_activity =
+                            Some(agent_core::text::truncate_bytes(&text, 512).to_owned());
                     }
                     Event::SessionStarted { native_id, .. } => {
                         let worker = worker.clone();

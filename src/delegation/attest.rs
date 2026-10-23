@@ -25,12 +25,8 @@ pub(super) fn sanitise_identity(identity: &mut agent_core::delegation::identity:
             .into_iter()
             .flatten()
         {
-            *text = agent_core::redact::redact(text);
-            let mut end = max.min(text.len());
-            while !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            text.truncate(end);
+            let redacted = agent_core::redact::redact(text);
+            *text = agent_core::text::truncate_bytes(&redacted, max).to_owned();
         }
     }
 }
