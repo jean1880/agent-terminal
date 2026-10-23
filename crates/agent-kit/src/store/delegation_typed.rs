@@ -22,7 +22,7 @@ use std::collections::{BTreeSet, HashSet};
 
 use agent_core::adapter::Driver;
 use agent_core::delegation::authority::{revocation, RevocationEffect, RevocationEvent, TaskMode};
-use agent_core::delegation::error::{ErrorCode, ToolError};
+use agent_core::delegation::error::{truncate_bytes, ErrorCode, ToolError};
 use agent_core::delegation::identity::Identity;
 use agent_core::delegation::ids::{
     Cursor, IdempotencyKey, MessageId, OperationId, ProfileId, RunId, WorkerId,
@@ -148,18 +148,6 @@ fn message_id(s: &str) -> Result<MessageId> {
 
 fn operation_id(s: &str) -> Result<OperationId> {
     parse_id("operation", s, OperationId::parse)
-}
-
-/// `s` cut to at most `max` bytes at a character boundary.
-fn cut(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_owned();
-    }
-    let mut end = max;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    s[..end].to_owned()
 }
 
 fn illegal(what: &str) -> StoreError {
@@ -1653,7 +1641,7 @@ impl Store {
                     recipient_worker_id: parent.clone(),
                     kind: name_of(&MessageKind::Report),
                     reply_to: None,
-                    body: cut(&redact(result), MAX_RESULT_BYTES),
+                    body: truncate_bytes(&redact(result), MAX_RESULT_BYTES).to_owned(),
                     delivery_policy: name_of(&Delivery::Auto),
                     target_run_id: None,
                     delivery_state: name_of(&DeliveryState::Queued),
@@ -2917,7 +2905,10 @@ fn event_summary(env: &Envelope) -> (String, Option<StateRef>) {
         Event::ContentDelta { .. } | Event::ContentSnapshot { .. } => ("activity".to_owned(), None),
         other => (super::event_kind(other), None),
     };
-    (cut(&redact(&text), MAX_EVENT_SUMMARY_BYTES), state)
+    (
+        truncate_bytes(&redact(&text), MAX_EVENT_SUMMARY_BYTES).to_owned(),
+        state,
+    )
 }
 
 #[cfg(test)]
