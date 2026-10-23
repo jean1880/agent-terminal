@@ -277,14 +277,14 @@ impl Supervisor {
         request: &ToolRequest,
     ) -> Result<Option<Value>, ToolError> {
         use agent_core::delegation::operation::{
-            canonical_request, idempotency, replay, IdempotencyDecision, StoredOperation,
+            canonical_request, idempotency, replay, IdempotencyDecision, OperationKind,
+            StoredOperation,
         };
-        let (key, expected) = match request {
-            ToolRequest::Spawn(r) => (&r.idempotency_key, r.expected_authority_epoch),
-            ToolRequest::Send(r) => (&r.idempotency_key, r.expected_authority_epoch),
-            ToolRequest::Cancel(r) => (&r.idempotency_key, r.expected_authority_epoch),
-            ToolRequest::Close(r) => (&r.idempotency_key, r.expected_authority_epoch),
-            _ => return Ok(None),
+        // An acknowledging read has a key too, but its replay is the read path's own.
+        let Some((key, expected)) = agent_kit::store::delegation_typed::key_and_epoch(request)
+            .filter(|_| !matches!(request, ToolRequest::Read(_)))
+        else {
+            return Ok(None);
         };
         let epoch = self.epoch(caller)?;
         if expected.is_some_and(|e| e != epoch.0) {
@@ -292,12 +292,10 @@ impl Supervisor {
         }
         let principal = caller.to_string();
         let key = key.to_string();
-        let kind = request
-            .tool()
-            .as_str()
-            .strip_prefix("cross_agent_")
-            .unwrap_or("unknown")
-            .to_owned();
+        let kind = OperationKind::of(request).map_or_else(
+            || "unknown".to_owned(),
+            |k| super::supervisor::enum_value(&k),
+        );
         let row = self
             .services
             .read(move |s| s.delegation_operation_by_key(&principal, &kind, &key))
