@@ -109,20 +109,8 @@ impl Publisher {
             {
                 Some(Completion {
                     run: run.clone(),
-                    state: match state {
-                        TurnState::Completed => {
-                            agent_core::delegation::lifecycle::RunState::Completed
-                        }
-                        TurnState::Interrupted => {
-                            agent_core::delegation::lifecycle::RunState::Interrupted
-                        }
-                        TurnState::Failed => agent_core::delegation::lifecycle::RunState::Failed,
-                    },
-                    worker_state: match state {
-                        TurnState::Completed => agent_core::event::WorkerState::Completed,
-                        TurnState::Interrupted => agent_core::event::WorkerState::Waiting,
-                        TurnState::Failed => agent_core::event::WorkerState::Failed,
-                    },
+                    state: agent_core::delegation::lifecycle::run_state_after(*state),
+                    worker_state: agent_core::delegation::lifecycle::worker_state_after(*state),
                     reason: None,
                     usage_json: usage.as_ref().and_then(|u| serde_json::to_string(u).ok()),
                     result: Some(std::mem::take(&mut *self.result.borrow_mut())),
@@ -500,12 +488,9 @@ impl Supervisor {
                         if w.run.as_ref() == scope.run.as_ref() {
                             w.last_run = w.run.take();
                         }
-                        w.row.state = match state {
-                            TurnState::Completed => "completed",
-                            TurnState::Interrupted => "waiting",
-                            TurnState::Failed => "failed",
-                        }
-                        .into();
+                        w.row.state = super::supervisor::enum_value(
+                            &agent_core::delegation::lifecycle::worker_state_after(*state),
+                        );
                     }
                     Event::ContentSnapshot {
                         stream: StreamKind::Assistant,
@@ -619,20 +604,10 @@ impl Supervisor {
                 link.run = Some(run.clone());
             }
         }
-        let run_state = match state {
-            TurnState::Completed => agent_core::delegation::lifecycle::RunState::Completed,
-            TurnState::Interrupted => agent_core::delegation::lifecycle::RunState::Interrupted,
-            TurnState::Failed => agent_core::delegation::lifecycle::RunState::Failed,
-        };
-        let worker_state = match state {
-            TurnState::Completed => agent_core::event::WorkerState::Completed,
-            TurnState::Interrupted => agent_core::event::WorkerState::Waiting,
-            TurnState::Failed => agent_core::event::WorkerState::Failed,
-        };
         let mut completion = Completion {
             run,
-            state: run_state,
-            worker_state,
+            state: agent_core::delegation::lifecycle::run_state_after(state),
+            worker_state: agent_core::delegation::lifecycle::worker_state_after(state),
             reason: None,
             usage_json: usage,
             result,
@@ -674,12 +649,9 @@ impl Supervisor {
                 {
                     w.last_run = w.run.take();
                     if w.row.state != "closed" {
-                        w.row.state = match state {
-                            TurnState::Completed => "completed",
-                            TurnState::Interrupted => "waiting",
-                            TurnState::Failed => "failed",
-                        }
-                        .into();
+                        w.row.state = super::supervisor::enum_value(
+                            &agent_core::delegation::lifecycle::worker_state_after(state),
+                        );
                     }
                 }
                 sup.drain_deferred(&worker);
