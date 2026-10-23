@@ -1740,6 +1740,21 @@ impl Transcript {
                 let kind = &restored_kind;
                 let id = env.item.clone().unwrap_or_else(|| self.next_id("item"));
                 if let Some(item) = self.items.get_mut(&id) {
+                    // A finished sub-agent started again (Claude continuing it) runs again on
+                    // the same card, keeping what it was asked. Only a Claude sub-agent: any
+                    // other repeated start is a refinement or a replay.
+                    if let Body::Tool(tool) = &mut item.body {
+                        if driver == Driver::Claude
+                            && tool.kind == ItemKind::Subagent
+                            && *kind == ItemKind::Subagent
+                            && tool.status != ToolStatus::Running
+                        {
+                            tool.status = ToolStatus::Running;
+                            tool.error = None;
+                            out.push(Change::Updated(id));
+                            return out;
+                        }
+                    }
                     // Codex can start a tool before it knows the full action, then repeat the
                     // item in its completed snapshot. Accept a matching tool start as a metadata
                     // refinement; identical replayed starts remain no-ops.
@@ -2458,6 +2473,107 @@ mod tests {
         assert_eq!(t.gauge, before);
         assert!(!changes.contains(&Change::Gauge));
         assert_eq!(t.last_model.as_deref(), Some("m1"));
+    }
+
+    fn tool_start(kind: ItemKind, title: &str, input: Option<Value>) -> Event {
+        Event::ItemStarted {
+            kind,
+            title: title.to_owned(),
+            input,
+            parent: None,
+        }
+    }
+
+    fn done(status: ItemStatus, output: &str) -> Event {
+        Event::ItemCompleted {
+            status,
+            output: Some(output.to_owned()),
+            error: (status == ItemStatus::Failed).then(|| output.to_owned()),
+        }
+    }
+
+    #[test]
+    fn a_finished_claude_sub_agent_started_again_runs_again() {
+        let mut t = Transcript::new();
+        let input = json!({"description": "Survey", "prompt": "Look around."});
+        t.apply(
+            &ev(tool_start(ItemKind::Subagent, "Agent", Some(input.clone()))).item("toolu_a"),
+            Driver::Claude,
+        );
+        t.apply(
+            &ev(done(ItemStatus::Failed, "boom")).item("toolu_a"),
+            Driver::Claude,
+        );
+        assert!(!t.subagents()[0].active());
+        // The adapter restarts it with no input: the card keeps what it was asked.
+        let changes = t.apply(
+            &ev(tool_start(ItemKind::Subagent, "Agent", None)).item("toolu_a"),
+            Driver::Claude,
+        );
+        assert_eq!(changes, [Change::Updated("toolu_a".to_owned())]);
+        let agents = t.subagents();
+        assert!(agents[0].active());
+        let Some(Body::Tool(tool)) = t.get("toolu_a").map(|i| &i.body) else {
+            panic!("no tool card");
+        };
+        assert_eq!(tool.error, None);
+        assert_eq!(tool.input.as_ref(), Some(&input));
+        t.apply(
+            &ev(Event::BackgroundTasks {
+                tasks: vec![BackgroundTask {
+                    id: "ag1".into(),
+                    kind: BackgroundTaskKind::Agent,
+                    description: Some("Survey".into()),
+                    tool_use_id: Some("toolu_a".into()),
+                }],
+            }),
+            Driver::Claude,
+        );
+        let tasks = t.background_tasks();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].tool_use_id.as_deref(), Some(agents[0].id.as_str()));
+        // Its next completion finishes it.
+        t.apply(
+            &ev(done(ItemStatus::Completed, "second")).item("toolu_a"),
+            Driver::Claude,
+        );
+        assert!(!t.subagents()[0].active());
+    }
+
+    #[test]
+    fn a_repeated_start_of_a_running_or_codex_item_changes_nothing() {
+        let mut t = Transcript::new();
+        let start = ev(tool_start(
+            ItemKind::Subagent,
+            "Agent",
+            Some(json!({"prompt": "go"})),
+        ))
+        .item("toolu_a");
+        t.apply(&start, Driver::Claude);
+        assert!(t.apply(&start, Driver::Claude).is_empty());
+        assert!(t.subagents()[0].active());
+
+        // A Codex sub-agent start is read as a tool: a finished one is not restarted, and an
+        // identical start of a finished tool stays a no-op.
+        let mut t = Transcript::new();
+        let start = ev(tool_start(ItemKind::Subagent, "spawn", None)).item("c1");
+        t.apply(&start, Driver::Codex);
+        t.apply(
+            &ev(done(ItemStatus::Completed, "ok")).item("c1"),
+            Driver::Codex,
+        );
+        assert!(t.apply(&start, Driver::Codex).is_empty());
+        // A refinement updates the card's metadata and leaves it finished.
+        let refined = ev(tool_start(ItemKind::Subagent, "spawn worker", None)).item("c1");
+        assert_eq!(
+            t.apply(&refined, Driver::Codex),
+            [Change::Updated("c1".to_owned())]
+        );
+        let Some(Body::Tool(tool)) = t.get("c1").map(|i| &i.body) else {
+            panic!("no tool card");
+        };
+        assert_eq!(tool.status, ToolStatus::Completed);
+        assert_eq!(tool.title, "spawn worker");
     }
 
     #[test]
