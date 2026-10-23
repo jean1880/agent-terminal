@@ -3139,12 +3139,7 @@ impl Supervisor {
         }
     }
     pub(super) fn latch_revoke(&self, root: &WorkerId, event: &RevocationEvent) {
-        if matches!(
-            event,
-            RevocationEvent::RootStop
-                | RevocationEvent::RootRestriction { .. }
-                | RevocationEvent::AppShutdown
-        ) {
+        if event.is_root_wide() {
             self.rollback_root_switch(root, None);
         }
         let (sessions, conns, overlays) = {
@@ -3156,12 +3151,7 @@ impl Supervisor {
                 .map(|(id, w)| (id.clone(), w.row.parent(), w.row.task_mode_kind()))
                 .collect::<Vec<_>>();
             let effect = revocation(event, &tree);
-            if matches!(
-                event,
-                RevocationEvent::RootStop
-                    | RevocationEvent::RootRestriction { .. }
-                    | RevocationEvent::AppShutdown
-            ) {
+            if event.is_root_wide() {
                 if let Some(thread) = state.roots.get(root).map(|r| r.row.root_thread_id.clone()) {
                     let revision = state.preparations.entry(thread).or_default();
                     *revision = revision.wrapping_add(1);
