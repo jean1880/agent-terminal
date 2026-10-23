@@ -375,11 +375,15 @@ impl Inner {
         news.take()
     }
 
-    /// The prompt carrying `news` was accepted (`sent`) or not. Not sent: it goes back to the
-    /// supervisor, and no notice is left behind. Accepted into a start still waiting on its
-    /// checks (`PendingStart`): it stays with that start's writes, settled when they reach a
-    /// process or given back when they never do. Written to a process: posted as the app's
-    /// notice, as a wake is.
+    /// The prompt carrying `news` was accepted (`sent`) or not. Spent only on positive
+    /// evidence that its line went somewhere it can arrive: written to a process that can take
+    /// writes ([`AgentProcess::can_write`]), posted then as the app's notice, as a wake is; or
+    /// held with a start still waiting on its checks (`PendingStart`), settled when those
+    /// writes reach a process and given back when they never do. Anything else (not sent, no
+    /// process, one that exited and is still draining, a failed stdin) gives it back, and no
+    /// notice is left behind.
+    ///
+    /// [`AgentProcess::can_write`]: crate::agent_proc::AgentProcess::can_write
     pub(super) fn settle_news(&self, news: Option<TakenNews>, sent: bool) {
         let Some(news) = news else {
             return;
@@ -388,30 +392,17 @@ impl Inner {
             drop(news);
             return;
         }
-        let (live, writable) = self
-            .proc
-            .borrow()
-            .as_ref()
-            .map_or((false, false), |p| (p.is_alive(), p.can_write()));
-        if live && !writable {
-            // Its stdin failed: the line was dropped, not sent. Given back.
-            drop(news);
+        // Synchronous since the write: a process that can take writes now took that line.
+        let written = self.proc.borrow().as_ref().is_some_and(|p| p.can_write());
+        if written {
+            self.news_delivered(news);
             return;
         }
-        let news = if live {
-            Some(news)
-        } else {
-            match self.starting.borrow_mut().as_mut() {
-                Some(pending) => {
-                    pending.news.push(news);
-                    None
-                }
-                None => Some(news),
-            }
-        };
-        if let Some(news) = news {
-            self.news_delivered(news);
+        if let Some(pending) = self.starting.borrow_mut().as_mut() {
+            pending.news.push(news);
+            return;
         }
+        drop(news);
     }
 
     /// `news` reached the agent's process: posted as the app's notice.

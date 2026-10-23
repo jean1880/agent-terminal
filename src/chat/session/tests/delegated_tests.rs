@@ -2284,6 +2284,78 @@ fn held_news_is_never_taken_by_a_process_whose_stdin_failed() {
     });
 }
 
+/// A Claude process that exited while its output still drains (a child of it holds stdout
+/// open) is not yet seen as gone by the session: a message then is dropped, and the held news
+/// riding on it is given back, never spent, with no notice. The next agent's process takes it,
+/// once.
+#[test]
+fn held_news_is_given_back_when_its_message_reaches_an_exited_process() {
+    in_loop(|ctx| {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let thread = fresh(&store, &dir.path().to_string_lossy());
+        let (sink, seen) = make_sink();
+        let session = ChatSession::with_env(
+            Box::new(agent_core::claude::ClaudeAdapter::new()),
+            scripted(
+                dir.path(),
+                "IFS= read -r handshake\n\
+                 echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\",\"model\":\"m\",\"claude_code_version\":\"2.1.293\"}'\n\
+                 echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'\n\
+                 if [ ! -e \"$D/launched\" ]; then touch \"$D/launched\"; sleep 4 & exit 0; fi\n\
+                 while IFS= read -r line; do printf '%s\\n' \"$line\" >> \"$D/prompts.log\"; \
+                 case \"$line\" in *'\"type\":\"user\"'*) \
+                 echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}';; esac; done",
+            ),
+            store,
+            thread,
+            sink,
+            Err(None),
+            bare_env(dir.path()),
+        );
+        let prompts =
+            || std::fs::read_to_string(dir.path().join("prompts.log")).unwrap_or_default();
+        let notices = || {
+            seen.borrow()
+                .iter()
+                .filter(
+                    |e| matches!(&e.event, Event::Notice { text } if text.contains("held news")),
+                )
+                .count()
+        };
+        let exited = |s: &ChatSession| {
+            s.inner
+                .proc
+                .borrow()
+                .as_ref()
+                .is_some_and(|p| !p.is_alive())
+        };
+        // Exited, and still draining: the session has not closed it out.
+        assert!(pump_until(ctx, 10, || exited(&session)));
+        assert!(session.status().alive, "the exit is not handled yet");
+
+        session.confirm_mode(Mode::Bypass);
+        let news = Rc::new(FakeNews::default());
+        *news.text.borrow_mut() = Some("[agent-terminal] held news".into());
+        session.hold_news_for_user(news.clone());
+        session.send_prompt("into an exited process");
+        assert_eq!(news.taken.get(), 1, "taken for the message");
+        assert_eq!(news.given_back.get(), 1, "and given back, never spent");
+        assert_eq!(notices(), 0);
+
+        // The exit is handled; the next message starts the agent again and carries the news.
+        assert!(pump_until(ctx, 10, || !session.status().alive));
+        session.inner.state.borrow_mut().running_turn = false;
+        session.inner.prompt_in_flight.set(false);
+        session.send_prompt("once it runs again");
+        assert!(pump_until(ctx, 10, || prompts().contains("once it runs again")));
+        assert!(pump_until(ctx, 10, || notices() == 1));
+        assert_eq!(prompts().matches("held news").count(), 1, "{}", prompts());
+        assert_eq!(news.taken.get(), news.given_back.get() + 1, "spent once");
+        session.shutdown(false);
+    });
+}
+
 /// A message the user writes while a turn runs (live input) carries held news like any other:
 /// framed ahead of it, shown as the app's notice, and taken from the supervisor.
 #[test]
