@@ -35,7 +35,6 @@ use crate::freshness::{
     is_due, latest, now_epoch, CatalogStatus, ReadAt, MODEL_PICKER_AGE, MODEL_TTL,
 };
 use crate::probe::{join_n, ListenerSet, ProbeTargets};
-use crate::{claude_probe, codex_probe};
 
 // ---------------------------------------------------------------------------------------------
 // Pure pieces
@@ -519,31 +518,23 @@ impl ModelCatalog {
                         done();
                     });
                 }
-                // One Claude process serves this and the usage indicator (see `claude_probe`).
-                Driver::Claude => {
-                    claude_probe::probe_shared(&target.program, &target.env, move |result| {
+                // One Claude process, or one `codex app-server` asked for models and the account
+                // and never a turn, serves this and the usage indicator (see `claude_probe` and
+                // `codex_probe`).
+                Driver::Claude | Driver::Codex => {
+                    crate::probe::read_shared(driver, target, move |result| {
                         match result {
-                            Ok(probe) => {
-                                info!(count = probe.models.len(), "claude model list fetched");
-                                me.set(Driver::Claude, probe.models.clone());
+                            Ok(reading) => {
+                                info!(
+                                    count = reading.models.len(),
+                                    "{} model list fetched",
+                                    driver.info().key
+                                );
+                                me.set(driver, reading.models.clone());
                             }
-                            Err(_) => me.mark_failed(Driver::Claude),
+                            Err(_) => me.mark_failed(driver),
                         }
-                        me.mark_attempted(Driver::Claude);
-                        done();
-                    });
-                }
-                // Likewise one `codex app-server`, asked for models and the account, never a turn.
-                Driver::Codex => {
-                    codex_probe::probe_shared(&target.program, &target.env, move |result| {
-                        match result {
-                            Ok(probe) => {
-                                info!(count = probe.models.len(), "codex model list fetched");
-                                me.set(Driver::Codex, probe.models.clone());
-                            }
-                            Err(_) => me.mark_failed(Driver::Codex),
-                        }
-                        me.mark_attempted(Driver::Codex);
+                        me.mark_attempted(driver);
                         done();
                     });
                 }
@@ -967,19 +958,8 @@ mod tests {
 
     /// A fake `claude` that leaves a mark each time it is started.
     fn marking_claude(dir: &std::path::Path) -> (ProbeTargets, std::path::PathBuf) {
-        let mark = dir.join("started");
-        let program = crate::claude_probe::tests::fake_claude(
-            dir,
-            &format!("echo x >> '{}'\nexit 1", mark.display()),
-        );
-        let targets = ProbeTargets::new(vec![(
-            Driver::Claude,
-            crate::probe::ProbeTarget {
-                program,
-                env: crate::agent_proc::AgentEnv::default(),
-            },
-        )]);
-        (targets, mark)
+        let (target, mark) = crate::probe::fixtures::marking_target(dir);
+        (ProbeTargets::new(vec![(Driver::Claude, target)]), mark)
     }
 
     #[test]
