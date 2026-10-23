@@ -18,6 +18,7 @@ use agent_core::delegation::{
     ProcessGeneration, RunId, ToolError, WorkerId,
 };
 use agent_core::event::WorkerState;
+use agent_core::serde_name::parse_lenient;
 use agent_kit::store::delegation::{RootRow, WorkerRow};
 use agent_kit::store::delegation_typed::NewRoot;
 use gtk4::{gio, glib};
@@ -2137,14 +2138,9 @@ pub(super) fn now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
+/// `v`'s serde name as the store spells it, `unknown` if it has none.
 pub(super) fn enum_value<T: serde::Serialize>(v: &T) -> String {
-    serde_json::to_value(v)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_owned))
-        .unwrap_or_else(|| "unknown".into())
-}
-pub(super) fn parse_enum<T: serde::de::DeserializeOwned>(s: &str) -> Option<T> {
-    serde_json::from_value(serde_json::Value::String(s.to_owned())).ok()
+    agent_core::serde_name::name_of(v).unwrap_or_else(|| "unknown".into())
 }
 pub(super) fn opted_in(p: &Profile) -> bool {
     p.available_for_delegation && !p.disabled
@@ -3364,8 +3360,8 @@ impl Supervisor {
             worker_id: id.clone(),
             parent_id: w.row.parent(),
             name: w.row.name.clone(),
-            origin: parse_enum(&w.row.origin)?,
-            state: parse_enum(&w.row.state).unwrap_or(WorkerState::Unknown),
+            origin: parse_lenient(&w.row.origin)?,
+            state: parse_lenient(&w.row.state).unwrap_or(WorkerState::Unknown),
             run_id: w.run.clone(),
             run_state: w
                 .run
@@ -3391,7 +3387,7 @@ impl Supervisor {
                 base_commit: None,
             }),
             delegation: DelegationStatus {
-                code: parse_enum(&w.row.delegation_status)
+                code: parse_lenient(&w.row.delegation_status)
                     .unwrap_or(DelegationStatusCode::Unavailable),
                 reason: w.row.delegation_reason.clone(),
                 paths: Vec::new(),

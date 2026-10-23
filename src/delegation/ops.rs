@@ -1,6 +1,6 @@
 //! Authenticated tools and the durable acceptance/reservation/write protocol.
 use super::seam::{CallDispatcher, ConnId, LocalFuture, PeerFacts, ProcFacts};
-use super::supervisor::{error, opted_in, parse_enum, Supervisor};
+use super::supervisor::{error, opted_in, Supervisor};
 use agent_core::adapter::Driver;
 use agent_core::delegation::authority::{ceiling, permits, RevocationEvent, TaskMode};
 use agent_core::delegation::correlation::{attestation_arguments, Attestation};
@@ -14,6 +14,7 @@ use agent_core::delegation::page::{
 use agent_core::delegation::route::{ChildBridge, DelegationCaps, RouteQuery};
 use agent_core::delegation::wire::*;
 use agent_core::delegation::{AuthorityEpoch, ErrorCode, OperationId, ToolError, WorkerId};
+use agent_core::serde_name::parse_lenient;
 use agent_kit::store::delegation_typed::*;
 use gtk4::{gio, glib};
 use serde_json::{json, Value};
@@ -323,7 +324,7 @@ impl Supervisor {
         let op = StoredOperation {
             id: OperationId::parse(&row.id)
                 .map_err(|_| error(ErrorCode::InternalError, "stored operation id is invalid"))?,
-            kind: parse_enum(&row.kind).ok_or_else(|| {
+            kind: parse_lenient(&row.kind).ok_or_else(|| {
                 error(ErrorCode::InternalError, "stored operation kind is invalid")
             })?,
             epoch: AuthorityEpoch::from_stored(row.authority_epoch),
@@ -333,7 +334,7 @@ impl Supervisor {
             resolution: serde_json::from_str(&row.resolution_json)
                 .map_err(|_| error(ErrorCode::InternalError, "stored resolution is invalid"))?,
             receipt: Some(parse(&row.receipt_json)?),
-            dispatch: parse_enum(&row.dispatch_state)
+            dispatch: parse_lenient(&row.dispatch_state)
                 .ok_or_else(|| error(ErrorCode::InternalError, "stored dispatch state invalid"))?,
             error: row
                 .error_json
@@ -1280,7 +1281,7 @@ impl Supervisor {
                     let run = run.and_then(|row| {
                         Some((
                             agent_core::delegation::RunId::parse(&row.id).ok()?,
-                            parse_enum(&row.state)?,
+                            parse_lenient(&row.state)?,
                         ))
                     });
                     summary.controls.cancel = run.is_some();

@@ -289,7 +289,7 @@ impl Publisher {
                 continue;
             }
             let stream =
-                super::supervisor::parse_enum(&key.stream).unwrap_or(StreamKind::Assistant);
+                agent_core::serde_name::parse_lenient(&key.stream).unwrap_or(StreamKind::Assistant);
             let env = Envelope::new(if out.replace {
                 Event::ContentSnapshot {
                     stream,
