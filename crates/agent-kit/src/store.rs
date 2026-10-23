@@ -1678,7 +1678,7 @@ impl Store {
                     params![seq, thread],
                     |r| r.get(0),
                 )?;
-                let mut env: Envelope = serde_json::from_str(&json)?;
+                let env: Envelope = serde_json::from_str(&json)?;
                 // The row must still be this item's delta on this stream: never rewrite a row
                 // the tail only thinks it knows.
                 let ours = env.item.as_deref() == Some(item)
@@ -1688,17 +1688,26 @@ impl Store {
                         "delta row {seq} of a heal tail"
                     )));
                 }
-                if let Event::ContentDelta { text, .. } = &mut env.event {
-                    *text = if i == 0 { whole.clone() } else { String::new() };
-                }
-                env.raw = None;
-                self.conn.execute(
-                    "UPDATE events SET envelope_json = ?1 WHERE seq = ?2",
-                    params![serde_json::to_string(&env)?, seq],
-                )?;
+                let replacement = if i == 0 { whole.clone() } else { String::new() };
+                self.rewrite_healed_delta(*seq, env, replacement)?;
             }
             self.tails.borrow_mut().healed(thread, item, stream, &whole);
         }
+        Ok(())
+    }
+
+    /// Writes one healed delta row back in place (same `seq`): its text becomes `replacement`
+    /// (already redacted: the whole stream's text, or empty) and its `raw` frame, which carries
+    /// the fragment verbatim, is dropped.
+    fn rewrite_healed_delta(&self, seq: i64, mut env: Envelope, replacement: String) -> Result<()> {
+        if let Event::ContentDelta { text, .. } = &mut env.event {
+            *text = replacement;
+        }
+        env.raw = None;
+        self.conn.execute(
+            "UPDATE events SET envelope_json = ?1 WHERE seq = ?2",
+            params![serde_json::to_string(&env)?, seq],
+        )?;
         Ok(())
     }
 
@@ -1757,15 +1766,9 @@ impl Store {
             if whole == joined {
                 continue;
             }
-            for (i, (seq, mut env)) in rows.into_iter().enumerate() {
-                if let Event::ContentDelta { text, .. } = &mut env.event {
-                    *text = if i == 0 { whole.clone() } else { String::new() };
-                }
-                env.raw = None;
-                self.conn.execute(
-                    "UPDATE events SET envelope_json = ?1 WHERE seq = ?2",
-                    params![serde_json::to_string(&env)?, seq],
-                )?;
+            for (i, (seq, env)) in rows.into_iter().enumerate() {
+                let replacement = if i == 0 { whole.clone() } else { String::new() };
+                self.rewrite_healed_delta(seq, env, replacement)?;
             }
         }
         Ok(())

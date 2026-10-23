@@ -521,7 +521,6 @@ pub fn remove_own_temp(root: &Path) -> usize {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
-    use std::process::Command;
 
     use super::*;
     use crate::git::{git_installed, RefEntry};
@@ -548,49 +547,21 @@ mod tests {
         assert_eq!(latest_commit(&entries, 1), None);
     }
 
-    /// Fixture-side git: hermetic config, a fixed identity.
-    fn sh(dir: &Path, args: &[&str]) -> String {
-        let out = Command::new("git")
-            .args([
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "-c",
-                "commit.gpgsign=false",
-            ])
-            .args([
-                "-c",
-                "core.hooksPath=/dev/null",
-                "-c",
-                "init.defaultBranch=main",
-            ])
-            .args(args)
-            .current_dir(dir)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .output()
-            .expect("git");
-        assert!(
-            out.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8_lossy(&out.stdout).trim().to_owned()
-    }
+    use crate::test_support::{git as sh, git_or_skip, init_repo_at};
 
     fn repo() -> Option<tempfile::TempDir> {
-        if !git_installed() {
-            eprintln!("git not installed; skipping");
+        if !git_or_skip() {
             return None;
         }
         let dir = tempfile::tempdir().expect("tmp");
-        sh(dir.path(), &["init", "-q"]);
-        std::fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\n").expect("a");
-        std::fs::write(dir.path().join("my file.txt"), "x\n").expect("spaced");
-        std::fs::write(dir.path().join("bin.dat"), [0u8, 1, 2]).expect("bin");
-        sh(dir.path(), &["add", "."]);
-        sh(dir.path(), &["commit", "-q", "-m", "init"]);
+        init_repo_at(
+            dir.path(),
+            &[
+                ("a.txt", b"one\ntwo\nthree\n"),
+                ("my file.txt", b"x\n"),
+                ("bin.dat", &[0u8, 1, 2]),
+            ],
+        );
         Some(dir)
     }
 

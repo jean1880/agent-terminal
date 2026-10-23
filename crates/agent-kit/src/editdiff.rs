@@ -170,13 +170,10 @@ fn cut(text: &str) -> (&str, bool) {
     if text.len() <= MAX_SIDE_BYTES {
         return (text, false);
     }
-    let mut end = MAX_SIDE_BYTES;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    let kept = match text[..end].rfind('\n') {
+    let head = agent_core::delegation::error::truncate_bytes(text, MAX_SIDE_BYTES);
+    let kept = match head.rfind('\n') {
         Some(nl) => &text[..=nl],
-        None => &text[..end],
+        None => head,
     };
     (kept, true)
 }

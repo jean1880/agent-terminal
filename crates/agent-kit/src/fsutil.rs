@@ -5,6 +5,12 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// The process's effective uid, the owner its private files and folders must have.
+pub fn effective_uid() -> u32 {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
 /// Writes `bytes` to `path` through a `0600` temp file in the same directory, `sync_all`, a
 /// rename, then a sync of the directory, so a crash leaves the old file or the new one and never
 /// a half-written one, and the contents are never readable by anyone else, even briefly. The
