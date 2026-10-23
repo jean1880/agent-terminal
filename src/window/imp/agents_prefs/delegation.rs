@@ -644,10 +644,7 @@ async fn registration_context(
         })
         .await
         .map_err(|_| "Could not resolve this profile's environment".to_owned())??;
-    let launch = crate::agent_proc::AgentEnv {
-        env,
-        unset: super::super::threads::unset_list(&clear),
-    };
+    let launch = super::super::threads::agent_env(env, &clear);
     if agent_core::delegation::agy_guard::argv_redirect(&profile.argv()).is_some()
         || agent_core::delegation::agy_guard::env_redirect(&crate::agent_home::child_env(&launch))
             .is_some()

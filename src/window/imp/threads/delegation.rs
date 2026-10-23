@@ -563,10 +563,7 @@ impl AgentTerminalWindow {
                 Some(ResolvedChild {
                     program: resolved.program?,
                     extra_args: profile.args.clone(),
-                    env: AgentEnv {
-                        env: resolved.env,
-                        unset: unset_list(&config.borrow().clear_env),
-                    },
+                    env: agent_env(resolved.env, &config.borrow().clear_env),
                     default_model: profile.default_model.clone(),
                     default_effort: profile.default_effort.clone(),
                 })

@@ -29,7 +29,7 @@ use crate::availability::{
     classify, probe_targets, unavailable_banner, AgentAvailability, Availability,
 };
 use crate::chat::session::{
-    build_handoff, retired_notice, AgentLaunch, Approval, ChatSession, LaunchEnv, RetiredModel,
+    build_handoff, retired_notice, AgentLaunch, Approval, ChatSession, RetiredModel,
 };
 use crate::chat::view::usage::UsageIndicator;
 use crate::chat::view::{ChatView, ViewAction};
@@ -2102,6 +2102,39 @@ pub(super) async fn resolve_agent(profile: Profile) -> ResolvedAgent {
     resolved
 }
 
+/// `driver`'s own profile in `config`, or a bare one for an agent with none.
+pub(super) fn agent_profile_or_new(
+    config: &crate::config::TerminalConfig,
+    driver: Driver,
+) -> Profile {
+    config
+        .agent_profile(driver)
+        .cloned()
+        .unwrap_or_else(|| crate::config::new_agent_profile(driver))
+}
+
+/// The profile a thread opened with `profile_id` runs on `driver` with
+/// ([`crate::config::TerminalConfig::thread_profile`]), or a bare one for an agent with none.
+pub(super) fn thread_profile_or_new(
+    config: &crate::config::TerminalConfig,
+    profile_id: Option<&str>,
+    driver: Driver,
+) -> Profile {
+    config
+        .thread_profile(profile_id, driver)
+        .cloned()
+        .unwrap_or_else(|| crate::config::new_agent_profile(driver))
+}
+
+/// The environment an agent process (or its hooks check) gets: `env` from its profile, with
+/// `clear` and the app's own variables removed ([`unset_list`]).
+pub(super) fn agent_env(env: Vec<(String, String)>, clear: &[String]) -> AgentEnv {
+    AgentEnv {
+        env,
+        unset: unset_list(clear),
+    }
+}
+
 /// What the app removes from an agent's environment: the configured `clear_env` (a launching
 /// agent session's markers) and any inherited approval socket, which only the app may set.
 pub(super) fn unset_list(patterns: &[String]) -> Vec<String> {
@@ -2170,9 +2203,7 @@ fn agent_launch_with(
     let (profile, clear) = {
         let c = config.borrow();
         (
-            c.thread_profile(profile_id, driver)
-                .cloned()
-                .unwrap_or_else(|| crate::config::new_agent_profile(driver)),
+            thread_profile_or_new(&c, profile_id, driver),
             c.clear_env.clone(),
         )
     };
@@ -2181,10 +2212,7 @@ fn agent_launch_with(
         return Err(not_ready_reason(driver, &Availability::Missing));
     };
     let adapter = make_adapter(driver, &program);
-    let env = LaunchEnv {
-        env: resolved.env,
-        unset: unset_list(&clear),
-    };
+    let env = agent_env(resolved.env, &clear);
     let approval = match driver {
         // Claude and Codex raise approvals over their own protocol, not the hook socket.
         Driver::Claude | Driver::Codex => Err(None),
@@ -2278,6 +2306,28 @@ thread_local! {
     static HOOK_VERDICTS: RefCell<crate::hook_config::HookCache> = RefCell::new(crate::hook_config::HookCache::default());
 }
 
+/// The fresh hooks check a launch of `driver` in `dir` waits for ([`check_hook`]), with the
+/// profile's `env` less `clear`: agy's is read off the main thread now, never taken from the
+/// cache; the other agents have none.
+async fn launch_hook_verdict(
+    driver: Driver,
+    env: &[(String, String)],
+    clear: &[String],
+    dir: &str,
+) -> Result<(), String> {
+    match driver {
+        Driver::Agy => {
+            let hook_env = agent_env(env.to_vec(), clear);
+            check_hook(crate::hook_config::HookTarget::new(
+                &hook_env,
+                Some(dir.to_owned().into()),
+            ))
+            .await
+        }
+        Driver::Claude | Driver::Codex => Ok(()),
+    }
+}
+
 /// Reads agy's hooks file off the main thread and remembers the verdict. A thread being built
 /// awaits this; a switch to agy (which cannot wait) uses [`cached_hook_verdict`].
 pub(super) async fn check_hook(target: crate::hook_config::HookTarget) -> Result<(), String> {
@@ -2324,16 +2374,10 @@ fn cached_agy_hook_target(
 ) -> Option<crate::hook_config::HookTarget> {
     let config = SharedConfig::default();
     let config = config.borrow();
-    let profile = config
-        .agent_profile(Driver::Agy)
-        .cloned()
-        .unwrap_or_else(|| crate::config::new_agent_profile(Driver::Agy));
+    let profile = agent_profile_or_new(&config, Driver::Agy);
     let resolved = cached_agent(&profile)?;
     Some(crate::hook_config::HookTarget::new(
-        &AgentEnv {
-            env: resolved.env,
-            unset: unset_list(&config.clear_env),
-        },
+        &agent_env(resolved.env, &config.clear_env),
         cwd,
     ))
 }
@@ -2352,21 +2396,12 @@ pub(super) async fn agy_hook_target(
     let (profile, clear) = {
         let config = config.borrow();
         (
-            config
-                .agent_profile(Driver::Agy)
-                .cloned()
-                .unwrap_or_else(|| crate::config::new_agent_profile(Driver::Agy)),
+            agent_profile_or_new(&config, Driver::Agy),
             config.clear_env.clone(),
         )
     };
     let resolved = resolve_agent(profile).await;
-    crate::hook_config::HookTarget::new(
-        &AgentEnv {
-            env: resolved.env,
-            unset: unset_list(&clear),
-        },
-        cwd,
-    )
+    crate::hook_config::HookTarget::new(&agent_env(resolved.env, &clear), cwd)
 }
 
 /// Every active agy environment and every possible switch target, without retaining env values.
@@ -4769,20 +4804,7 @@ impl AgentTerminalWindow {
                     return;
                 }
                 // agy's hooks file is read off the main thread too; the verdict gates the socket.
-                let hook = match driver {
-                    Driver::Agy => {
-                        let hook_env = AgentEnv {
-                            env: resolved.env.clone(),
-                            unset: unset_list(&hook_clear),
-                        };
-                        check_hook(crate::hook_config::HookTarget::new(
-                            &hook_env,
-                            Some(dir.clone().into()),
-                        ))
-                        .await
-                    }
-                    Driver::Claude | Driver::Codex => Ok(()),
-                };
+                let hook = launch_hook_verdict(driver, &resolved.env, &hook_clear, &dir).await;
                 if !obj.imp().session_start_allowed() {
                     return;
                 }
@@ -5139,10 +5161,7 @@ impl AgentTerminalWindow {
         };
         let adapter = make_adapter(driver, &program);
         let clear = self.config.borrow().clear_env.clone();
-        let launch_env = LaunchEnv {
-            env: resolved.env,
-            unset: unset_list(&clear),
-        };
+        let launch_env = agent_env(resolved.env, &clear);
         let approval = match driver {
             Driver::Claude | Driver::Codex => Err(None),
             Driver::Agy => {
@@ -6485,11 +6504,7 @@ impl AgentTerminalWindow {
     /// The profile a thread on `driver` runs with, given the id it was opened with
     /// ([`crate::config::TerminalConfig::thread_profile`]); a bare one for an agent with none.
     pub(super) fn thread_profile_for(&self, profile_id: Option<&str>, driver: Driver) -> Profile {
-        self.config
-            .borrow()
-            .thread_profile(profile_id, driver)
-            .cloned()
-            .unwrap_or_else(|| crate::config::new_agent_profile(driver))
+        thread_profile_or_new(&self.config.borrow(), profile_id, driver)
     }
 
     /// The profile open thread `thread` runs on `driver` with.
@@ -7058,10 +7073,7 @@ impl AgentTerminalWindow {
                 Driver::ALL
                     .into_iter()
                     .map(|d| {
-                        let profile = config
-                            .agent_profile(d)
-                            .cloned()
-                            .unwrap_or_else(|| crate::config::new_agent_profile(d));
+                        let profile = agent_profile_or_new(&config, d);
                         (d, profile)
                     })
                     .collect(),
@@ -7115,13 +7127,7 @@ impl AgentTerminalWindow {
                     return;
                 }
                 // Probes run where the threads run: the profile's env file and `clear_env`.
-                envs.push((
-                    driver,
-                    AgentEnv {
-                        env: resolved.env.clone(),
-                        unset: unset_list(&clear),
-                    },
-                ));
+                envs.push((driver, agent_env(resolved.env.clone(), &clear)));
                 let state = classify(false, Some(resolved.program.as_deref()));
                 // Back from missing (installed, or switched on again): its list may be new.
                 if state.is_ready()
@@ -7318,12 +7324,7 @@ impl AgentTerminalWindow {
     /// with the sign-in arguments), in the home folder.
     pub(super) fn sign_in(&self, driver: Driver) {
         let info = driver.info();
-        let base = self
-            .config
-            .borrow()
-            .agent_profile(driver)
-            .cloned()
-            .unwrap_or_else(|| crate::config::new_agent_profile(driver));
+        let base = agent_profile_or_new(&self.config.borrow(), driver);
         let profile = crate::config::Profile {
             name: format!("Sign in to {}", info.label),
             command: base.command,
@@ -7476,20 +7477,7 @@ impl AgentTerminalWindow {
                 {
                     return;
                 }
-                let hook = match driver {
-                    Driver::Agy => {
-                        let hook_env = AgentEnv {
-                            env: resolved.env.clone(),
-                            unset: unset_list(&hook_clear),
-                        };
-                        check_hook(crate::hook_config::HookTarget::new(
-                            &hook_env,
-                            Some(dir.clone().into()),
-                        ))
-                        .await
-                    }
-                    Driver::Claude | Driver::Codex => Ok(()),
-                };
+                let hook = launch_hook_verdict(driver, &resolved.env, &hook_clear, &dir).await;
                 if !obj
                     .upgrade()
                     .is_some_and(|w| w.imp().session_start_allowed())

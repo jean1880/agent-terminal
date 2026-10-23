@@ -441,10 +441,7 @@ impl AgentTerminalWindow {
     fn codex_inputs(&self) -> (Profile, Vec<String>) {
         let config = self.config.borrow();
         (
-            config
-                .agent_profile(Driver::Codex)
-                .cloned()
-                .unwrap_or_else(|| crate::config::new_agent_profile(Driver::Codex)),
+            super::threads::agent_profile_or_new(&config, Driver::Codex),
             config.clear_env.clone(),
         )
     }
@@ -539,11 +536,7 @@ impl AgentTerminalWindow {
     }
 
     fn agent_profile_now(&self, driver: Driver) -> Profile {
-        self.config
-            .borrow()
-            .agent_profile(driver)
-            .cloned()
-            .unwrap_or_else(|| crate::config::new_agent_profile(driver))
+        super::threads::agent_profile_or_new(&self.config.borrow(), driver)
     }
 
     pub(super) fn add_agents_page(&self, dialog: &adw::PreferencesDialog) {
