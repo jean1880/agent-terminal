@@ -19,11 +19,7 @@ pub(crate) fn verified() -> Result<RuntimeDir, String> {
     verified_in(&base, effective_uid())
 }
 
-/// The calling process's effective uid.
-pub(super) fn effective_uid() -> u32 {
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    unsafe { libc::geteuid() }
-}
+pub(super) use agent_kit::fsutil::effective_uid;
 
 /// [`verified`] under `base`, for the owner `uid`.
 pub(super) fn verified_in(base: &Path, uid: u32) -> Result<RuntimeDir, String> {

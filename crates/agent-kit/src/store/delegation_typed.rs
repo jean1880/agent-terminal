@@ -50,6 +50,7 @@ use agent_core::delegation::wire::{
 use agent_core::delegation::API_VERSION;
 use agent_core::event::{Envelope, Event, ItemStatus, TurnState, WorkerState};
 use agent_core::redact::redact;
+use agent_core::text::json_len;
 use rusqlite::{params, OptionalExtension};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -114,15 +115,12 @@ impl<T> DurableOutcome<T> {
 
 /// The serde (snake case) name of a unit enum value.
 fn name_of<T: Serialize>(v: &T) -> String {
-    match serde_json::to_value(v) {
-        Ok(Value::String(s)) => s,
-        _ => "unknown".to_owned(),
-    }
+    agent_core::serde_name::name_of(v).unwrap_or_else(|| "unknown".to_owned())
 }
 
 /// A stored enum value read back; a value this build cannot read is an error, never a guess.
 fn parse_name<T: DeserializeOwned>(what: &str, s: &str) -> Result<T> {
-    serde_json::from_value(Value::String(s.to_owned()))
+    agent_core::serde_name::parse_strict(s)
         .map_err(|_| StoreError::Failed(format!("stored {what} `{s}` is not one this build knows")))
 }
 
@@ -2876,10 +2874,6 @@ fn scrub_tool_error(e: &ToolError) -> Result<ToolError> {
     scrubbed.code = e.code;
     scrubbed.retryable = e.retryable;
     Ok(scrubbed)
-}
-
-fn json_len(v: &Value) -> usize {
-    serde_json::to_string(v).map_or(usize::MAX, |s| s.len())
 }
 
 /// A page event's summary and state: scrubbed, at most [`MAX_EVENT_SUMMARY_BYTES`], never a
