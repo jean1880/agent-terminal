@@ -655,9 +655,12 @@ impl ClaudeAdapter {
         let parent = str_of(v, "parent_tool_use_id").map(str::to_owned);
         let msg_id = str_of(msg, "id").unwrap_or_default().to_owned();
         let mut out = Vec::new();
-        // A sub-agent's own messages name the model it runs on.
+        // A sub-agent's own messages name the model it runs on. A replayed frame is an old
+        // observation: only a frame seen for the first time may update it.
         if let Some(parent) = &parent {
-            out.extend(self.subagent_model(parent, str_of(msg, "model")));
+            if self.first_time(format!("{uuid}#model")) {
+                out.extend(self.subagent_model(parent, str_of(msg, "model")));
+            }
         }
         for (pos, block) in content.iter().enumerate() {
             let index = {
@@ -2778,6 +2781,28 @@ mod tests {
         // The main thread's own model is the session's, not a sub-agent's.
         let main = a.feed(&model_frame("m1", None, "claude-opus-5-5"));
         assert!(reported_models(&main).is_empty());
+    }
+
+    #[test]
+    fn a_replayed_sub_agent_frame_never_brings_back_an_older_model() {
+        let mut a = ClaudeAdapter::new();
+        a.feed(&agent_call("toolu_a", false));
+        let first = model_frame("s1", Some("toolu_a"), "claude-haiku-5-5");
+        let mut reported = reported_models(&a.feed(&first));
+        reported.extend(reported_models(&a.feed(&model_frame(
+            "s2",
+            Some("toolu_a"),
+            "claude-sonnet-5-5",
+        ))));
+        reported.extend(reported_models(&a.feed(&first)));
+        assert_eq!(
+            reported,
+            [
+                ("toolu_a".to_owned(), "claude-haiku-5-5".to_owned()),
+                ("toolu_a".to_owned(), "claude-sonnet-5-5".to_owned()),
+            ],
+            "the replay of s1 reports nothing"
+        );
     }
 
     #[test]
