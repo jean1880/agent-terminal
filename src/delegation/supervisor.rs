@@ -2289,11 +2289,7 @@ impl Supervisor {
             return true;
         }
         let prepared = self
-            .stage(
-                &worker,
-                ProcessGeneration(session.process_generation().0 + 1),
-                profile,
-            )
+            .stage(&worker, session.process_generation().next(), profile)
             .await
             .is_ok()
             && self.root_session_current(&worker, &session)
@@ -2571,9 +2567,7 @@ impl Supervisor {
             .borrow()
             .workers
             .get(&id)
-            .map_or(ProcessGeneration(1), |w| {
-                ProcessGeneration(w.generation.0 + 1)
-            });
+            .map_or(ProcessGeneration(1), |w| w.generation.next());
         {
             let mut state = self.state.borrow_mut();
             state.threads.insert(thread.into(), id.clone());
@@ -2628,11 +2622,9 @@ impl Supervisor {
         !state.shutting_down && state.preparations.get(thread) == Some(&revision)
     }
     pub(super) fn worker_rt(&self, row: WorkerRow, root: WorkerId, cwd: PathBuf) -> WorkerRt {
-        let driver = parse_enum(&row.driver).unwrap_or(Driver::Claude);
+        let driver = row.driver_kind().unwrap_or(Driver::Claude);
         let mode = row
-            .task_mode
-            .as_deref()
-            .and_then(parse_enum::<TaskMode>)
+            .task_mode_kind()
             .map(TaskMode::as_mode)
             .unwrap_or(Mode::Ask);
         WorkerRt {
@@ -2684,7 +2676,7 @@ impl Supervisor {
                 } else {
                     Role::Child
                 },
-                w.row.task_mode.as_deref().and_then(parse_enum),
+                w.row.task_mode_kind(),
             )
         };
         let req = BindingRequest {
@@ -2817,7 +2809,7 @@ impl Supervisor {
         };
         let sup = self.clone();
         glib::spawn_future_local(async move {
-            let next = ProcessGeneration(session.process_generation().0 + 1);
+            let next = session.process_generation().next();
             if let Err(e) = sup.stage(&needed.0, next, &profile).await {
                 (sup.services.report)(&e.to_string());
                 return;
@@ -3022,7 +3014,7 @@ impl Supervisor {
                                     .into_iter()
                                     .filter(|l| l.worker_id == w.id)
                                 {
-                                    generation=ProcessGeneration(link.process_generation.max(0) as u64);
+                                    generation=ProcessGeneration::from_stored(link.process_generation);
                                     run=link.run_id.and_then(|r|RunId::parse(&r).ok());
                                 }
                                 bytes += serde_json::to_vec(&envelope)?.len();
@@ -3165,16 +3157,7 @@ impl Supervisor {
                 .workers
                 .iter()
                 .filter(|(_, w)| &w.root == root)
-                .map(|(id, w)| {
-                    (
-                        id.clone(),
-                        w.row
-                            .parent_id
-                            .as_deref()
-                            .and_then(|p| WorkerId::parse(p).ok()),
-                        w.row.task_mode.as_deref().and_then(parse_enum),
-                    )
-                })
+                .map(|(id, w)| (id.clone(), w.row.parent(), w.row.task_mode_kind()))
                 .collect::<Vec<_>>();
             let effect = revocation(event, &tree);
             if matches!(
@@ -3335,7 +3318,7 @@ impl Supervisor {
                 "delegation authority is changing",
             ));
         }
-        Ok(AuthorityEpoch(r.row.authority_epoch.max(0) as u64))
+        Ok(r.row.epoch())
     }
     pub(super) fn principal_mode(&self, worker: &WorkerId) -> Mode {
         self.state
@@ -3379,11 +3362,7 @@ impl Supervisor {
         use agent_core::delegation::wire::*;
         let mut summary = WorkerSummary {
             worker_id: id.clone(),
-            parent_id: w
-                .row
-                .parent_id
-                .as_deref()
-                .and_then(|s| WorkerId::parse(s).ok()),
+            parent_id: w.row.parent(),
             name: w.row.name.clone(),
             origin: parse_enum(&w.row.origin)?,
             state: parse_enum(&w.row.state).unwrap_or(WorkerState::Unknown),
@@ -3405,7 +3384,7 @@ impl Supervisor {
                 cancel: w.run.is_some(),
                 close: w.row.state != "closed",
             },
-            task_mode: w.row.task_mode.as_deref().and_then(parse_enum),
+            task_mode: w.row.task_mode_kind(),
             workspace: serde_json::from_str(&w.row.workspace_json).unwrap_or(WorkspaceInfo {
                 kind: WorkspaceKind::SharedReadOnly,
                 path: None,

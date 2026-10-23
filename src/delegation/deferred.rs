@@ -1,6 +1,6 @@
 //! Supervisor-owned delivery queues. Every write follows a durable reservation and a fresh authority check.
 use super::seam::{DelegatedInput, DelegatedOutcome, InputSource};
-use super::supervisor::{error, parse_enum, Supervisor};
+use super::supervisor::{error, Supervisor};
 use agent_core::delegation::authority::delivery_allowed;
 use agent_core::delegation::mailbox::{
     plan_delivery, DeliveryPlan, DeliveryState, Direction, TargetRuntime,
@@ -78,9 +78,7 @@ impl Supervisor {
             let target = match &r.target {
                 Target::Parent => from
                     .row
-                    .parent_id
-                    .as_deref()
-                    .and_then(|id| WorkerId::parse(id).ok())
+                    .parent()
                     .ok_or_else(|| error(ErrorCode::NotFound, "root has no parent"))?,
                 Target::Worker(id) => id.clone(),
             };
@@ -105,7 +103,7 @@ impl Supervisor {
                 dir,
                 r.kind,
                 self.principal_mode(caller),
-                to.row.task_mode.as_deref().and_then(parse_enum),
+                to.row.task_mode_kind(),
             )
             .map_err(|c| error(c, "delivery exceeds authority"))?;
             (target, dir)
@@ -792,11 +790,7 @@ impl Supervisor {
     pub(super) fn queue_human(self: &Rc<Self>, worker: &WorkerId, text: &str) {
         let caller = {
             let state = self.state.borrow();
-            state
-                .workers
-                .get(worker)
-                .and_then(|w| w.row.parent_id.as_deref())
-                .and_then(|p| WorkerId::parse(p).ok())
+            state.workers.get(worker).and_then(|w| w.row.parent())
         };
         let Some(caller) = caller else {
             return;

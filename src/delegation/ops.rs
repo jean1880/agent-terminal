@@ -326,7 +326,7 @@ impl Supervisor {
             kind: parse_enum(&row.kind).ok_or_else(|| {
                 error(ErrorCode::InternalError, "stored operation kind is invalid")
             })?,
-            epoch: AuthorityEpoch(row.authority_epoch.max(0) as u64),
+            epoch: AuthorityEpoch::from_stored(row.authority_epoch),
             canonical: agent_core::delegation::operation::CanonicalRequest::from_stored(
                 row.canonical_request,
             ),
@@ -632,11 +632,7 @@ impl Supervisor {
             return;
         }
         let worker = scope.worker.clone();
-        let caller = self.state.borrow().workers[&worker]
-            .row
-            .parent_id
-            .as_deref()
-            .and_then(|p| WorkerId::parse(p).ok());
+        let caller = self.state.borrow().workers[&worker].row.parent();
         let Some(caller) = caller else {
             return;
         };
@@ -665,11 +661,7 @@ impl Supervisor {
             return;
         }
         let worker = scope.worker.clone();
-        let caller = self.state.borrow().workers[&worker]
-            .row
-            .parent_id
-            .as_deref()
-            .and_then(|p| WorkerId::parse(p).ok());
+        let caller = self.state.borrow().workers[&worker].row.parent();
         let Some(caller) = caller else {
             return;
         };
@@ -1220,11 +1212,7 @@ impl Supervisor {
             if &w == caller {
                 return include_self || caller != target;
             }
-            current = state
-                .workers
-                .get(&w)
-                .and_then(|w| w.row.parent_id.as_deref())
-                .and_then(|p| WorkerId::parse(p).ok());
+            current = state.workers.get(&w).and_then(|w| w.row.parent());
         }
         false
     }
@@ -1664,7 +1652,7 @@ impl Supervisor {
             }
         }
         if w.row.parent_id.as_deref() == Some(from.as_str()) {
-            let mode = w.row.task_mode.as_deref().and_then(parse_enum::<TaskMode>);
+            let mode = w.row.task_mode_kind();
             if mode.is_none_or(|m| !permits(self.principal_mode(from), m)) {
                 return Err(error(
                     ErrorCode::AuthorityDenied,

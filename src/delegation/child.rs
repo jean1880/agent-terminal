@@ -57,7 +57,7 @@ impl Supervisor {
                     && !w.generations.is_empty()
                     && w.row.delegation_status != "rebind_required"
                     && state.token_current(w),
-                ProcessGeneration(w.generation.0 + 1),
+                w.generation.next(),
             )
         };
         if ready {

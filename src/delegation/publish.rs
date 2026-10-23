@@ -429,11 +429,7 @@ impl Supervisor {
                     invocation: None,
                 });
             }
-            current = node
-                .row
-                .parent_id
-                .as_deref()
-                .and_then(|p| WorkerId::parse(p).ok());
+            current = node.row.parent();
         }
         // Every publication needs a link; token deltas have no public-page category and use
         // the ordinary backing transcript append below instead.
