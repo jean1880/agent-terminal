@@ -2448,15 +2448,9 @@ pub(super) mod tests {
     fn closing_settings_and_window_flushes_agent_edits() {
         gtk4::init().unwrap();
         adw::init().unwrap();
-        let config_home = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
-        let env_file = config_home.path().join("agent.env");
+        let app = crate::window::imp::test_support::test_app("org.test.SettingsFlush", false);
+        let env_file = app.config_dir().join("agent.env");
         std::fs::write(&env_file, "TEST_FLAG=yes\n").unwrap();
-        let app = adw::Application::builder()
-            .application_id("org.test.SettingsFlush")
-            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
-            .build();
-        app.register(None::<&gtk4::gio::Cancellable>).unwrap();
         let window = crate::window::AgentTerminalWindow::new(&app);
         window.present();
         let prefs = adw::PreferencesDialog::new();
@@ -2528,13 +2522,7 @@ pub(super) mod tests {
     fn invalid_text_keeps_the_saved_command_detection() {
         gtk4::init().unwrap();
         adw::init().unwrap();
-        let config_home = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
-        let app = adw::Application::builder()
-            .application_id("org.test.InvalidDetection")
-            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
-            .build();
-        app.register(None::<&gtk4::gio::Cancellable>).unwrap();
+        let app = crate::window::imp::test_support::test_app("org.test.InvalidDetection", false);
         let window = crate::window::AgentTerminalWindow::new(&app);
         let prefs = adw::PreferencesDialog::new();
         let group = adw::PreferencesGroup::new();
@@ -2575,13 +2563,7 @@ pub(super) mod tests {
     fn typing_a_command_runs_one_scan() {
         gtk4::init().unwrap();
         adw::init().unwrap();
-        let config_home = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
-        let app = adw::Application::builder()
-            .application_id("org.test.AgentDebounce")
-            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
-            .build();
-        app.register(None::<&gtk4::gio::Cancellable>).unwrap();
+        let app = crate::window::imp::test_support::test_app("org.test.AgentDebounce", false);
         let window = crate::window::AgentTerminalWindow::new(&app);
         let ctx = glib::MainContext::default();
         crate::testutil::settle(&ctx);
@@ -2687,10 +2669,9 @@ pub(super) mod tests {
         let group = adw::PreferencesGroup::new();
         let dialog = adw::PreferencesDialog::new();
         imp.add_agent_detail_rows(&group, Driver::Codex, &saved, &dialog);
-        let mut stack = vec![group.upcast::<gtk4::Widget>()];
         let mut fields = Vec::new();
         let mut feedback = Vec::new();
-        while let Some(widget) = stack.pop() {
+        for widget in crate::testutil::descendants(group.upcast_ref()) {
             if let Some(row) = widget.downcast_ref::<adw::EntryRow>() {
                 fields.push(row.clone());
             }
@@ -2698,11 +2679,6 @@ pub(super) mod tests {
                 if row.title() == "Not Saved" {
                     feedback.push(row.clone());
                 }
-            }
-            let mut child = widget.first_child();
-            while let Some(widget) = child {
-                child = widget.next_sibling();
-                stack.push(widget);
             }
         }
         for (title, bad) in [
@@ -2795,14 +2771,7 @@ pub(super) mod tests {
         adw::init().expect("libadwaita init");
         crate::load_css();
         let ctx = glib::MainContext::default();
-        let config_home = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
-        let app = adw::Application::builder()
-            .application_id("org.test.Dropdowns")
-            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
-            .build();
-        app.register(None::<&gtk4::gio::Cancellable>)
-            .expect("registering a non-unique application");
+        let app = crate::window::imp::test_support::test_app("org.test.Dropdowns", false);
         let win = super::super::super::AgentTerminalWindow::new(&app);
         let rows: Vec<adw::ComboRow> = vec![win.imp().default_agent_row()];
         for width in [360, 1400] {

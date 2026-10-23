@@ -7560,25 +7560,19 @@ fn is_interruption(event: &Event) -> bool {
 pub(super) mod tests {
     use super::*;
 
+    /// Forgets every cached hook verdict, so the next test starts unproven.
+    pub(super) fn reset_hook_verdicts() {
+        HOOK_VERDICTS.with(|cache| *cache.borrow_mut() = crate::hook_config::HookCache::default());
+    }
+
     #[test]
     #[ignore = "needs a display; run alone in an isolated display"]
     fn a_failed_custom_profile_does_not_strand_a_switch_while_its_driver_is_ready() {
         gtk4::init().unwrap();
         adw::init().unwrap();
-        let config_home = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
-        let app = adw::Application::builder()
-            .application_id("org.test.SwitchFailedProfile")
-            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
-            .build();
-        app.register(None::<&gtk4::gio::Cancellable>).unwrap();
-        let window = crate::window::AgentTerminalWindow::new(&app);
+        let app = crate::window::imp::test_support::test_app("org.test.SwitchFailedProfile", false);
         let ctx = glib::MainContext::default();
-        assert!(crate::testutil::pump_until(&ctx, 5, || window
-            .imp()
-            .tab_view
-            .borrow()
-            .is_some()));
+        let window = crate::window::imp::test_support::test_window(&app, &ctx);
         CHAT_RESTORED.with(|done| done.set(true));
         let availability = AgentAvailability::shared();
         for driver in Driver::ALL {
@@ -7958,21 +7952,9 @@ pub(super) mod tests {
         gtk4::init().unwrap();
         adw::init().unwrap();
         crate::icons::register();
-        let config_home = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
-        let app = adw::Application::builder()
-            .application_id("org.test.ClosingLayout")
-            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
-            .build();
-        app.register(None::<&gtk4::gio::Cancellable>).unwrap();
-        let _hold = app.hold();
-        let window = crate::window::AgentTerminalWindow::new(&app);
+        let app = crate::window::imp::test_support::test_app("org.test.ClosingLayout", true);
         let ctx = glib::MainContext::default();
-        assert!(crate::testutil::pump_until(&ctx, 5, || window
-            .imp()
-            .tab_view
-            .borrow()
-            .is_some()));
+        let window = crate::window::imp::test_support::test_window(&app, &ctx);
         CHAT_RESTORED.with(|done| done.set(true));
         // Titled: a blank thread left for the next one would be discarded.
         let ids: Vec<_> = (0..2)
@@ -8029,22 +8011,10 @@ pub(super) mod tests {
         gtk4::init().unwrap();
         adw::init().unwrap();
         crate::icons::register();
-        let config_home = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
-        let app = adw::Application::builder()
-            .application_id("org.test.OnlySelectedVisible")
-            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
-            .build();
-        app.register(None::<&gtk4::gio::Cancellable>).unwrap();
-        let _hold = app.hold();
+        let app = crate::window::imp::test_support::test_app("org.test.OnlySelectedVisible", true);
         CHAT_RESTORED.with(|done| done.set(true));
-        let window = crate::window::AgentTerminalWindow::new(&app);
         let ctx = glib::MainContext::default();
-        assert!(crate::testutil::pump_until(&ctx, 5, || window
-            .imp()
-            .tab_view
-            .borrow()
-            .is_some()));
+        let window = crate::window::imp::test_support::test_window(&app, &ctx);
         window.present();
         let imp = window.imp();
         for i in 0..3 {
@@ -8148,22 +8118,10 @@ pub(super) mod tests {
         gtk4::init().unwrap();
         adw::init().unwrap();
         crate::icons::register();
-        let config_home = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
-        let app = adw::Application::builder()
-            .application_id("org.test.StillSkeleton")
-            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
-            .build();
-        app.register(None::<&gtk4::gio::Cancellable>).unwrap();
-        let _hold = app.hold();
+        let app = crate::window::imp::test_support::test_app("org.test.StillSkeleton", true);
         CHAT_RESTORED.with(|done| done.set(true));
-        let window = crate::window::AgentTerminalWindow::new(&app);
         let ctx = glib::MainContext::default();
-        assert!(crate::testutil::pump_until(&ctx, 5, || window
-            .imp()
-            .tab_view
-            .borrow()
-            .is_some()));
+        let window = crate::window::imp::test_support::test_window(&app, &ctx);
         window.present();
         let imp = window.imp();
         let ids: Vec<_> = (0..2)
@@ -8206,23 +8164,11 @@ pub(super) mod tests {
         gtk4::init().unwrap();
         adw::init().unwrap();
         crate::icons::register();
-        let config_home = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
-        let app = adw::Application::builder()
-            .application_id("org.test.BlankThreads")
-            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
-            .build();
-        app.register(None::<&gtk4::gio::Cancellable>).unwrap();
-        let _hold = app.hold();
+        let app = crate::window::imp::test_support::test_app("org.test.BlankThreads", true);
         // Before the window: one built while the last session is restored discards nothing.
         CHAT_RESTORED.with(|done| done.set(true));
-        let window = crate::window::AgentTerminalWindow::new(&app);
         let ctx = glib::MainContext::default();
-        assert!(crate::testutil::pump_until(&ctx, 5, || window
-            .imp()
-            .tab_view
-            .borrow()
-            .is_some()));
+        let window = crate::window::imp::test_support::test_window(&app, &ctx);
         window.present();
         assert!(crate::testutil::pump_until(&ctx, 5, || window.is_realized()));
         let imp = window.imp();
@@ -8275,14 +8221,7 @@ pub(super) mod tests {
         gtk4::init().unwrap();
         adw::init().unwrap();
         crate::icons::register();
-        let config_home = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
-        let app = adw::Application::builder()
-            .application_id("org.test.ReopenOffer")
-            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
-            .build();
-        app.register(None::<&gtk4::gio::Cancellable>).unwrap();
-        let _hold = app.hold();
+        let app = crate::window::imp::test_support::test_app("org.test.ReopenOffer", true);
         CHAT_RESTORED.with(|done| done.set(true));
         let first = crate::window::AgentTerminalWindow::new(&app);
         let second = crate::window::AgentTerminalWindow::new(&app);
@@ -8332,13 +8271,7 @@ pub(super) mod tests {
     fn opening_a_thread_in_two_windows_keeps_one_page_and_remote_actions_reach_it() {
         gtk4::init().unwrap();
         adw::init().unwrap();
-        let config_home = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
-        let app = adw::Application::builder()
-            .application_id("org.test.ThreadOwners")
-            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
-            .build();
-        app.register(None::<&gtk4::gio::Cancellable>).unwrap();
+        let app = crate::window::imp::test_support::test_app("org.test.ThreadOwners", false);
         let first = crate::window::AgentTerminalWindow::new(&app);
         let second = crate::window::AgentTerminalWindow::new(&app);
         let ctx = glib::MainContext::default();
@@ -9447,7 +9380,7 @@ pub(super) mod tests {
     fn an_unchecked_hook_fails_closed_and_says_it_is_not_checked_yet() {
         let home = std::path::Path::new("/test/home");
         let target = hook_target(Some(home), Some(std::path::Path::new("/tmp")));
-        HOOK_VERDICTS.with(|cache| *cache.borrow_mut() = crate::hook_config::HookCache::default());
+        reset_hook_verdicts();
         let before = cached_hook_verdict(&target);
         assert!(before
             .as_ref()
@@ -9479,7 +9412,7 @@ pub(super) mod tests {
         );
         remember_hook_probe(target.clone(), &crate::hook_config::HookProbe::Installed);
         assert_eq!(cached_hook_verdict(&target), Ok(()));
-        HOOK_VERDICTS.with(|cache| *cache.borrow_mut() = crate::hook_config::HookCache::default());
+        reset_hook_verdicts();
     }
 
     #[test]
@@ -9509,8 +9442,7 @@ pub(super) mod tests {
             let target = crate::hook_config::HookTarget::new(&env, Some(app.path().into()));
             assert!(ctx.block_on(check_hook(target.clone())).is_err());
             assert!(cached_hook_verdict(&target).is_err());
-            HOOK_VERDICTS
-                .with(|cache| *cache.borrow_mut() = crate::hook_config::HookCache::default());
+            reset_hook_verdicts();
         });
     }
 
@@ -9535,8 +9467,7 @@ pub(super) mod tests {
                 cached_hook_verdict(&target),
                 Err(crate::chat::session::HOOK_NOT_CHECKED.into())
             );
-            HOOK_VERDICTS
-                .with(|cache| *cache.borrow_mut() = crate::hook_config::HookCache::default());
+            reset_hook_verdicts();
         });
     }
 
@@ -9567,7 +9498,7 @@ pub(super) mod tests {
             Ok(()),
             "another home's check cannot erase this proof"
         );
-        HOOK_VERDICTS.with(|cache| *cache.borrow_mut() = crate::hook_config::HookCache::default());
+        reset_hook_verdicts();
     }
 
     #[test]
@@ -9588,7 +9519,7 @@ pub(super) mod tests {
             bind_approval(hook_for_launch(checked, &cleared, "/tmp"), "t", "/tmp", Mode::Ask),
             Err(Some(reason)) if reason == crate::chat::session::HOOK_NOT_CHECKED
         ));
-        HOOK_VERDICTS.with(|cache| *cache.borrow_mut() = crate::hook_config::HookCache::default());
+        reset_hook_verdicts();
     }
 
     #[test]
@@ -9613,7 +9544,7 @@ pub(super) mod tests {
         let refusal = hook_for_launch(Ok(()), &env, "/tmp");
         assert!(matches!(bind_approval(refusal, "t", "/tmp", Mode::Ask),
             Err(Some(why)) if why.contains("ANTIGRAVITY_APP_DATA_DIR") && !why.contains("private-config-value")));
-        HOOK_VERDICTS.with(|cache| *cache.borrow_mut() = crate::hook_config::HookCache::default());
+        reset_hook_verdicts();
     }
 
     #[test]
@@ -9627,7 +9558,7 @@ pub(super) mod tests {
             cached_hook_verdict(&second),
             Err(crate::hook_config::DIFFERENT_DIRECTORY.into())
         );
-        HOOK_VERDICTS.with(|cache| *cache.borrow_mut() = crate::hook_config::HookCache::default());
+        reset_hook_verdicts();
     }
 
     #[test]
@@ -9676,8 +9607,7 @@ pub(super) mod tests {
                 cached_hook_verdict(&changed_home).is_err(),
                 "a new HOME requires its own proof"
             );
-            HOOK_VERDICTS
-                .with(|cache| *cache.borrow_mut() = crate::hook_config::HookCache::default());
+            reset_hook_verdicts();
         });
     }
 
@@ -9759,8 +9689,7 @@ pub(super) mod tests {
             remember_hook_probe(unscoped.clone(), &crate::hook_config::HookProbe::Installed);
             assert!(cached_hook_verdict(&unscoped).is_err());
             assert_eq!(cached_hook_verdict(&scoped), Ok(()));
-            HOOK_VERDICTS
-                .with(|cache| *cache.borrow_mut() = crate::hook_config::HookCache::default());
+            reset_hook_verdicts();
         });
     }
 
@@ -9782,7 +9711,7 @@ pub(super) mod tests {
         assert_eq!(refusal, Err(crate::hook_config::DIFFERENT_HOME.into()));
         assert!(matches!(bind_approval(refusal, "t", "/tmp", Mode::Ask),
             Err(Some(why)) if why == crate::hook_config::DIFFERENT_HOME));
-        HOOK_VERDICTS.with(|cache| *cache.borrow_mut() = crate::hook_config::HookCache::default());
+        reset_hook_verdicts();
     }
 
     #[test]
@@ -9807,8 +9736,7 @@ pub(super) mod tests {
                     },
                 )
             });
-            HOOK_VERDICTS
-                .with(|cache| *cache.borrow_mut() = crate::hook_config::HookCache::default());
+            reset_hook_verdicts();
             let cached = cached_agy_hook_target(Some("/tmp".into())).expect("fallback resolved");
             let refreshed = ctx.block_on(agy_hook_target(Some("/tmp".into())));
             let launch = agent_launch_with(
@@ -10391,26 +10319,14 @@ pub(super) mod tests {
     #[test]
     #[ignore = "needs a display; run alone in an isolated display"]
     fn a_failed_switch_rolls_back_onto_the_threads_own_profile() {
-        use crate::testutil::pump_until;
         gtk4::init().unwrap();
         adw::init().unwrap();
         crate::icons::register();
-        let config_home = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
-        let app = adw::Application::builder()
-            .application_id("org.test.FailedSwitchKeepsProfile")
-            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
-            .build();
-        app.register(None::<&gtk4::gio::Cancellable>).unwrap();
-        let _hold = app.hold();
+        let app =
+            crate::window::imp::test_support::test_app("org.test.FailedSwitchKeepsProfile", true);
         CHAT_RESTORED.with(|done| done.set(true));
-        let window = crate::window::AgentTerminalWindow::new(&app);
         let ctx = glib::MainContext::default();
-        assert!(pump_until(&ctx, 5, || window
-            .imp()
-            .tab_view
-            .borrow()
-            .is_some()));
+        let window = crate::window::imp::test_support::test_window(&app, &ctx);
         let imp = window.imp();
         let default = Profile {
             id: "claude-default".into(),
@@ -10548,13 +10464,8 @@ pub(super) mod tests {
         app.register(None::<&gtk4::gio::Cancellable>).unwrap();
         let _hold = app.hold();
         CHAT_RESTORED.with(|done| done.set(true));
-        let window = crate::window::AgentTerminalWindow::new(&app);
         let ctx = glib::MainContext::default();
-        assert!(pump_until(&ctx, 5, || window
-            .imp()
-            .tab_view
-            .borrow()
-            .is_some()));
+        let window = crate::window::imp::test_support::test_window(&app, &ctx);
         let imp = window.imp();
         imp.config.borrow_mut().profiles.push(Profile {
             id: "claude-work".into(),
@@ -10840,13 +10751,8 @@ pub(super) mod tests {
         app.register(None::<&gtk4::gio::Cancellable>).unwrap();
         let _hold = app.hold();
         CHAT_RESTORED.with(|done| done.set(true));
-        let window = crate::window::AgentTerminalWindow::new(&app);
         let ctx = glib::MainContext::default();
-        assert!(pump_until(&ctx, 5, || window
-            .imp()
-            .tab_view
-            .borrow()
-            .is_some()));
+        let window = crate::window::imp::test_support::test_window(&app, &ctx);
         window.present();
         assert!(pump_until(&ctx, 5, || window.is_realized()));
         let imp = window.imp();

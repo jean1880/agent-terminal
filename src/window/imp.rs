@@ -12,6 +12,10 @@ mod thread_menu;
 mod threads;
 mod uninstall_prefs;
 
+#[cfg(test)]
+#[path = "test_support.rs"]
+pub(super) mod test_support;
+
 use threads::{blocking_or, off_main};
 
 pub(crate) use threads::{close_store_writer, flush_store_for_panic};
@@ -7656,14 +7660,7 @@ mod tests {
         adw::init().expect("adw init");
         crate::icons::register();
         crate::load_css();
-        let config_home = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
-        let app = adw::Application::builder()
-            .application_id("org.test.SmallWindow")
-            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
-            .build();
-        app.register(None::<&gtk4::gio::Cancellable>)
-            .expect("registering a non-unique application");
+        let app = crate::window::imp::test_support::test_app("org.test.SmallWindow", false);
         let window = super::super::AgentTerminalWindow::new(&app);
         let imp = window.imp();
         for p in imp.config.borrow_mut().profiles.iter_mut() {
