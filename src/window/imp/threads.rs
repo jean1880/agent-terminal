@@ -7527,6 +7527,32 @@ fn is_interruption(event: &Event) -> bool {
 pub(super) mod tests {
     use super::*;
 
+    /// The file store at a path, installed as the app's (reader, path and writer) for one test.
+    /// Dropping it takes all three out again, so a failing test leaves no store behind.
+    struct InstalledStore {
+        reader: Rc<Store>,
+        writer: StoreWriter,
+    }
+
+    impl InstalledStore {
+        fn at(path: std::path::PathBuf) -> Self {
+            let reader = Rc::new(Store::open(&path).expect("open"));
+            let writer = StoreWriter::spawn(&path).expect("writer");
+            STORE.with(|s| *s.borrow_mut() = Some(reader.clone()));
+            STORE_PATH.with(|p| *p.borrow_mut() = Some(path));
+            WRITER.with(|w| *w.borrow_mut() = Some(writer.clone()));
+            Self { reader, writer }
+        }
+    }
+
+    impl Drop for InstalledStore {
+        fn drop(&mut self) {
+            WRITER.with(|w| *w.borrow_mut() = None);
+            STORE_PATH.with(|p| *p.borrow_mut() = None);
+            STORE.with(|s| *s.borrow_mut() = None);
+        }
+    }
+
     /// Forgets every cached hook verdict, so the next test starts unproven.
     pub(super) fn reset_hook_verdicts() {
         HOOK_VERDICTS.with(|cache| *cache.borrow_mut() = crate::hook_config::HookCache::default());
@@ -8309,20 +8335,9 @@ pub(super) mod tests {
             .downcast::<adw::AlertDialog>()
             .unwrap();
         assert!(dialog.body().contains("1 background task will stop"));
-        let cancel = crate::testutil::descendants(dialog.upcast_ref())
-            .into_iter()
-            .filter_map(|widget| widget.downcast::<gtk4::Button>().ok())
-            .find(|button| {
-                button.label().as_deref() == Some("Keep Waiting")
-                    || crate::testutil::descendants(button.upcast_ref())
-                        .iter()
-                        .any(|widget| {
-                            widget
-                                .downcast_ref::<gtk4::Label>()
-                                .is_some_and(|label| label.text() == "Keep Waiting")
-                        })
-            })
-            .unwrap();
+        let cancel =
+            crate::window::imp::test_support::button_labelled(dialog.upcast_ref(), "Keep Waiting")
+                .unwrap();
         assert!(
             crate::testutil::pump_until(&ctx, 5, || cancel.is_mapped() && cancel.is_sensitive())
         );
@@ -8759,19 +8774,9 @@ pub(super) mod tests {
             };
             assert!(pump_until(&ctx, 5, || open().is_some()), "asks: {heading}");
             let dialog = open().expect("the dialog");
-            let target = crate::testutil::descendants(dialog.upcast_ref())
-                .into_iter()
-                .filter_map(|w| w.downcast::<gtk4::Button>().ok())
-                .find(|b| {
-                    b.label().as_deref() == Some(button)
-                        || crate::testutil::descendants(b.upcast_ref())
-                            .iter()
-                            .any(|w| {
-                                w.downcast_ref::<gtk4::Label>()
-                                    .is_some_and(|l| l.text() == button)
-                            })
-                })
-                .unwrap_or_else(|| panic!("{heading} has a {button} button"));
+            let target =
+                crate::window::imp::test_support::button_labelled(dialog.upcast_ref(), button)
+                    .unwrap_or_else(|| panic!("{heading} has a {button} button"));
             // A dialog still animating in ignores its buttons: click only once it is shown.
             assert!(
                 pump_until(&ctx, 10, || target.is_mapped() && target.is_sensitive()),
@@ -10022,12 +10027,8 @@ pub(super) mod tests {
     fn main_thread_writes_are_queued_and_store_jobs_read_them_back() {
         use crate::testutil::{in_loop, pump_until};
         let dir = tempfile::tempdir().expect("tmp");
-        let path = dir.path().join("threads.db");
-        let reader = Rc::new(Store::open(&path).expect("open"));
-        let writer = StoreWriter::spawn(&path).expect("writer");
-        STORE.with(|s| *s.borrow_mut() = Some(reader.clone()));
-        STORE_PATH.with(|p| *p.borrow_mut() = Some(path));
-        WRITER.with(|w| *w.borrow_mut() = Some(writer.clone()));
+        let installed = InstalledStore::at(dir.path().join("threads.db"));
+        let (reader, writer) = (installed.reader.clone(), installed.writer.clone());
 
         let handle = app_handle();
         assert!(handle.writer().is_some());
@@ -10089,9 +10090,7 @@ pub(super) mod tests {
             let got = out.borrow_mut().take();
             got
         });
-        WRITER.with(|w| *w.borrow_mut() = None);
-        STORE_PATH.with(|p| *p.borrow_mut() = None);
-        STORE.with(|s| *s.borrow_mut() = None);
+        drop(installed);
         let (read, renamed) = got.expect("ran");
         assert_eq!(read.expect("job").expect("events"), 300);
         assert_eq!(
@@ -10418,12 +10417,8 @@ pub(super) mod tests {
         let config_home = tempfile::tempdir().unwrap();
         std::env::set_var("XDG_CONFIG_HOME", config_home.path());
         let state = tempfile::tempdir().unwrap();
-        let path = state.path().join("threads.db");
-        let reader = Rc::new(Store::open(&path).expect("open"));
-        let writer = StoreWriter::spawn(&path).expect("writer");
-        STORE.with(|s| *s.borrow_mut() = Some(reader.clone()));
-        STORE_PATH.with(|p| *p.borrow_mut() = Some(path));
-        WRITER.with(|w| *w.borrow_mut() = Some(writer.clone()));
+        let installed = InstalledStore::at(state.path().join("threads.db"));
+        let (reader, writer) = (installed.reader.clone(), installed.writer.clone());
         let app = adw::Application::builder()
             .application_id("org.test.WorktreeThreadReopen")
             .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
@@ -10494,9 +10489,7 @@ pub(super) mod tests {
 
         window.destroy();
         crate::testutil::settle(&ctx);
-        WRITER.with(|w| *w.borrow_mut() = None);
-        STORE_PATH.with(|p| *p.borrow_mut() = None);
-        STORE.with(|s| *s.borrow_mut() = None);
+        drop(installed);
         assert_eq!(writer.failures().0, 0);
     }
 
@@ -10705,12 +10698,8 @@ pub(super) mod tests {
         let config_home = tempfile::tempdir().unwrap();
         std::env::set_var("XDG_CONFIG_HOME", config_home.path());
         let state = tempfile::tempdir().unwrap();
-        let path = state.path().join("threads.db");
-        let reader = Rc::new(Store::open(&path).expect("open"));
-        let writer = StoreWriter::spawn(&path).expect("writer");
-        STORE.with(|s| *s.borrow_mut() = Some(reader.clone()));
-        STORE_PATH.with(|p| *p.borrow_mut() = Some(path));
-        WRITER.with(|w| *w.borrow_mut() = Some(writer.clone()));
+        let installed = InstalledStore::at(state.path().join("threads.db"));
+        let (reader, writer) = (installed.reader.clone(), installed.writer.clone());
         let app = adw::Application::builder()
             .application_id("org.test.CloseGuards")
             .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
@@ -10759,19 +10748,9 @@ pub(super) mod tests {
             };
             assert!(pump_until(&ctx, 5, || open().is_some()), "asks: {heading}");
             let dialog = open().expect("the dialog");
-            let target = crate::testutil::descendants(dialog.upcast_ref())
-                .into_iter()
-                .filter_map(|w| w.downcast::<gtk4::Button>().ok())
-                .find(|b| {
-                    b.label().as_deref() == Some(button)
-                        || crate::testutil::descendants(b.upcast_ref())
-                            .iter()
-                            .any(|w| {
-                                w.downcast_ref::<gtk4::Label>()
-                                    .is_some_and(|l| l.text() == button)
-                            })
-                })
-                .unwrap_or_else(|| panic!("{heading} has a {button} button"));
+            let target =
+                crate::window::imp::test_support::button_labelled(dialog.upcast_ref(), button)
+                    .unwrap_or_else(|| panic!("{heading} has a {button} button"));
             assert!(pump_until(&ctx, 10, || target.is_mapped() && target.is_sensitive()));
             settle(&ctx);
             target.emit_clicked();
@@ -11001,8 +10980,6 @@ pub(super) mod tests {
 
         window.destroy();
         settle(&ctx);
-        WRITER.with(|w| *w.borrow_mut() = None);
-        STORE_PATH.with(|p| *p.borrow_mut() = None);
-        STORE.with(|s| *s.borrow_mut() = None);
+        drop(installed);
     }
 }

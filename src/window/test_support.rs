@@ -47,6 +47,23 @@ pub(crate) fn test_app(id: &str, hold: bool) -> TestApp {
     }
 }
 
+/// The button under `root` that reads `label`, as its own label or a label inside it (an
+/// AlertDialog's response buttons hold theirs in a child).
+pub(crate) fn button_labelled(root: &gtk4::Widget, label: &str) -> Option<gtk4::Button> {
+    crate::testutil::descendants(root)
+        .into_iter()
+        .filter_map(|w| w.downcast::<gtk4::Button>().ok())
+        .find(|b| {
+            b.label().as_deref() == Some(label)
+                || crate::testutil::descendants(b.upcast_ref())
+                    .iter()
+                    .any(|w| {
+                        w.downcast_ref::<gtk4::Label>()
+                            .is_some_and(|l| l.text() == label)
+                    })
+        })
+}
+
 /// A new window of `app`, once its tab view exists (at most 5 s of `ctx`).
 pub(crate) fn test_window(app: &adw::Application, ctx: &glib::MainContext) -> AgentTerminalWindow {
     let window = AgentTerminalWindow::new(app);

@@ -2382,6 +2382,21 @@ fn detect_agent(command: &str) -> Result<String, String> {
 pub(super) mod tests {
     use super::*;
 
+    /// The first `T` among `widgets` titled `title`.
+    fn find_titled<T: IsA<adw::PreferencesRow> + IsA<gtk4::Widget>>(
+        widgets: &[gtk4::Widget],
+        title: &str,
+    ) -> T {
+        widgets
+            .iter()
+            .find_map(|w| {
+                w.downcast_ref::<T>()
+                    .filter(|r| r.title() == title)
+                    .cloned()
+            })
+            .unwrap_or_else(|| panic!("no row titled {title}"))
+    }
+
     #[test]
     fn sync_buttons_never_claim_synced_for_unread_codex_rules() {
         use crate::always_allow::PermissionSyncStatus;
@@ -2458,15 +2473,7 @@ pub(super) mod tests {
         assert!(crate::testutil::pump_until(&ctx, 5, || prefs.is_mapped()));
         crate::testutil::settle(&ctx);
         let widgets = crate::testutil::descendants(group.upcast_ref());
-        let field = |title: &str| {
-            widgets
-                .iter()
-                .find_map(|w| {
-                    w.downcast_ref::<adw::EntryRow>()
-                        .filter(|r| r.title() == title)
-                })
-                .unwrap()
-        };
+        let field = |title: &str| find_titled::<adw::EntryRow>(&widgets, title);
         let closed = Rc::new(std::cell::Cell::new(false));
         let checked = closed.clone();
         let weak = window.downgrade();
@@ -2524,20 +2531,8 @@ pub(super) mod tests {
             .imp()
             .add_agent_detail_rows(&group, Driver::Codex, &profile, &prefs);
         let widgets = crate::testutil::descendants(group.upcast_ref());
-        let command = widgets
-            .iter()
-            .find_map(|w| {
-                w.downcast_ref::<adw::EntryRow>()
-                    .filter(|r| r.title() == "Command or Path")
-            })
-            .unwrap();
-        let status = widgets
-            .iter()
-            .find_map(|w| {
-                w.downcast_ref::<adw::ActionRow>()
-                    .filter(|r| r.title() == "Detected")
-            })
-            .unwrap();
+        let command = find_titled::<adw::EntryRow>(&widgets, "Command or Path");
+        let status = find_titled::<adw::ActionRow>(&widgets, "Detected");
         command.set_text("--invalid"); // before the initial detection future can answer
         assert!(crate::testutil::pump_until(
             &glib::MainContext::default(),
@@ -2564,20 +2559,8 @@ pub(super) mod tests {
             .imp()
             .add_agent_detail_rows(&group, Driver::Codex, &saved, &prefs);
         let widgets = crate::testutil::descendants(group.upcast_ref());
-        let field = widgets
-            .iter()
-            .find_map(|w| {
-                w.downcast_ref::<adw::EntryRow>()
-                    .filter(|r| r.title() == "Command or Path")
-            })
-            .unwrap();
-        let status = widgets
-            .iter()
-            .find_map(|w| {
-                w.downcast_ref::<adw::ActionRow>()
-                    .filter(|r| r.title() == "Detected")
-            })
-            .unwrap();
+        let field = find_titled::<adw::EntryRow>(&widgets, "Command or Path");
+        let status = find_titled::<adw::ActionRow>(&widgets, "Detected");
         let before = super::super::threads::scan_generation_for_test();
         // Preserve the executable basename: profile_driver deliberately gives wrappers with
         // other names no chat adapter. This tests path edits within the Codex profile.
