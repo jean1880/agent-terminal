@@ -470,6 +470,18 @@ async fn thread_enclosing_repo(thread: String) -> Option<Option<std::path::PathB
         .ok()
 }
 
+/// Where the external diff tool runs for a panel file: the top of `dir`'s repository, else of
+/// the file's, else `dir` itself. Blocking: run it off the main thread.
+fn diff_tool_working_dir(dir: &str, file: &str) -> std::path::PathBuf {
+    if let Ok(Some(repo)) = crate::git::discover(std::path::Path::new(dir)) {
+        repo.toplevel
+    } else if let Ok(Some(repo)) = crate::git::discover(std::path::Path::new(file)) {
+        repo.toplevel
+    } else {
+        std::path::PathBuf::from(dir)
+    }
+}
+
 /// The main checkout of the repository `dir` is in, and the branch `dir` has checked out.
 /// Blocking: run it off the main thread.
 fn worktree_repo(dir: &std::path::Path) -> Result<(std::path::PathBuf, Option<String>), String> {
@@ -6282,15 +6294,14 @@ impl AgentTerminalWindow {
             Some(rev) => crate::diff_tool::NewSide::Rev(rev),
             None => crate::diff_tool::NewSide::Working,
         };
-        let working_dir = if let Ok(Some(repo)) = crate::git::discover(std::path::Path::new(&dir)) {
-            repo.toplevel
-        } else if let Ok(Some(repo)) = crate::git::discover(std::path::Path::new(&file.path)) {
-            repo.toplevel
-        } else {
-            std::path::PathBuf::from(dir)
-        };
         let obj = self.obj().downgrade();
         glib::MainContext::default().spawn_local(async move {
+            let working_dir = gtk4::gio::spawn_blocking({
+                let (dir, path) = (dir.clone(), file.path.clone());
+                move || diff_tool_working_dir(&dir, &path)
+            })
+            .await
+            .unwrap_or_else(|_| std::path::PathBuf::from(dir));
             let result =
                 crate::diff_tool::open_from_dir(tool, working_dir, file.path, file.from, new_side)
                     .await;
@@ -7314,6 +7325,40 @@ mod tests {
         assert_eq!(
             ctx.block_on(thread_enclosing_repo("absent".into())),
             Some(None)
+        );
+    }
+
+    #[test]
+    fn the_diff_tool_runs_in_the_tab_repository_then_the_file_one_then_the_tab_folder() {
+        let repo = tempfile::tempdir().unwrap();
+        let ran = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(repo.path())
+            .status();
+        if !ran.is_ok_and(|s| s.success()) {
+            eprintln!("git is not available; skipping");
+            return;
+        }
+        let top = repo.path().canonicalize().unwrap();
+        let inside = repo.path().join("sub");
+        std::fs::create_dir(&inside).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_dir = outside.path().to_string_lossy().into_owned();
+        let canon = |p: std::path::PathBuf| p.canonicalize().unwrap();
+        assert_eq!(
+            canon(diff_tool_working_dir(&inside.to_string_lossy(), "x.rs")),
+            top
+        );
+        assert_eq!(
+            canon(diff_tool_working_dir(
+                &outside_dir,
+                &inside.to_string_lossy()
+            )),
+            top
+        );
+        assert_eq!(
+            diff_tool_working_dir(&outside_dir, "/nonexistent/x.rs"),
+            std::path::PathBuf::from(&outside_dir)
         );
     }
 
