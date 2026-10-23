@@ -67,12 +67,7 @@ pub struct Request {
 
 /// Whether `s` is safe to print as a line: no control, bidi or zero-width characters.
 pub(super) fn plain(s: &str) -> bool {
-    !s.chars().any(|c| {
-        c.is_control()
-            || matches!(c,
-                '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}'
-                | '\u{2066}'..='\u{2069}' | '\u{FEFF}' | '\u{E0000}'..='\u{E007F}')
-    })
+    !agent_core::text::has_control_or_bidi(s, &[])
 }
 
 fn special_words(name: &str) -> Option<&'static str> {
