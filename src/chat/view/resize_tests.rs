@@ -164,6 +164,235 @@ fn resize_cost_of_long_threads() {
     }
 }
 
+/// Envelopes of `turns` live turns from `start`: each a prompt, a streamed reply, two tool steps
+/// and a closing reply (6 top-level items). Every 10th turn also starts a sub-agent with
+/// `children` steps, one of them a nested sub-agent with 10 steps of its own. Every 20th step
+/// (5%) never completes, as a step whose completion was lost.
+fn live_turns(start: usize, turns: usize, children: usize) -> Vec<Envelope> {
+    let mut out = Vec::new();
+    let mut steps = 0usize;
+    let mut step = |out: &mut Vec<Envelope>, id: String, parent: Option<&str>| {
+        out.push(Envelope::item_started(
+            &id,
+            ItemKind::Command,
+            format!("cargo test -p {id}"),
+            None,
+            parent,
+        ));
+        steps += 1;
+        if !steps.is_multiple_of(20) {
+            out.push(Envelope::item_completed(
+                &id,
+                ItemStatus::Completed,
+                Some("test result: ok. 12 passed; 0 failed"),
+                None,
+            ));
+        }
+    };
+    for t in start..start + turns {
+        out.push(Envelope::new(Event::TurnStarted { model: None }));
+        let user = format!("t{t}-user");
+        out.push(Envelope::item_started(
+            &user,
+            ItemKind::UserMessage,
+            "",
+            None,
+            None,
+        ));
+        out.push(Envelope::snapshot(
+            &user,
+            StreamKind::Assistant,
+            format!("Question {t}: {PARA}"),
+        ));
+        out.push(Envelope::item_completed(
+            &user,
+            ItemStatus::Completed,
+            None,
+            None,
+        ));
+        for reply in ["a", "b"] {
+            let id = format!("t{t}-{reply}");
+            out.push(Envelope::item_started(
+                &id,
+                ItemKind::AssistantMessage,
+                "",
+                None,
+                None,
+            ));
+            // Streamed in pieces, as a live reply is.
+            for chunk in PARA.split_inclusive(". ") {
+                out.push(Envelope::delta(&id, StreamKind::Assistant, chunk));
+            }
+            out.push(Envelope::item_completed(
+                &id,
+                ItemStatus::Completed,
+                None,
+                None,
+            ));
+            if reply == "a" {
+                step(&mut out, format!("t{t}-s1"), None);
+                step(&mut out, format!("t{t}-s2"), None);
+                if t.is_multiple_of(10) {
+                    let agent = format!("t{t}-agent");
+                    out.push(Envelope::item_started(
+                        &agent,
+                        ItemKind::Subagent,
+                        "Agent",
+                        Some(serde_json::json!({
+                            "subagent_type": "Explore",
+                            "description": format!("explore part {t}"),
+                        })),
+                        None,
+                    ));
+                    for c in 0..children {
+                        step(&mut out, format!("t{t}-agent-c{c}"), Some(&agent));
+                        if c == children / 2 {
+                            let nested = format!("t{t}-agent-n");
+                            out.push(Envelope::item_started(
+                                &nested,
+                                ItemKind::Subagent,
+                                "Agent",
+                                Some(serde_json::json!({ "subagent_type": "Plan" })),
+                                Some(&agent),
+                            ));
+                            for n in 0..10 {
+                                step(&mut out, format!("t{t}-agent-n{n}"), Some(&nested));
+                            }
+                            out.push(Envelope::item_completed(
+                                &nested,
+                                ItemStatus::Completed,
+                                Some("planned"),
+                                None,
+                            ));
+                        }
+                    }
+                    out.push(Envelope::item_completed(
+                        &agent,
+                        ItemStatus::Completed,
+                        Some("explored"),
+                        None,
+                    ));
+                }
+            }
+        }
+        out.push(Envelope::new(Event::TurnCompleted {
+            state: agent_core::event::TurnState::Completed,
+            usage: None,
+            cost_usd: None,
+            error: None,
+        }));
+    }
+    out
+}
+
+/// Applies `envs` one at a time, as a live session does, running the main loop between bursts
+/// (idle flushes and frames run as they would). Milliseconds spent in `ChatView::apply`.
+fn feed(ctx: &glib::MainContext, view: &ChatView, envs: &[Envelope]) -> f64 {
+    let mut spent = Duration::ZERO;
+    for burst in envs.chunks(20) {
+        let started = Instant::now();
+        for env in burst {
+            view.apply(env);
+        }
+        spent += started.elapsed();
+        while ctx.iteration(false) {}
+    }
+    spent.as_secs_f64() * 1000.0
+}
+
+/// What a live session costs a resize, against a replay of the same envelopes.
+///
+/// Measured 2026-10-23 (Xvfb, measure profile), M = steps per sub-agent, rows nested included,
+/// layout / layout+snapshot ms at narrow widths, before and after bounding the live transcript:
+///
+/// | M   | live rows   | live resize        | jumped +300 rows | jumped resize       |
+/// |-----|-------------|--------------------|------------------|---------------------|
+/// | 0   | 205 → 205   | 1.9 / 1.8 → 1.5 / 1.8 | 460 → 460     | 3.0 / 4.1 → 2.7 / 4.3 |
+/// | 50  | 449 → 405   | 2.5 / 5.5 → 2.3 / 4.8 | 1009 → 600    | 4.8 / 13.8 → 2.3 / 7.4 |
+/// | 300 | 1449 → 365  | 6.2 / 21.1 → 2.0 / 3.9 | 3259 → 600   | 21.9 / 57.7 → 2.4 / 6.7 |
+///
+/// At M = 300, applying the 7775 envelopes took 7.1 s → 5.3 s, and the 300 items after the jump
+/// 7.2 s → 2.7 s; a replay builds 1083 → 270 rows.
+#[test]
+#[ignore = "a measurement: prints costs, asserts nothing (make bench T=resize_cost_of_live_sessions)"]
+fn resize_cost_of_live_sessions() {
+    use adw::prelude::AdwWindowExt;
+    let ctx = native_init();
+    let rows = |inner: &Inner| {
+        format!(
+            "{:5} rows ({:3} top-level)",
+            inner.transcript.row_count(),
+            inner.transcript.materialised()
+        )
+    };
+    for children in [0usize, 50, 300] {
+        let envs = live_turns(0, 100, children);
+        let window = adw::Window::new();
+        window.set_default_size(900, 800);
+        let tabs = adw::TabView::new();
+        window.set_content(Some(&tabs));
+        window.present();
+
+        // Live: every envelope through `apply`, with an agent alive behind the view.
+        let view = ChatView::new(StubBackend::new(Driver::Claude));
+        let page = tabs.append(&view);
+        tabs.set_selected_page(&page);
+        let inner = view.inner().expect("inner");
+        pump_until(&ctx, || view.is_mapped());
+        let apply_ms = feed(&ctx, &view, &envs);
+        pump_for(&ctx, 500);
+        eprintln!(
+            "M={children:3} live   {} | {} envelopes applied in {apply_ms:7.1} ms",
+            rows(&inner),
+            envs.len()
+        );
+        report(&format!("M={children:3} live, resize"), &tabs);
+
+        // Not following: a jump to an old card, 300 more items arrive, then back to the end.
+        let old = {
+            let model = inner.model.borrow();
+            let order = model.order();
+            order[order.len().saturating_sub(transcript::WINDOW) + 5].clone()
+        };
+        inner.transcript.scroll_to_card(&old);
+        pump_for(&ctx, 200);
+        let more = live_turns(100, 50, children);
+        let more_ms = feed(&ctx, &view, &more);
+        pump_for(&ctx, 300);
+        eprintln!(
+            "M={children:3} jumped {} | 300 more items applied in {more_ms:7.1} ms",
+            rows(&inner)
+        );
+        report(&format!("M={children:3} jumped, resize"), &tabs);
+        view.scroll_to_end();
+        pump_for(&ctx, 500);
+        eprintln!("M={children:3} back   {}", rows(&inner));
+        report(&format!("M={children:3} back at the end, resize"), &tabs);
+        tabs.close_page(&page);
+        pump_for(&ctx, 200);
+
+        // Replay: the same envelopes as a thread opened from history.
+        let replayed = ChatView::new(StubBackend::new(Driver::Claude));
+        let started = Instant::now();
+        replayed.replay(&envs);
+        let replay_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let page = tabs.append(&replayed);
+        tabs.set_selected_page(&page);
+        let rinner = replayed.inner().expect("inner");
+        pump_until(&ctx, || {
+            replayed.is_mapped() && rinner.transcript.materialised() == transcript::WINDOW
+        });
+        pump_for(&ctx, 500);
+        eprintln!(
+            "M={children:3} replay {} | replayed in {replay_ms:7.1} ms",
+            rows(&rinner)
+        );
+        report(&format!("M={children:3} replay, resize"), &tabs);
+        window.close();
+        pump_for(&ctx, 200);
+    }
+}
+
 /// Nanoseconds the calling thread has run on a CPU (`/proc/thread-self/schedstat`'s first
 /// field): the test thread, which is the one GTK runs on here. 0 when unreadable.
 fn gtk_thread_cpu_ns() -> u64 {

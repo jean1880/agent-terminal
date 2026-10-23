@@ -9,8 +9,8 @@
 //! load a diff) through the view's own row sink, exactly like the transcript's.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
-use std::rc::Rc;
+use std::collections::{HashMap, HashSet};
+use std::rc::{Rc, Weak};
 
 use adw::prelude::AdwDialogExt;
 use gtk4::prelude::*;
@@ -19,6 +19,7 @@ use super::cards::{label, wrapping, Row, RowSink};
 #[cfg(test)]
 use super::model::ToolStatus;
 use super::model::{Body, SubagentSummary, Transcript};
+use super::transcript::CHILD_CAP;
 
 /// `running`, `done · 12 steps`.
 pub fn status_text(s: &SubagentSummary) -> String {
@@ -443,6 +444,17 @@ pub struct SubagentPanel {
     brand: gtk4::Image,
     /// One row per step (nested steps included), built once and then updated.
     rows: RefCell<HashMap<String, Row>>,
+    /// Per list of steps (the sub-agent's, or a card's), keyed by its owner: the index of the
+    /// first step built, and the button that builds the earlier ones. A list builds its newest
+    /// [`CHILD_CAP`] steps when the panel first shows it; later steps are added as they come.
+    earlier: RefCell<HashMap<String, (usize, gtk4::Button)>>,
+    /// Lists whose earlier steps the user asked for.
+    uncapped: RefCell<HashSet<String>>,
+    /// Lists synced at least once.
+    seen: RefCell<HashSet<String>>,
+    /// Brings the panel up to date from its owner's model (see [`Self::set_refresher`]).
+    refresher: RefCell<Option<Rc<dyn Fn()>>>,
+    this: Weak<Self>,
 }
 
 impl SubagentPanel {
@@ -497,7 +509,7 @@ impl SubagentPanel {
         toolbar.add_top_bar(&adw::HeaderBar::new());
         toolbar.set_content(Some(&scroller));
         dialog.set_child(Some(&toolbar));
-        Rc::new(Self {
+        Rc::new_cyclic(|this| Self {
             dialog,
             id: id.to_owned(),
             sink,
@@ -515,7 +527,18 @@ impl SubagentPanel {
             controls,
             brand,
             rows: RefCell::new(HashMap::new()),
+            earlier: RefCell::new(HashMap::new()),
+            uncapped: RefCell::new(HashSet::new()),
+            seen: RefCell::new(HashSet::new()),
+            refresher: RefCell::new(None),
+            this: this.clone(),
         })
+    }
+
+    /// How the panel asks its owner for a refresh, once the user asked for earlier steps (the
+    /// panel holds no model of its own).
+    pub(super) fn set_refresher(&self, refresh: impl Fn() + 'static) {
+        *self.refresher.borrow_mut() = Some(Rc::new(refresh));
     }
 
     pub fn id(&self) -> &str {
@@ -563,9 +586,7 @@ impl SubagentPanel {
         set_if_changed(&self.asked_text, prompt);
         self.asked.set_visible(!prompt.is_empty());
 
-        for child in &item.children {
-            self.sync(model, child, &self.steps, changed);
-        }
+        self.sync_list(model, &self.id, &item.children, &self.steps, changed);
         self.empty
             .set_text(if summary.is_some_and(|s| s.lifecycle.is_some()) {
                 "Step telemetry unavailable."
@@ -589,6 +610,9 @@ impl SubagentPanel {
 
     pub(super) fn reset_steps(&self) {
         self.rows.borrow_mut().clear();
+        self.earlier.borrow_mut().clear();
+        self.uncapped.borrow_mut().clear();
+        self.seen.borrow_mut().clear();
         while let Some(child) = self.steps.first_child() {
             self.steps.remove(&child);
         }
@@ -612,9 +636,84 @@ impl SubagentPanel {
         self.error.set_visible(false);
         self.empty.set_text("No activity recorded for this run.");
         self.empty.set_visible(model.order().is_empty());
-        for id in model.order() {
-            self.sync(model, id, &self.steps, changed);
+        self.sync_list(model, &self.id, model.order(), &self.steps, changed);
+    }
+
+    /// Syncs the steps `ids` of `key` under `parent`: the first time, only the newest
+    /// [`CHILD_CAP`] of them are built, under a button that builds the rest; once the user asked
+    /// for those, they are built in place above the others.
+    fn sync_list(
+        &self,
+        model: &Transcript,
+        key: &str,
+        ids: &[String],
+        parent: &gtk4::Box,
+        changed: &[String],
+    ) {
+        if self.seen.borrow_mut().insert(key.to_owned()) {
+            let from = ids.len().saturating_sub(CHILD_CAP);
+            if from > 0 && !self.uncapped.borrow().contains(key) {
+                let button = self.earlier_button(key, from);
+                parent.prepend(&button);
+                self.earlier
+                    .borrow_mut()
+                    .insert(key.to_owned(), (from, button));
+            }
         }
+        let shown = self.earlier.borrow().get(key).cloned();
+        let from = match shown {
+            Some((from, button)) if self.uncapped.borrow().contains(key) => {
+                self.earlier.borrow_mut().remove(key);
+                let mut after: gtk4::Widget = button.clone().upcast();
+                let mut first = None;
+                for id in &ids[..from.min(ids.len())] {
+                    self.sync(model, id, parent, changed);
+                    if let Some(w) = self.rows.borrow().get(id).map(Row::widget) {
+                        parent.reorder_child_after(&w, Some(&after));
+                        first.get_or_insert(w.clone());
+                        after = w;
+                    }
+                }
+                if button.is_focus() {
+                    if let Some(w) = first {
+                        w.child_focus(gtk4::DirectionType::TabForward);
+                    }
+                }
+                parent.remove(&button);
+                from.min(ids.len())
+            }
+            Some((from, _)) => from.min(ids.len()),
+            None => 0,
+        };
+        for id in &ids[from..] {
+            self.sync(model, id, parent, changed);
+        }
+    }
+
+    /// The button above a list's built steps that builds the `count` earlier ones.
+    fn earlier_button(&self, key: &str, count: usize) -> gtk4::Button {
+        let steps = if count == 1 { "step" } else { "steps" };
+        let button = gtk4::Button::with_label(&format!("{count} earlier {steps}"));
+        button.add_css_class("flat");
+        button.add_css_class("earlier-steps");
+        button.set_halign(gtk4::Align::Start);
+        button.set_tooltip_text(Some("Show the steps before these"));
+        button.update_property(&[gtk4::accessible::Property::Label(&format!(
+            "Show {count} earlier {steps}"
+        ))]);
+        let weak = self.this.clone();
+        let key = key.to_owned();
+        button.connect_clicked(move |_| {
+            let Some(panel) = weak.upgrade() else {
+                return;
+            };
+            panel.uncapped.borrow_mut().insert(key.clone());
+            let refresh = panel.refresher.borrow().clone();
+            if let Some(refresh) = refresh {
+                refresh();
+            }
+        });
+        button
     }
 
     /// Builds `id` under `parent` the first time it is seen, else updates it when it changed;
@@ -637,9 +736,7 @@ impl SubagentPanel {
             .get(id)
             .and_then(|r| r.children_box().cloned());
         if let Some(children) = children_box {
-            for child in &item.children {
-                self.sync(model, child, &children, changed);
-            }
+            self.sync_list(model, id, &item.children, &children, changed);
         }
     }
 
@@ -701,6 +798,72 @@ pub(crate) mod tests {
         assert_eq!(provenance_text(&value), "unconfirmed-effective");
         value.source = Provenance::Unknown;
         assert_eq!(provenance_text(&value), "unknown");
+    }
+
+    /// A long sub-agent's panel opens on its newest steps; "earlier steps" builds the rest in
+    /// place above them; steps arriving later are added.
+    pub(crate) fn a_long_sub_agent_opens_on_its_newest_steps() {
+        use agent_core::adapter::Driver;
+        use agent_core::event::{Envelope, ItemKind};
+        let model = Rc::new(RefCell::new(Transcript::new()));
+        let started = |id: &str, kind: ItemKind, parent: Option<&str>| {
+            model.borrow_mut().apply(
+                &Envelope::item_started(id, kind, format!("echo {id}"), None, parent),
+                Driver::Claude,
+            );
+        };
+        started("agent", ItemKind::Subagent, None);
+        for c in 0..100 {
+            started(&format!("c{c}"), ItemKind::Command, Some("agent"));
+        }
+        let panel = SubagentPanel::new("agent", Rc::new(|_| {}));
+        let (weak, shared) = (Rc::downgrade(&panel), model.clone());
+        panel.set_refresher(move || {
+            if let Some(panel) = weak.upgrade() {
+                panel.refresh(&shared.borrow(), None, &[]);
+            }
+        });
+        panel.refresh(&model.borrow(), None, &[]);
+        assert_eq!(panel.steps_shown(), CHILD_CAP);
+        assert!(panel.row_widget("c99").is_some() && panel.row_widget("c59").is_none());
+        started("c100", ItemKind::Command, Some("agent"));
+        panel.refresh(&model.borrow(), None, &[]);
+        assert!(panel.row_widget("c100").is_some(), "a new step is added");
+        let (count, button) = panel
+            .earlier
+            .borrow()
+            .get("agent")
+            .cloned()
+            .expect("button");
+        assert_eq!(count, 100 - CHILD_CAP);
+        assert_eq!(
+            button.label().as_deref(),
+            Some(format!("{count} earlier steps").as_str())
+        );
+        button.emit_clicked();
+        assert_eq!(panel.steps_shown(), 101, "every step, once asked");
+        let order: Vec<gtk4::Widget> = ["c0", "c1", "c60", "c100"]
+            .iter()
+            .filter_map(|id| panel.row_widget(id))
+            .collect();
+        assert_eq!(order.len(), 4);
+        let index = |w: &gtk4::Widget| {
+            let mut n = 0;
+            let mut at = panel.steps.first_child();
+            while let Some(c) = at {
+                if &c == w {
+                    return n;
+                }
+                n += 1;
+                at = c.next_sibling();
+            }
+            usize::MAX
+        };
+        assert!(
+            order.windows(2).all(|p| index(&p[0]) < index(&p[1])),
+            "in order"
+        );
+        assert!(panel.earlier.borrow().is_empty() && !button.is_ancestor(&panel.steps));
     }
 
     pub(crate) fn worker_group_updates_without_rebuilding_its_row() {

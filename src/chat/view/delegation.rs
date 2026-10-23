@@ -456,6 +456,12 @@ impl Inspector {
             }
         });
         let panel = SubagentPanel::new(worker, sink);
+        let weak = Rc::downgrade(inner);
+        panel.set_refresher(move || {
+            if let Some(inner) = weak.upgrade() {
+                inner.refresh_worker_inspector();
+            }
+        });
         let history = gtk4::DropDown::from_strings(&[]);
         history.set_tooltip_text(Some("Worker run and process history"));
         let state = gtk4::Label::new(None);
