@@ -115,6 +115,7 @@ fn plant_unspawned(
             text: text.into(),
             stored,
         }],
+        news: Vec::new(),
     });
 }
 

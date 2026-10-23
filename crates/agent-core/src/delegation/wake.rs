@@ -10,7 +10,9 @@
 //! message presented to it) is never sent again. News that arrives close together is coalesced
 //! into one turn, within [`WAKE_BUDGET`]. Every text is redacted before it is cut, so a cut can
 //! never leave half a secret unmasked. A stopped or closed parent is never woken, and at most
-//! [`MAX_CONSECUTIVE_WAKES`] wakes run without the user speaking in between.
+//! [`MAX_CONSECUTIVE_WAKES`] wakes run without the user speaking in between. A parent in
+//! dangerous permissive mode is never woken either: its thread is told what waits, and the news
+//! goes with the user's next message or once the mode is left.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -86,11 +88,25 @@ pub struct Queue {
     presented: VecDeque<MessageId>,
     /// Items that gave way to [`MAX_PENDING`] since the last wake.
     dropped: usize,
+    /// Items queued since the parent's thread was last told of what waits ([`Self::announced`]).
+    fresh: usize,
+    /// Why the last offer was held, so a hold is logged once per reason rather than per retry.
+    held_for: Option<&'static str>,
+    /// Bumped by every [`Self::clear`]: news taken before it is never put back after it.
+    cleared: u64,
 }
 
 impl Queue {
     /// Queues `item` unless the parent was already shown it. False when it was.
     pub fn push(&mut self, item: Item) -> bool {
+        let queued = self.insert(item);
+        if queued {
+            self.fresh += 1;
+        }
+        queued
+    }
+
+    fn insert(&mut self, item: Item) -> bool {
         if self.was_shown(&item) || self.items.contains(&item) {
             return false;
         }
@@ -139,7 +155,7 @@ impl Queue {
         let newer = std::mem::take(&mut self.items);
         let older = std::mem::replace(&mut self.dropped, dropped);
         for item in items.into_iter().chain(newer) {
-            self.push(item);
+            self.insert(item);
         }
         self.dropped += older;
     }
@@ -148,6 +164,49 @@ impl Queue {
     pub fn clear(&mut self) {
         self.items.clear();
         self.dropped = 0;
+        self.fresh = 0;
+        self.held_for = None;
+        self.cleared = self.cleared.wrapping_add(1);
+    }
+
+    /// Which clearing the queue is at: taken items carry it, and are put back only with
+    /// [`Self::restore_taken`] while it holds.
+    pub fn generation(&self) -> u64 {
+        self.cleared
+    }
+
+    /// [`Self::restore`], unless the queue was cleared (the parent stopped or closed) since
+    /// the items were taken at `generation`: what a stop discarded stays discarded. True when
+    /// they were put back.
+    pub fn restore_taken(&mut self, generation: u64, items: Vec<Item>, dropped: usize) -> bool {
+        if generation != self.cleared {
+            return false;
+        }
+        self.restore(items, dropped);
+        true
+    }
+
+    /// How many of the waiting items arrived since the parent's thread was last told of them.
+    pub fn unannounced(&self) -> usize {
+        self.fresh.min(self.items.len())
+    }
+
+    /// The parent's thread was told of everything waiting now.
+    pub fn announced(&mut self) {
+        self.fresh = 0;
+    }
+
+    /// The waiting items reached the parent: what its thread was told and why it was held
+    /// start over.
+    pub fn delivered(&mut self) {
+        self.fresh = 0;
+        self.held_for = None;
+    }
+
+    /// The offer was held for `reason`. True when that differs from the last hold's reason, so
+    /// a hold repeated on every retry is noted once.
+    pub fn held(&mut self, reason: &'static str) -> bool {
+        self.held_for.replace(reason) != Some(reason)
     }
 
     fn was_shown(&self, item: &Item) -> bool {
@@ -159,7 +218,23 @@ impl Queue {
 
     fn prune(&mut self) {
         let items = std::mem::take(&mut self.items);
-        self.items = items.into_iter().filter(|i| !self.was_shown(i)).collect();
+        // The items not yet announced are the newest: pushes go to the back, restores ahead.
+        let first_fresh = items.len().saturating_sub(self.fresh);
+        let mut fresh = 0;
+        let kept: VecDeque<Item> = items
+            .into_iter()
+            .enumerate()
+            .filter(|(n, i)| {
+                let keep = !self.was_shown(i);
+                if keep && *n >= first_fresh {
+                    fresh += 1;
+                }
+                keep
+            })
+            .map(|(_, i)| i)
+            .collect();
+        self.items = kept;
+        self.fresh = fresh;
     }
 }
 
@@ -173,6 +248,9 @@ pub enum ParentState {
     /// A prompt cannot be sent now: a turn runs, a prompt is queued or in flight, an approval
     /// is open, a restart or rebind is under way, or the process is gone. Tried again later.
     Busy,
+    /// In dangerous permissive mode: no turn starts that the user did not ask for, so nothing
+    /// changes until the user sends a message or leaves the mode.
+    Unattended,
     /// Idle: a turn can start now (a suspended process is resumed for it).
     Idle,
 }
@@ -185,6 +263,10 @@ pub enum Decision {
     Drop,
     /// Keep it for the next opportunity.
     Hold,
+    /// Keep it for the user: tell the thread what waits (once per new item, with
+    /// [`held_for_user_notice`]), send it with the user's next message, and offer it again
+    /// only when the mode is left. Never retried on a timer.
+    HoldForUser,
     /// Start a turn with it.
     Wake,
     /// Post it as a notice only: [`MAX_CONSECUTIVE_WAKES`] ran without the user.
@@ -198,6 +280,7 @@ pub fn decide(state: ParentState, pending: usize, consecutive: u32) -> Decision 
         _ if pending == 0 => Decision::Nothing,
         ParentState::Closed | ParentState::Stopped => Decision::Drop,
         ParentState::Busy => Decision::Hold,
+        ParentState::Unattended => Decision::HoldForUser,
         ParentState::Idle if consecutive >= MAX_CONSECUTIVE_WAKES => Decision::NoticeOnly,
         ParentState::Idle => Decision::Wake,
     }
@@ -254,13 +337,11 @@ fn header(item: &Item) -> String {
 /// The text of one wake for `items` (and `dropped` older items that gave way), within
 /// `budget` bytes: each item's header, then its redacted text, sharing what the headers leave
 /// fairly (a short text leaves its unused share to the others). A cut text ends with a note
-/// pointing at `cross_agent_read`.
+/// pointing at `cross_agent_read`. When the headers alone would not fit, the oldest items give
+/// way and are counted with `dropped`, so the whole frame stays within `budget` for any budget
+/// that holds the footer and that count's line.
 pub fn frame(items: &[Item], dropped: usize, budget: usize) -> String {
     let headers: Vec<String> = items.iter().map(header).collect();
-    let texts: Vec<String> = items
-        .iter()
-        .map(|i| quote_marker(redact(&i.text).trim()))
-        .collect();
     let notes: Vec<String> = items
         .iter()
         .map(|i| {
@@ -270,17 +351,38 @@ pub fn frame(items: &[Item], dropped: usize, budget: usize) -> String {
             )
         })
         .collect();
-    let dropped_line = (dropped > 0).then(|| {
-        format!(
-            "{MARKER} {dropped} earlier sub-agent notification(s) did not fit; they are in your \
-             mailbox (cross_agent_read)."
-        )
-    });
-    // Fixed cost: headers, separators, the footer, the dropped line, and a cut note each.
-    let fixed = headers.iter().map(|h| h.len() + 2).sum::<usize>()
-        + notes.iter().map(String::len).sum::<usize>()
-        + FOOTER.len()
-        + dropped_line.as_ref().map_or(0, |l| l.len() + 2);
+    let dropped_line = |dropped: usize| {
+        (dropped > 0).then(|| {
+            format!(
+                "{MARKER} {dropped} earlier sub-agent notification(s) did not fit; they are in \
+                 your mailbox (cross_agent_read)."
+            )
+        })
+    };
+    // Fixed cost of each item: its header and separator, the line break before its text, and
+    // its cut note.
+    let cost: Vec<usize> = headers
+        .iter()
+        .zip(&notes)
+        .map(|(h, n)| h.len() + 2 + 1 + n.len())
+        .collect();
+    let fixed_from = |skip: usize| {
+        cost[skip..].iter().sum::<usize>()
+            + FOOTER.len()
+            + dropped_line(dropped + skip).map_or(0, |l| l.len() + 2)
+    };
+    // The whole frame stays within the budget: the oldest items give way until what is fixed
+    // fits, and are counted with those that already did not fit.
+    let mut skip = 0;
+    while skip < items.len() && fixed_from(skip) > budget {
+        skip += 1;
+    }
+    let fixed = fixed_from(skip);
+    let (items, headers, notes) = (&items[skip..], &headers[skip..], &notes[skip..]);
+    let texts: Vec<String> = items
+        .iter()
+        .map(|i| quote_marker(redact(&i.text).trim()))
+        .collect();
     let mut room = budget.saturating_sub(fixed);
     // Water-filling: the shortest texts first, each taking at most an even share of what is left.
     let mut order: Vec<usize> = (0..items.len()).collect();
@@ -292,12 +394,12 @@ pub fn frame(items: &[Item], dropped: usize, budget: usize) -> String {
         room -= allowed[i];
     }
     let mut out = Vec::with_capacity(items.len() + 2);
-    if let Some(line) = dropped_line {
+    if let Some(line) = dropped_line(dropped + skip) {
         out.push(line);
     }
-    for (i, h) in headers.into_iter().enumerate() {
+    for (i, h) in headers.iter().enumerate() {
         let (text, was_cut) = cut(&texts[i], allowed[i]);
-        let mut block = h;
+        let mut block = h.clone();
         if !text.is_empty() {
             block.push('\n');
             block.push_str(&text);
@@ -317,6 +419,22 @@ pub fn capped_notice(framed: &str) -> String {
         "{framed}\n\n{MARKER} Not sent to the agent: it was woken {MAX_CONSECUTIVE_WAKES} times \
          in a row without you. Send a message to let it continue."
     )
+}
+
+/// The notice posted when news waits for a parent in dangerous permissive mode
+/// ([`Decision::HoldForUser`]): `pending` items, none of them sent.
+pub fn held_for_user_notice(pending: usize) -> String {
+    format!(
+        "{MARKER} {pending} sub-agent update(s) waiting: not sent to the agent while it is in \
+         dangerous permissive mode. They go with your next message, or as soon as you leave the \
+         mode."
+    )
+}
+
+/// The user's own `prompt` carrying `framed` news held for it ([`Decision::HoldForUser`]): the
+/// news first, then a line saying where the user's message starts.
+pub fn with_user_prompt(framed: &str, prompt: &str) -> String {
+    format!("{framed}\n\n{MARKER} The user's message follows.\n\n{prompt}")
 }
 
 #[cfg(test)]
@@ -351,6 +469,78 @@ mod tests {
         assert_eq!(decide(Idle, 1, MAX_CONSECUTIVE_WAKES), Decision::NoticeOnly);
         // A busy parent past the cap still waits: the cap is judged when it can be woken.
         assert_eq!(decide(Busy, 1, MAX_CONSECUTIVE_WAKES), Decision::Hold);
+    }
+
+    /// Dangerous permissive mode never starts a turn: the news is kept for the user, whatever
+    /// the cap, and nothing waiting is still nothing.
+    #[test]
+    fn an_unattended_parent_holds_the_news_for_the_user() {
+        use ParentState::*;
+        assert_eq!(decide(Unattended, 1, 0), Decision::HoldForUser);
+        assert_eq!(
+            decide(Unattended, 3, MAX_CONSECUTIVE_WAKES),
+            Decision::HoldForUser
+        );
+        assert_eq!(decide(Unattended, 0, 0), Decision::Nothing);
+        assert_eq!(decide(Busy, 1, 0), Decision::Hold);
+        let notice = held_for_user_notice(2);
+        assert!(notice.starts_with("[agent-terminal] 2 sub-agent update(s) waiting"));
+        assert!(notice.contains("dangerous permissive mode"));
+        let sent = with_user_prompt("news", "carry on");
+        assert!(sent.starts_with("news\n\n[agent-terminal] The user's message follows."));
+        assert!(sent.ends_with("\n\ncarry on"));
+    }
+
+    /// Items taken before a clear (the parent was stopped or closed) are never put back after
+    /// it; taken after it, they are.
+    #[test]
+    fn a_clear_since_the_take_keeps_taken_items_discarded() {
+        let mut q = Queue::default();
+        q.push(item('a', Outcome::Completed, "r", Shown::Event(1)));
+        let generation = q.generation();
+        let (taken, dropped) = q.take();
+        q.clear();
+        assert!(!q.restore_taken(generation, taken, dropped));
+        assert_eq!(q.pending(), 0, "what the stop discarded stays discarded");
+
+        q.push(item('b', Outcome::Completed, "r", Shown::Event(2)));
+        let generation = q.generation();
+        let (taken, dropped) = q.take();
+        assert!(q.restore_taken(generation, taken, dropped));
+        assert_eq!(q.pending(), 1);
+    }
+
+    /// The thread is told of new items once: a restore, a take or a repeat offer does not make
+    /// them new again, a later push does, and a hold reason is noted only when it changes.
+    #[test]
+    fn new_items_are_announced_once_and_a_repeated_hold_is_noted_once() {
+        let mut q = Queue::default();
+        q.push(item('a', Outcome::Completed, "r", Shown::Event(1)));
+        q.push(item('b', Outcome::Completed, "r", Shown::Event(2)));
+        assert_eq!(q.unannounced(), 2);
+        q.announced();
+        let (taken, dropped) = q.take();
+        q.restore(taken, dropped);
+        assert_eq!(q.pending(), 2);
+        assert_eq!(q.unannounced(), 0, "put back is not new");
+        q.push(item('c', Outcome::Message, "m", Shown::Event(3)));
+        assert_eq!(q.unannounced(), 1);
+        // A page that showed the new one leaves nothing new to tell.
+        q.covered(&[worker('c')], 3);
+        assert_eq!(q.unannounced(), 0);
+
+        assert!(q.held("running turn"));
+        assert!(!q.held("running turn"));
+        assert!(q.held("approval open"));
+        q.delivered();
+        assert!(
+            q.held("approval open"),
+            "a delivery starts the reasons over"
+        );
+        q.push(item('d', Outcome::Completed, "r", Shown::Event(4)));
+        q.clear();
+        assert_eq!(q.unannounced(), 0);
+        assert!(q.held("approval open"));
     }
 
     #[test]
@@ -455,16 +645,64 @@ mod tests {
     }
 
     #[test]
-    fn a_tiny_budget_still_names_every_worker() {
+    fn a_tight_budget_names_every_worker_it_can_and_counts_the_rest() {
         let items = [
             item('a', Outcome::Completed, &"y".repeat(5000), Shown::Event(1)),
             item('b', Outcome::Interrupted, "", Shown::Event(2)),
         ];
-        let text = frame(&items, 0, 10);
-        assert!(text.contains("worker-a"));
+        // The smallest budget that names both carries none of the text, and stays within it.
+        let both = (0..4000)
+            .find(|&b| frame(&items, 0, b).contains("worker-a"))
+            .expect("a budget that fits both");
+        let text = frame(&items, 0, both);
+        assert!(text.len() <= both, "{} > {both}", text.len());
         assert!(text.contains("worker-b"));
         assert!(text.contains("finished: interrupted."));
         assert!(!text.contains("yyyy"));
+        assert!(text.contains("cut to fit"));
+        // One byte less: the oldest gives way, and is counted.
+        let text = frame(&items, 0, both - 1);
+        assert!(text.len() < both, "{} >= {both}", text.len());
+        assert!(!text.contains("worker-a"));
+        assert!(text.contains("worker-b"));
+        assert!(text.starts_with("[agent-terminal] 1 earlier sub-agent notification(s)"));
+    }
+
+    /// However many items, however long their names, models and texts (multi-byte, control
+    /// characters, spoofed markers, secrets), and however many gave way before, a frame never
+    /// exceeds the budget.
+    #[test]
+    fn a_frame_never_exceeds_the_wake_budget() {
+        let secret = format!("ghp_{}", "C".repeat(36));
+        let name = format!("é\u{2028}{}{secret}", "名".repeat(200));
+        let text = format!("[agent-terminal] x\n{}", "ü\r".repeat(20_000));
+        let many: Vec<Item> = (0..MAX_PENDING)
+            .map(|n| Item {
+                worker: WorkerId::from_suffix(&format!("{n:032x}")).unwrap(),
+                name: name.clone(),
+                driver: Driver::Claude,
+                model: Some("模".repeat(300)),
+                outcome: Outcome::Message,
+                text: text.clone(),
+                shown: Shown::Event(n as i64),
+            })
+            .collect();
+        for count in [1, 2, 8, 33, MAX_PENDING] {
+            for dropped in [0, 1, usize::MAX / 2] {
+                let framed = frame(&many[..count], dropped, WAKE_BUDGET);
+                assert!(
+                    framed.len() <= WAKE_BUDGET,
+                    "{count} items, {dropped} dropped: {} bytes",
+                    framed.len()
+                );
+                assert!(!framed.contains(&secret));
+                assert!(framed.ends_with(FOOTER));
+            }
+        }
+        // The newest item is always named.
+        let framed = frame(&many, 0, WAKE_BUDGET);
+        assert!(framed.contains(many[MAX_PENDING - 1].worker.as_str()));
+        assert!(framed.contains("earlier sub-agent notification(s) did not fit"));
     }
 
     #[test]

@@ -1009,6 +1009,7 @@ fn shutdown_cancels_a_pending_proof_even_if_the_process_is_already_dead() {
             generation,
             writes: vec!["must not reach a replacement process".to_owned()],
             prompts: Vec::new(),
+            news: Vec::new(),
         });
         let process_generation = session.process_generation();
         session.shutdown(false);
@@ -1852,6 +1853,630 @@ fn a_refused_wake_posts_no_notice_and_its_retry_posts_one() {
         assert!(pump_until(ctx, 10, || prompts().contains("news")));
         assert!(pump_until(ctx, 10, || !session.status().running_turn));
         assert_eq!(notices(), 1, "exactly one notice for the one wake");
+        session.shutdown(false);
+    });
+}
+
+/// The supervisor's held news, faked: what it gives, what was given back, and releases.
+#[derive(Default)]
+struct FakeNews {
+    text: Rc<RefCell<Option<String>>>,
+    taken: Cell<usize>,
+    given_back: Rc<Cell<usize>>,
+    released: Cell<usize>,
+}
+
+impl crate::chat::session::HeldNews for FakeNews {
+    fn take(&self) -> Option<crate::chat::session::TakenNews> {
+        let text = self.text.borrow_mut().take()?;
+        self.taken.set(self.taken.get() + 1);
+        let (slot, back) = (self.text.clone(), self.given_back.clone());
+        let kept = text.clone();
+        Some(crate::chat::session::TakenNews::new(
+            text,
+            Box::new(move || {
+                *slot.borrow_mut() = Some(kept);
+                back.set(back.get() + 1);
+            }),
+        ))
+    }
+
+    fn release(&self) {
+        self.released.set(self.released.get() + 1);
+    }
+}
+
+/// Dangerous permissive mode never starts a turn nobody asked for: news offered to an idle root
+/// in it is held for the user (no prompt, no notice from the session), however often it is
+/// offered. The user's next message carries it, shown as the app's notice; a message that is
+/// not sent gives it back and leaves no notice; a slash command never carries it; leaving the
+/// mode releases it, and an ordinary wake then starts.
+#[test]
+fn a_root_in_dangerous_permissive_mode_takes_news_only_with_the_users_message() {
+    use crate::chat::session::WakeOutcome;
+    in_loop(|ctx| {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let thread = fresh(&store, &dir.path().to_string_lossy());
+        let (sink, seen) = make_sink();
+        let hooks = Rc::new(TestHooks::default());
+        let session = ChatSession::with_options(
+            Box::new(agent_core::claude::ClaudeAdapter::new()),
+            super::idle_claude(dir.path()),
+            SessionStore::from(store),
+            thread,
+            sink,
+            Err(None),
+            minimal_env(dir.path()),
+            SessionOptions {
+                generation_base: ProcessGeneration(0),
+                hooks: Some(hooks.clone()),
+                child: None,
+            },
+        );
+        let prompts =
+            || std::fs::read_to_string(dir.path().join("prompts.log")).unwrap_or_default();
+        let notices = |needle: &str| {
+            seen.borrow()
+                .iter()
+                .filter(|e| matches!(&e.event, Event::Notice { text } if text.contains(needle)))
+                .count()
+        };
+        let idle = |s: &ChatSession| s.status().alive && !s.status().running_turn;
+        assert!(pump_until(ctx, 10, || has(&seen, |e| matches!(
+            e,
+            Event::TurnCompleted { .. }
+        )) && idle(&session)));
+
+        session.confirm_mode(Mode::Bypass);
+        assert_eq!(session.status().mode, Mode::Bypass);
+        for _ in 0..3 {
+            assert_eq!(session.wake_with("news held"), WakeOutcome::HeldForUser);
+        }
+        assert!(!session.status().running_turn);
+        assert!(!session.inner.prompt_in_flight.get());
+        assert_eq!(session.inner.auto_wakes.get(), 0);
+        assert_eq!(
+            notices("news held"),
+            0,
+            "the supervisor tells the thread, once"
+        );
+        assert!(!prompts().contains("news held"));
+
+        let news = Rc::new(FakeNews::default());
+        *news.text.borrow_mut() = Some("[agent-terminal] held news".into());
+        session.hold_news_for_user(news.clone());
+
+        // A slash command never carries it.
+        session.send_prompt("/hello");
+        assert_eq!(news.taken.get(), 0);
+        assert!(pump_until(ctx, 10, || idle(&session)));
+
+        // A message whose send is refused gives it back and leaves no notice.
+        hooks
+            .hold_after_check
+            .set(Some(hooks.prompt_checks.get() + 1));
+        session.send_prompt("first try");
+        assert_eq!(news.taken.get(), 1);
+        assert_eq!(news.given_back.get(), 1);
+        assert_eq!(notices("held news"), 0);
+        assert!(!prompts().contains("held news"));
+
+        // Sent from the queue once the send is allowed: it carries the news, and the thread
+        // shows the news as the app's notice, not as the user's message.
+        hooks.hold_after_check.set(None);
+        session.inner.dispatch_queued_prompt();
+        assert!(pump_until(ctx, 10, || prompts().contains("first try")));
+        let sent = prompts();
+        assert!(sent.contains("held news"), "{sent}");
+        assert!(sent.contains("The user's message follows."), "{sent}");
+        assert_eq!(news.taken.get(), 2);
+        assert_eq!(notices("held news"), 1);
+        assert!(!has(&seen, |e| matches!(
+            e,
+            Event::ContentSnapshot { text, .. } if text.contains("held news")
+        )));
+        assert!(pump_until(ctx, 10, || idle(&session)));
+
+        // Nothing waits now: the next message goes alone.
+        session.send_prompt("second");
+        assert!(pump_until(ctx, 10, || prompts().contains("second")));
+        assert_eq!(news.taken.get(), 2);
+        assert!(pump_until(ctx, 10, || idle(&session)));
+
+        // Leaving the mode releases the news to an ordinary wake.
+        session.confirm_mode(Mode::Ask);
+        assert_eq!(news.released.get(), 1);
+        assert_eq!(session.wake_with("news after"), WakeOutcome::Started);
+        assert!(pump_until(ctx, 10, || prompts().contains("news after")));
+        session.shutdown(false);
+    });
+}
+
+/// Held news riding on a message written into a start still waiting on its launch check is
+/// not spent there: the launch is refused, the news is given back once and no notice is left;
+/// the message's resend, once the agent starts, carries it and posts its notice once.
+#[test]
+fn held_news_in_a_refused_launch_is_given_back_once_and_goes_with_the_resend() {
+    in_loop(|ctx| {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let thread = fresh(&store, &tmp.path().to_string_lossy());
+        let (sink, seen) = make_sink();
+        let hooks = Rc::new(TestHooks::default());
+        hooks.refuse_spawn.set(true);
+        let session = ChatSession::with_options(
+            Box::new(AgyAdapter::new("agy")),
+            scripted(tmp.path(), "cat > \"$D/stdin.log\""),
+            SessionStore::from(store),
+            thread,
+            sink,
+            Err(None),
+            LaunchEnv::default(),
+            SessionOptions {
+                generation_base: ProcessGeneration(0),
+                hooks: Some(hooks.clone()),
+                child: None,
+            },
+        );
+        let notices = || {
+            seen.borrow()
+                .iter()
+                .filter(
+                    |e| matches!(&e.event, Event::Notice { text } if text.contains("held news")),
+                )
+                .count()
+        };
+        session.confirm_mode(Mode::Bypass);
+        let news = Rc::new(FakeNews::default());
+        *news.text.borrow_mut() = Some("[agent-terminal] held news".into());
+        session.hold_news_for_user(news.clone());
+
+        session.send_prompt("the kept message");
+        assert_eq!(news.taken.get(), 1);
+        assert_eq!(news.given_back.get(), 0, "held with the start's writes");
+        assert_eq!(
+            notices(),
+            0,
+            "not posted before the write reaches a process"
+        );
+        assert!(pump_until(ctx, 10, || !session.status().alive));
+        assert_eq!(
+            news.given_back.get(),
+            1,
+            "given back when the launch is refused"
+        );
+        assert_eq!(notices(), 0, "and no notice is left behind");
+
+        hooks.refuse_spawn.set(false);
+        session.send_prompt("the next message");
+        let written = || std::fs::read_to_string(tmp.path().join("stdin.log")).unwrap_or_default();
+        assert!(pump_until(ctx, 10, || written().contains("the kept message")));
+        assert!(pump_until(ctx, 10, || notices() == 1));
+        let stdin = written();
+        assert_eq!(stdin.matches("held news").count(), 1, "{stdin:?}");
+        assert_eq!(news.taken.get(), 2);
+        assert_eq!(news.given_back.get(), 1, "given back exactly once");
+        session.shutdown(false);
+    });
+}
+
+/// Codex holds a prompt in its own queue until its thread has started or resumed, and drops it
+/// if that fails: held news is never attached to a prompt sent before then (it stays held, no
+/// notice), and is once the thread is up.
+#[test]
+fn held_news_waits_until_the_codex_thread_is_up() {
+    in_loop(|ctx| {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let thread = fresh(&store, &dir.path().to_string_lossy());
+        let (sink, seen) = make_sink();
+        let session = ChatSession::with_env(
+            Box::new(CodexAdapter::new()),
+            scripted_codex(dir.path(), Mode::Ask, None),
+            store,
+            thread,
+            sink,
+            Err(None),
+            minimal_env(dir.path()),
+        );
+        let started = || has(&seen, |e| matches!(e, Event::SessionStarted { .. }));
+        assert!(!started(), "the thread answers only once the loop runs");
+        session.confirm_mode(Mode::Bypass);
+        let news = Rc::new(FakeNews::default());
+        *news.text.borrow_mut() = Some("[agent-terminal] held news".into());
+        session.hold_news_for_user(news.clone());
+
+        session.send_prompt("before the thread is up");
+        assert_eq!(news.taken.get(), 0, "never into the adapter's own queue");
+        assert!(!has(&seen, |e| matches!(
+            e,
+            Event::Notice { text } if text.contains("held news")
+        )));
+
+        assert!(pump_until(ctx, 10, started));
+        let taken = session.inner.news_for_prompt("now", false);
+        assert!(taken.is_some(), "attached once the thread is up");
+        assert_eq!(news.taken.get(), 1);
+        drop(taken);
+        assert_eq!(news.given_back.get(), 1, "an unsent take is given back");
+        session.shutdown(false);
+    });
+}
+
+/// Readiness belongs to the process that reported it: once a ready Codex root's process is
+/// gone, the next message restarts it and waits in the adapter's queue for the resume, so it
+/// carries no news (not taken, no notice: a failed resume could only drop it). The news goes,
+/// once, with a message sent after the replacement is up.
+#[test]
+fn held_news_never_rides_on_a_message_that_restarts_a_gone_codex_process() {
+    in_loop(|ctx| {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let thread = fresh(&store, &dir.path().to_string_lossy());
+        let (sink, seen) = make_sink();
+        let session = ChatSession::with_env(
+            Box::new(CodexAdapter::new()),
+            scripted_codex(dir.path(), Mode::Ask, None),
+            store,
+            thread,
+            sink,
+            Err(None),
+            minimal_env(dir.path()),
+        );
+        let starts = || {
+            seen.borrow()
+                .iter()
+                .filter(|e| matches!(e.event, Event::SessionStarted { .. }))
+                .count()
+        };
+        let notices = || {
+            seen.borrow()
+                .iter()
+                .filter(
+                    |e| matches!(&e.event, Event::Notice { text } if text.contains("held news")),
+                )
+                .count()
+        };
+        let idle = |s: &ChatSession| s.status().alive && !s.status().running_turn;
+        assert!(pump_until(ctx, 10, || starts() == 1 && idle(&session)));
+        session.confirm_mode(Mode::Bypass);
+        let news = Rc::new(FakeNews::default());
+        *news.text.borrow_mut() = Some("[agent-terminal] held news".into());
+        session.hold_news_for_user(news.clone());
+
+        // The process goes; its readiness goes with it.
+        session.inner.stop_current();
+        assert!(!session.status().alive);
+        session.send_prompt("after the exit\nsuccess");
+        assert_eq!(
+            news.taken.get(),
+            0,
+            "never framed into the restart's queued prompt"
+        );
+        assert_eq!(notices(), 0);
+        assert_eq!(news.given_back.get(), 0);
+
+        assert!(pump_until(ctx, 10, || starts() == 2 && idle(&session)));
+        session.send_prompt("once it is up\nsuccess");
+        assert_eq!(news.taken.get(), 1);
+        assert!(pump_until(ctx, 10, || idle(&session)));
+        assert_eq!(notices(), 1, "delivered once");
+        let frames = std::fs::read_to_string(dir.path().join("frames.ndjson")).unwrap_or_default();
+        assert_eq!(frames.matches("held news").count(), 1, "{frames}");
+        assert_eq!(news.given_back.get(), 0);
+        session.shutdown(false);
+    });
+}
+
+/// A ready root whose stdin closed while its process stays alive takes no news: a line written
+/// to it would be dropped, so the news is neither taken nor spent, and no notice is posted.
+#[test]
+fn held_news_is_never_taken_by_a_process_whose_stdin_failed() {
+    in_loop(|ctx| {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let thread = fresh(&store, &dir.path().to_string_lossy());
+        let (sink, seen) = make_sink();
+        let session = ChatSession::with_env(
+            Box::new(agent_core::claude::ClaudeAdapter::new()),
+            scripted(
+                dir.path(),
+                "IFS= read -r handshake\n\
+                 echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\",\"model\":\"m\",\"claude_code_version\":\"2.1.293\"}'\n\
+                 echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'\n\
+                 exec 0<&-\n\
+                 sleep 30",
+            ),
+            store,
+            thread,
+            sink,
+            Err(None),
+            minimal_env(dir.path()),
+        );
+        let writable = |s: &ChatSession| {
+            s.inner
+                .proc
+                .borrow()
+                .as_ref()
+                .is_some_and(|p| p.can_write())
+        };
+        assert!(pump_until(ctx, 10, || has(&seen, |e| matches!(
+            e,
+            Event::TurnCompleted { .. }
+        )) && session.status().alive
+            && !session.status().running_turn));
+        // A write fails once the agent closed its stdin; the process stays alive.
+        session.send_prompt("into a closed pipe");
+        assert!(pump_until(ctx, 10, || !writable(&session)));
+        assert!(session
+            .inner
+            .proc
+            .borrow()
+            .as_ref()
+            .is_some_and(|p| p.is_alive()));
+
+        session.confirm_mode(Mode::Bypass);
+        let news = Rc::new(FakeNews::default());
+        *news.text.borrow_mut() = Some("[agent-terminal] held news".into());
+        session.hold_news_for_user(news.clone());
+        assert!(session.inner.news_for_prompt("now", false).is_none());
+        session.inner.state.borrow_mut().running_turn = false;
+        session.inner.prompt_in_flight.set(false);
+        session.send_prompt("dropped too");
+        assert_eq!(news.taken.get(), 0, "never taken");
+        assert_eq!(news.given_back.get(), 0);
+        assert!(!has(&seen, |e| matches!(
+            e,
+            Event::Notice { text } if text.contains("held news")
+        )));
+
+        // Leaving the mode releases the news to a wake, which this process cannot take: it
+        // stays with the supervisor (busy, offered again), with no notice.
+        session.inner.state.borrow_mut().running_turn = false;
+        session.inner.prompt_in_flight.set(false);
+        session.confirm_mode(Mode::Ask);
+        assert_eq!(news.released.get(), 1);
+        assert_eq!(
+            session.wake_with("released news"),
+            crate::chat::session::WakeOutcome::Busy
+        );
+        assert_eq!(session.wake_blocker(), Some("the agent's input failed"));
+        assert!(!has(&seen, |e| matches!(
+            e,
+            Event::Notice { text } if text.contains("released news")
+        )));
+        assert_eq!(session.inner.auto_wakes.get(), 0);
+        session.shutdown(false);
+    });
+}
+
+/// A Claude process that exited while its output still drains (a child of it holds stdout
+/// open) is not yet seen as gone by the session: a message then is dropped, and the held news
+/// riding on it is given back, never spent, with no notice. The next agent's process takes it,
+/// once.
+#[test]
+fn held_news_is_given_back_when_its_message_reaches_an_exited_process() {
+    in_loop(|ctx| {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let thread = fresh(&store, &dir.path().to_string_lossy());
+        let (sink, seen) = make_sink();
+        let session = ChatSession::with_env(
+            Box::new(agent_core::claude::ClaudeAdapter::new()),
+            scripted(
+                dir.path(),
+                "IFS= read -r handshake\n\
+                 echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\",\"model\":\"m\",\"claude_code_version\":\"2.1.293\"}'\n\
+                 echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'\n\
+                 if [ ! -e \"$D/launched\" ]; then touch \"$D/launched\"; sleep 4 & exit 0; fi\n\
+                 while IFS= read -r line; do printf '%s\\n' \"$line\" >> \"$D/prompts.log\"; \
+                 case \"$line\" in *'\"type\":\"user\"'*) \
+                 echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}';; esac; done",
+            ),
+            store,
+            thread,
+            sink,
+            Err(None),
+            minimal_env(dir.path()),
+        );
+        let prompts =
+            || std::fs::read_to_string(dir.path().join("prompts.log")).unwrap_or_default();
+        let notices = || {
+            seen.borrow()
+                .iter()
+                .filter(
+                    |e| matches!(&e.event, Event::Notice { text } if text.contains("held news")),
+                )
+                .count()
+        };
+        let exited = |s: &ChatSession| {
+            s.inner
+                .proc
+                .borrow()
+                .as_ref()
+                .is_some_and(|p| !p.is_alive())
+        };
+        // Exited, and still draining: the session has not closed it out.
+        assert!(pump_until(ctx, 10, || exited(&session)
+            && !session.status().running_turn));
+        assert!(session.status().alive, "the exit is not handled yet");
+
+        // A wake into it is dropped by the process: not started, no notice, nothing kept.
+        assert_eq!(
+            session.wake_blocker(),
+            None,
+            "nothing in the session stops it"
+        );
+        assert_eq!(
+            session.wake_with("woken into an exited process"),
+            crate::chat::session::WakeOutcome::Busy
+        );
+        assert!(!has(&seen, |e| matches!(
+            e,
+            Event::Notice { text } if text.contains("woken into an exited process")
+        )));
+        assert!(!session.status().running_turn);
+        assert!(!session.inner.prompt_in_flight.get());
+
+        session.confirm_mode(Mode::Bypass);
+        let news = Rc::new(FakeNews::default());
+        *news.text.borrow_mut() = Some("[agent-terminal] held news".into());
+        session.hold_news_for_user(news.clone());
+        session.send_prompt("into an exited process");
+        assert_eq!(news.taken.get(), 1, "taken for the message");
+        assert_eq!(news.given_back.get(), 1, "and given back, never spent");
+        assert_eq!(notices(), 0);
+
+        // The exit is handled; the next message starts the agent again and carries the news.
+        assert!(pump_until(ctx, 10, || !session.status().alive));
+        session.inner.state.borrow_mut().running_turn = false;
+        session.inner.prompt_in_flight.set(false);
+        session.send_prompt("once it runs again");
+        assert!(pump_until(ctx, 10, || prompts().contains("once it runs again")));
+        assert!(pump_until(ctx, 10, || notices() == 1));
+        assert_eq!(prompts().matches("held news").count(), 1, "{}", prompts());
+        assert_eq!(news.taken.get(), news.given_back.get() + 1, "spent once");
+        session.shutdown(false);
+    });
+}
+
+/// Claude refuses `--thinking-display` and exits before its `init`, its output still draining
+/// when a message is sent: that message's news goes back, and the restart without the flag
+/// replays the user's own text only. The news is delivered exactly once, later.
+#[test]
+fn the_thinking_retry_never_replays_news_that_was_given_back() {
+    in_loop(|ctx| {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let thread = fresh(&store, &dir.path().to_string_lossy());
+        let (sink, seen) = make_sink();
+        let open = scripted(
+            dir.path(),
+            "IFS= read -r handshake\n\
+             case \"$*\" in *--thinking-display*) \
+             echo \"error: unknown option '--thinking-display'\" >&2; sleep 4 & exit 1;; esac\n\
+             echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\",\"model\":\"m\",\"claude_code_version\":\"2.1.293\"}'\n\
+             echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'\n\
+             while IFS= read -r line; do printf '%s\\n' \"$line\" >> \"$D/prompts.log\"; \
+             case \"$line\" in *'\"type\":\"user\"'*) \
+             echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}';; esac; done",
+        );
+        // The probe said this binary takes the flag, so the first launch passes it.
+        crate::claude_probe::note_version(&open.program, "2.1.293 (Claude Code)");
+        let session = ChatSession::with_env(
+            Box::new(agent_core::claude::ClaudeAdapter::new()),
+            open,
+            store,
+            thread,
+            sink,
+            Err(None),
+            minimal_env(dir.path()),
+        );
+        let prompts =
+            || std::fs::read_to_string(dir.path().join("prompts.log")).unwrap_or_default();
+        let notices = || {
+            seen.borrow()
+                .iter()
+                .filter(
+                    |e| matches!(&e.event, Event::Notice { text } if text.contains("held news")),
+                )
+                .count()
+        };
+        let exited = |s: &ChatSession| {
+            s.inner
+                .proc
+                .borrow()
+                .as_ref()
+                .is_some_and(|p| !p.is_alive())
+        };
+        assert!(pump_until(ctx, 10, || exited(&session)));
+        assert!(
+            session.status().alive,
+            "the refusal's exit is not handled yet"
+        );
+
+        session.confirm_mode(Mode::Bypass);
+        let news = Rc::new(FakeNews::default());
+        *news.text.borrow_mut() = Some("[agent-terminal] held news".into());
+        session.hold_news_for_user(news.clone());
+        session.send_prompt("sent before init");
+        assert_eq!(news.taken.get(), 1);
+        assert_eq!(
+            news.given_back.get(),
+            1,
+            "the dropped message gives it back"
+        );
+
+        // The exit is handled: Claude restarts without the flag and replays the message.
+        assert!(pump_until(ctx, 10, || prompts().contains("sent before init")));
+        assert!(pump_until(ctx, 10, || session.status().alive
+            && !session.status().running_turn));
+        assert!(!prompts().contains("held news"), "{}", prompts());
+        assert_eq!(notices(), 0);
+
+        session.inner.prompt_in_flight.set(false);
+        session.send_prompt("later");
+        assert!(pump_until(ctx, 10, || prompts().contains("later")));
+        assert!(pump_until(ctx, 10, || notices() == 1));
+        assert_eq!(prompts().matches("held news").count(), 1, "{}", prompts());
+        session.shutdown(false);
+    });
+}
+
+/// A message the user writes while a turn runs (live input) carries held news like any other:
+/// framed ahead of it, shown as the app's notice, and taken from the supervisor.
+#[test]
+fn held_news_rides_on_a_live_message_written_mid_turn() {
+    in_loop(|ctx| {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let thread = fresh(&store, &dir.path().to_string_lossy());
+        let (sink, seen) = make_sink();
+        let hooks = Rc::new(TestHooks::default());
+        let session = ChatSession::with_options(
+            Box::new(agent_core::claude::ClaudeAdapter::new()),
+            super::idle_claude(dir.path()),
+            SessionStore::from(store),
+            thread,
+            sink,
+            Err(None),
+            minimal_env(dir.path()),
+            SessionOptions {
+                generation_base: ProcessGeneration(0),
+                hooks: Some(hooks.clone()),
+                child: None,
+            },
+        );
+        let prompts =
+            || std::fs::read_to_string(dir.path().join("prompts.log")).unwrap_or_default();
+        assert!(pump_until(ctx, 10, || has(&seen, |e| matches!(
+            e,
+            Event::TurnCompleted { .. }
+        )) && session.status().alive
+            && !session.status().running_turn));
+        session.confirm_mode(Mode::Bypass);
+        session.send_prompt("start a turn");
+        assert!(session.status().running_turn);
+        let news = Rc::new(FakeNews::default());
+        *news.text.borrow_mut() = Some("[agent-terminal] held news".into());
+        session.hold_news_for_user(news.clone());
+
+        session.steer_prompt("and one more thing");
+        assert_eq!(news.taken.get(), 1);
+        assert_eq!(news.given_back.get(), 0);
+        assert!(pump_until(ctx, 10, || prompts().contains("and one more thing")));
+        let line = prompts()
+            .lines()
+            .find(|l| l.contains("and one more thing"))
+            .map(str::to_owned)
+            .unwrap_or_default();
+        assert!(line.contains("held news"), "{line}");
+        assert!(line.contains("The user's message follows."), "{line}");
+        assert!(has(&seen, |e| matches!(
+            e,
+            Event::Notice { text } if text == "[agent-terminal] held news"
+        )));
         session.shutdown(false);
     });
 }
