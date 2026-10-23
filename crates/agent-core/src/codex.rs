@@ -831,19 +831,7 @@ impl CodexAdapter {
         title: String,
         input: Option<Value>,
     ) {
-        if self.open_items.iter().any(|i| i == id) {
-            return;
-        }
-        self.open_items.push(id.to_owned());
-        out.push(
-            Envelope::new(Event::ItemStarted {
-                kind,
-                title,
-                input,
-                parent: None,
-            })
-            .item(id),
-        );
+        crate::adapter::start_open_item(&mut self.open_items, out, id, kind, title, input);
     }
 
     fn complete_item(
@@ -2723,29 +2711,22 @@ impl Adapter for CodexAdapter {
 
     fn feed(&mut self, line: &str) -> Vec<Envelope> {
         let line = line.trim();
-        if line.is_empty() {
-            return Vec::new();
-        }
-        let raw: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => return vec![unknown(Value::String(line.to_owned()))],
-        };
-        let id = raw.get("id").filter(|v| !v.is_null()).cloned();
-        let method = raw.get("method").and_then(Value::as_str).map(str::to_owned);
-        let params = raw.get("params").cloned().unwrap_or(Value::Null);
-        let mut out = Vec::new();
-        match (method, id) {
-            (Some(method), Some(id)) => {
-                self.on_server_request(&id, &method, &params, line, &mut out)
+        crate::adapter::map_json_frame(line, |raw| {
+            let id = raw.get("id").filter(|v| !v.is_null()).cloned();
+            let method = raw.get("method").and_then(Value::as_str).map(str::to_owned);
+            let params = raw.get("params").cloned().unwrap_or(Value::Null);
+            let mut out = Vec::new();
+            match (method, id) {
+                // The original frame text: an elicitation's property order is read from it.
+                (Some(method), Some(id)) => {
+                    self.on_server_request(&id, &method, &params, line, &mut out)
+                }
+                (Some(method), None) => self.on_notification(&method, &params, &mut out),
+                (None, Some(id)) => self.on_response(&id, raw, &mut out),
+                (None, None) => out.push(Envelope::new(Event::Unknown)),
             }
-            (Some(method), None) => self.on_notification(&method, &params, &mut out),
-            (None, Some(id)) => self.on_response(&id, &raw, &mut out),
-            (None, None) => out.push(Envelope::new(Event::Unknown)),
-        }
-        if let Some(first) = out.first_mut() {
-            first.raw = Some(raw);
-        }
-        out
+            out
+        })
     }
 
     fn feed_stderr(&mut self, _line: &str) -> Vec<Envelope> {
@@ -3354,10 +3335,6 @@ fn strings(v: &Value, key: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-fn unknown(raw: Value) -> Envelope {
-    Envelope::new(Event::Unknown).raw(raw)
 }
 
 #[cfg(test)]

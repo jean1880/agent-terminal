@@ -1293,18 +1293,8 @@ impl Adapter for ClaudeAdapter {
     }
 
     fn feed(&mut self, line: &str) -> Vec<Envelope> {
-        if line.trim().is_empty() {
-            return Vec::new();
-        }
-        let Ok(frame) = serde_json::from_str::<Value>(line) else {
-            return vec![Envelope::new(Event::Unknown).raw(Value::String(line.to_owned()))];
-        };
-        let mut out = self.map_frame(&frame);
-        // One copy of the frame per line, on the first envelope only.
-        if let Some(first) = out.first_mut() {
-            first.raw = Some(frame);
-        }
-        out
+        // The line as given, untrimmed, is what a malformed one keeps.
+        crate::adapter::map_json_frame(line, |frame| self.map_frame(frame))
     }
 
     fn drain_outbox(&mut self) -> Outbox {

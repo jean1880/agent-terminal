@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::caps::Capabilities;
-use crate::event::{Decision, Envelope};
+use crate::event::{Decision, Envelope, Event, ItemKind};
 
 /// Which agent CLI an adapter drives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -481,9 +481,81 @@ pub trait Adapter {
     }
 }
 
+/// One stdout line of a JSON-lines protocol as events: a blank line gives none, a line that is
+/// not JSON gives `Unknown` carrying the line as given, and a frame gives what `map` makes of it,
+/// with the parsed frame as `raw` on the first envelope only (one copy per line). A caller that
+/// trims its lines passes the trimmed line.
+pub(crate) fn map_json_frame(
+    line: &str,
+    map: impl FnOnce(&Value) -> Vec<Envelope>,
+) -> Vec<Envelope> {
+    if line.trim().is_empty() {
+        return Vec::new();
+    }
+    let Ok(frame) = serde_json::from_str::<Value>(line) else {
+        return vec![Envelope::new(Event::Unknown).raw(Value::String(line.to_owned()))];
+    };
+    let mut out = map(&frame);
+    if let Some(first) = out.first_mut() {
+        first.raw = Some(frame);
+    }
+    out
+}
+
+/// Opens item `id` unless it is already in `open_items`: records it there and emits its
+/// `ItemStarted` (no parent). For adapters whose items never nest.
+pub(crate) fn start_open_item(
+    open_items: &mut Vec<String>,
+    out: &mut Vec<Envelope>,
+    id: &str,
+    kind: ItemKind,
+    title: String,
+    input: Option<Value>,
+) {
+    if open_items.iter().any(|i| i == id) {
+        return;
+    }
+    open_items.push(id.to_owned());
+    out.push(
+        Envelope::new(Event::ItemStarted {
+            kind,
+            title,
+            input,
+            parent: None,
+        })
+        .item(id),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_frames_attach_raw_once_and_bad_lines_are_unknown() {
+        assert!(map_json_frame("  ", |_| unreachable!()).is_empty());
+        let bad = map_json_frame(" {nope", |_| unreachable!());
+        assert_eq!(bad.len(), 1);
+        assert_eq!(bad[0].event, Event::Unknown);
+        assert_eq!(bad[0].raw, Some(Value::String(" {nope".into())));
+        let two = map_json_frame(r#"{"a":1}"#, |_| {
+            vec![Envelope::new(Event::Unknown), Envelope::new(Event::Unknown)]
+        });
+        assert_eq!(two[0].raw, Some(serde_json::json!({"a": 1})));
+        assert_eq!(two[1].raw, None);
+    }
+
+    #[test]
+    fn an_open_item_starts_once() {
+        let (mut open, mut out) = (Vec::new(), Vec::new());
+        start_open_item(&mut open, &mut out, "i", ItemKind::Tool, "t".into(), None);
+        start_open_item(&mut open, &mut out, "i", ItemKind::Tool, "t".into(), None);
+        assert_eq!(open, vec!["i".to_owned()]);
+        assert_eq!(
+            out,
+            vec![Envelope::item_started("i", ItemKind::Tool, "t", None, None)]
+        );
+    }
 
     #[test]
     fn every_driver_is_listed_and_described_once() {

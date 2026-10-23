@@ -232,19 +232,7 @@ impl AgyAdapter {
         title: String,
         input: Option<Value>,
     ) {
-        if self.open_items.iter().any(|i| i == id) {
-            return;
-        }
-        self.open_items.push(id.to_owned());
-        out.push(
-            Envelope::new(Event::ItemStarted {
-                kind,
-                title,
-                input,
-                parent: None,
-            })
-            .item(id),
-        );
+        crate::adapter::start_open_item(&mut self.open_items, out, id, kind, title, input);
     }
 
     /// Opens a thinking item. agy hands over each thinking block whole (its transcript has it,
@@ -713,34 +701,26 @@ impl Adapter for AgyAdapter {
     }
 
     fn feed(&mut self, line: &str) -> Vec<Envelope> {
-        let line = line.trim();
-        if line.is_empty() {
-            return Vec::new();
-        }
-        let raw: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => return vec![unknown(Value::String(line.to_owned()))],
-        };
-        let Ok(frame) = serde_json::from_value::<Frame>(raw.clone()) else {
-            return vec![unknown(raw)];
-        };
-        let mut out = Vec::new();
-        match frame.event.as_str() {
-            "init" => self.on_init(&frame, &mut out),
-            "step_update" => match &frame.step_update {
-                Some(step) => self.on_step(step, &mut out),
-                None => out.push(env(Event::Unknown)),
-            },
-            "result" => match &frame.result {
-                Some(result) => self.on_result(result, &mut out),
-                None => out.push(env(Event::Unknown)),
-            },
-            _ => out.push(env(Event::Unknown)),
-        }
-        if let Some(first) = out.first_mut() {
-            first.raw = Some(raw);
-        }
-        out
+        crate::adapter::map_json_frame(line.trim(), |raw| {
+            // A frame that is JSON but not agy's shape is Unknown, keeping the parsed JSON.
+            let Ok(frame) = serde_json::from_value::<Frame>(raw.clone()) else {
+                return vec![env(Event::Unknown)];
+            };
+            let mut out = Vec::new();
+            match frame.event.as_str() {
+                "init" => self.on_init(&frame, &mut out),
+                "step_update" => match &frame.step_update {
+                    Some(step) => self.on_step(step, &mut out),
+                    None => out.push(env(Event::Unknown)),
+                },
+                "result" => match &frame.result {
+                    Some(result) => self.on_result(result, &mut out),
+                    None => out.push(env(Event::Unknown)),
+                },
+                _ => out.push(env(Event::Unknown)),
+            }
+            out
+        })
     }
 
     fn feed_stderr(&mut self, line: &str) -> Vec<Envelope> {
@@ -882,10 +862,6 @@ fn thinking_text(id: &str, text: &str) -> Envelope {
         text: text.to_owned(),
     })
     .item(id)
-}
-
-fn unknown(raw: Value) -> Envelope {
-    Envelope::new(Event::Unknown).raw(raw)
 }
 
 fn tool_kind(name: &str) -> ItemKind {
