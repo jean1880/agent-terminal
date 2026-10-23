@@ -2382,10 +2382,17 @@ fn cached_agy_hook_target(
     let config = config.borrow();
     let profile = agent_profile_or_new(&config, Driver::Agy);
     let resolved = cached_agent(&profile)?;
-    Some(crate::hook_config::HookTarget::new(
-        &agent_env(resolved.env, &config.clear_env),
-        cwd,
-    ))
+    Some(agy_target_from(resolved, &config.clear_env, cwd))
+}
+
+/// The hook sources an agy process resolved as `resolved` (with `clear` removed from its
+/// environment) reads in `cwd`. Says where to look; never a verdict.
+fn agy_target_from(
+    resolved: ResolvedAgent,
+    clear: &[String],
+    cwd: Option<std::path::PathBuf>,
+) -> crate::hook_config::HookTarget {
+    crate::hook_config::HookTarget::new(&agent_env(resolved.env, clear), cwd)
 }
 
 /// Whether a switch to agy in `cwd` would get its approval hook now, from the cached proof the
@@ -2407,7 +2414,7 @@ pub(super) async fn agy_hook_target(
         )
     };
     let resolved = resolve_agent(profile).await;
-    crate::hook_config::HookTarget::new(&agent_env(resolved.env, &clear), cwd)
+    agy_target_from(resolved, &clear, cwd)
 }
 
 /// Every active agy environment and every possible switch target, without retaining env values.
