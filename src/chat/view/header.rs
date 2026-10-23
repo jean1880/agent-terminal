@@ -7,7 +7,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use agent_core::adapter::{Driver, Mode};
 
-use super::cards::accent_class;
+use super::cards::{accent_class, label};
 use super::model::{format_tokens, Activity, Gauge};
 
 /// Hookless agy cannot enforce a new policy mid-turn without interrupting it.
@@ -33,12 +33,6 @@ pub fn confirm_mode_switch(parent: &impl IsA<gtk4::Widget>, then: impl Fn() + 's
         }
     });
     dialog.present(Some(parent));
-}
-
-fn label(text: &str, classes: &[&str]) -> gtk4::Label {
-    let l = super::cards::label(text, classes);
-    l.set_selectable(false);
-    l
 }
 
 /// Dropdown order of the modes. Driven by index both ways; the guard test keeps it complete.

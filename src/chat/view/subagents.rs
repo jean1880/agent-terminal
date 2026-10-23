@@ -168,7 +168,6 @@ impl ListRow {
         top.append(&status);
         b.append(&top);
         let task = label("", &["subagent-task", "dim-label"]);
-        task.set_xalign(0.0);
         task.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         // The list takes its rows' natural width: a long task must not widen it past this.
         task.set_max_width_chars(48);
@@ -459,11 +458,9 @@ impl SubagentPanel {
         body.set_margin_end(18);
 
         let title = label("", &["subagent-panel-title"]);
-        title.set_xalign(0.0);
         title.set_wrap(true);
         title.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
         let status = label("", &["dim-label"]);
-        status.set_xalign(0.0);
         let head = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
         let title_line = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
         let brand = gtk4::Image::new();
@@ -484,7 +481,6 @@ impl SubagentPanel {
         let steps = gtk4::Box::new(gtk4::Orientation::Vertical, 14);
         body.append(&steps);
         let empty = label("No steps yet.", &["dim-label"]);
-        empty.set_xalign(0.0);
         body.append(&empty);
         let (reported, reported_text) = section("Reported");
         body.append(&reported);

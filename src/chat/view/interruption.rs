@@ -48,13 +48,11 @@ impl InterruptionShelf {
         info.set_valign(gtk4::Align::Center);
 
         let title = label("", &["interruption-title"]);
-        title.set_xalign(0.0);
         title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
 
         // Always shown, even empty: a line that came and went would change the shelf's height
         // and move its buttons up and down between requests.
         let preview = label("", &["interruption-preview"]);
-        preview.set_xalign(0.0);
         preview.set_ellipsize(gtk4::pango::EllipsizeMode::End);
 
         info.append(&title);

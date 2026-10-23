@@ -111,18 +111,15 @@ impl Row {
         state.set_visible(false);
         top.append(&state);
         let name = label("", &["subagent-name"]);
-        name.set_xalign(0.0);
         name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         name.set_max_width_chars(20);
         top.append(&name);
         let task = label("", &["subagent-task", "dim-label"]);
-        task.set_xalign(0.0);
         task.set_hexpand(true);
         task.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         top.append(&task);
         b.append(&top);
         let now = label("", &["subagent-now"]);
-        now.set_xalign(0.0);
         now.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         b.append(&now);
         let row = gtk4::ListBoxRow::new();
