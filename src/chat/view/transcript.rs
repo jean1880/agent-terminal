@@ -42,9 +42,21 @@
 //! to a row the fill has not built yet builds the rest at once and scrolls once it is laid out.
 //! Measured on real threads of 42k–47k envelopes (release build), building the whole window
 //! was 70–80% of the 36–64 ms a thread open held the main thread.
+//!
+//! # Bounding a live session
+//!
+//! Every built row is re-wrapped on a width change, so what a resize costs follows the rows
+//! built, nested ones included. A card builds only its newest [`CHILD_CAP`] children, under a
+//! button that builds the rest; while following, the oldest top-level rows go once the window
+//! passes [`WINDOW`] or all rows pass [`ROW_BUDGET`]. Away from the bottom (a jump, a Tab, a
+//! scroll up), rows arriving once the budget is reached are not built: they wait as the window's
+//! tail, built a [`PAGE`] at a time when the user scrolls down to them, or at once when the view
+//! returns to the end. A jump to a row not built (an evicted card, a card's earlier step) builds
+//! what it needs first. A row holding focus is never evicted (it stays, pinned above the
+//! window), nor is a pending approval, question or form.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
@@ -52,7 +64,7 @@ use gtk4::glib;
 use gtk4::prelude::*;
 
 use super::cards::{Row, RowSink};
-use super::model::{Body, ItemId, Transcript};
+use super::model::{ApprovalState, Body, FormState, ItemId, QuestionState, Transcript};
 
 /// How long a live row keeps its entrance class: longer than its animation, so a row moved
 /// later (a trim, a reload) does not play it again.
@@ -77,6 +89,13 @@ pub const WINDOW: usize = 150;
 pub const PAGE: usize = 60;
 /// Top-level rows a reset builds before it returns: more than a tall window shows.
 pub const FIRST_PAINT: usize = 30;
+/// Rows the window keeps as widgets, nested ones included. A width change re-wraps every one of
+/// them, so a live session's resize grew with every sub-agent step it had built
+/// (`resize_tests::resize_cost_of_live_sessions`); this many is still several screens of the
+/// densest thread.
+pub const ROW_BUDGET: usize = 600;
+/// Children a card builds: its newest ones. A button above them builds the rest on request.
+pub const CHILD_CAP: usize = 40;
 /// Time after which a fill step stops starting new rows and yields to the next frame. Checked
 /// between top-level rows, so one large row (a sub-agent card and its children) can overrun it.
 const FILL_BUDGET: Duration = Duration::from_millis(6);
@@ -101,6 +120,22 @@ pub struct TranscriptView {
     rows: RefCell<HashMap<ItemId, Row>>,
     /// Index (into `Transcript::order`) of the first materialised top-level item.
     first: Cell<usize>,
+    /// Top-level items after the materialised ones, not built: rows arrived while the view was
+    /// away from the bottom with the window at its [`ROW_BUDGET`]. 0 while the window reaches
+    /// the end, which it always does while following.
+    tail: Cell<usize>,
+    /// A load of the next [`PAGE`] of the tail is queued (the user scrolled down to it).
+    newer_queued: Cell<bool>,
+    /// Per card building only its newest [`CHILD_CAP`] children: the index (into
+    /// `Item::children`) of its first built child, and the button that builds the rest.
+    earlier: RefCell<HashMap<ItemId, (usize, gtk4::Button)>>,
+    /// Cards whose earlier children the user asked for: not capped again while they are built.
+    uncapped: RefCell<HashSet<ItemId>>,
+    /// A top-level row the trim passed while it held keyboard focus: kept, first in the list,
+    /// though older than the window, until focus leaves it or the window grows back to it.
+    pinned: RefCell<Option<ItemId>>,
+    /// The view itself, for the handlers of the buttons it builds.
+    this: Weak<Self>,
     stick: Cell<bool>,
     /// Set while the view moves itself (see `move_to`).
     own_move: Cell<bool>,
@@ -223,13 +258,19 @@ impl TranscriptView {
         root.add_overlay(&empty);
         root.add_overlay(&jump);
 
-        let view = Rc::new(Self {
+        let view = Rc::new_cyclic(|this| Self {
             root,
             scroller,
             list,
             jump,
             rows: RefCell::new(HashMap::new()),
             first: Cell::new(0),
+            tail: Cell::new(0),
+            newer_queued: Cell::new(false),
+            earlier: RefCell::new(HashMap::new()),
+            uncapped: RefCell::new(HashSet::new()),
+            pinned: RefCell::new(None),
+            this: this.clone(),
             stick: Cell::new(true),
             own_move: Cell::new(false),
             last_value: Cell::new(0.0),
@@ -575,8 +616,13 @@ impl TranscriptView {
             if Self::user_moved_up(now, last) {
                 view.stick.set(false);
             } else if now.value > last.value && now.value + now.page >= now.upper - STICK_SLOP {
-                view.stick.set(true);
-                view.jump.set_visible(false);
+                if view.tail.get() > 0 {
+                    // The end of what is built, not of the thread: build on, follow later.
+                    view.queue_load_newer();
+                } else {
+                    view.stick.set(true);
+                    view.jump.set_visible(false);
+                }
             }
         });
         let weak = Rc::downgrade(self);
@@ -689,26 +735,113 @@ impl TranscriptView {
         self.anchor.set(None);
         self.restore_to.set(None);
         self.jump.set_visible(false);
+        if self.tail.get() > 0 {
+            self.build_tail();
+        }
         let adj = self.scroller.vadjustment();
         self.move_to(adj.upper() - adj.page_size());
+    }
+
+    /// Following again with rows not built at the end: builds them (then trims to the window),
+    /// or, when there are more than a window of them, starts over from the newest window as a
+    /// thread open does. Never the latter while focus is in the transcript, which it would take
+    /// away.
+    fn build_tail(&self) {
+        let Some(model) = self.model.borrow().upgrade() else {
+            return;
+        };
+        // Being reduced into right now: the next row added while following builds it.
+        if let Ok(model) = model.try_borrow() {
+            self.build_tail_of(&model);
+        };
+    }
+
+    fn build_tail_of(&self, model: &Transcript) {
+        if self.tail.get() > WINDOW && !self.focus_in_list() {
+            if let Some(this) = self.this.upgrade() {
+                this.reset(model);
+                return;
+            }
+        }
+        let order = model.order();
+        for id in &order[order.len() - self.tail.get()..] {
+            if let Some(w) = self.build_tree(model, id) {
+                self.list.append(&w);
+            }
+        }
+        self.tail.set(0);
+        self.trim(model);
+    }
+
+    /// Whether keyboard focus is on a row of the transcript.
+    fn focus_in_list(&self) -> bool {
+        self.list
+            .root()
+            .and_then(|r| r.focus())
+            .is_some_and(|f| f.is_ancestor(&self.list))
+    }
+
+    /// Builds the next [`PAGE`] rows of the tail on idle: the user scrolled down to the end of
+    /// what is built. Appended below the view, they move nothing on screen.
+    fn queue_load_newer(&self) {
+        if self.newer_queued.replace(true) {
+            return;
+        }
+        let weak = self.this.clone();
+        glib::idle_add_local_once(move || {
+            let Some(view) = weak.upgrade() else {
+                return;
+            };
+            view.newer_queued.set(false);
+            let Some(model) = view.model.borrow().upgrade() else {
+                return;
+            };
+            if let Ok(model) = model.try_borrow() {
+                view.load_newer(&model);
+            };
+        });
+    }
+
+    /// Materialises up to [`PAGE`] rows of the tail, below the built ones.
+    fn load_newer(&self, model: &Transcript) {
+        let tail = self.tail.get();
+        if tail == 0 {
+            return;
+        }
+        let order = model.order();
+        let start = order.len() - tail;
+        let end = (start + PAGE).min(order.len());
+        for id in &order[start..end] {
+            if let Some(w) = self.build_tree(model, id) {
+                self.list.append(&w);
+            }
+        }
+        self.tail.set(order.len() - end);
+        tracing::debug!(
+            tail = order.len() - end,
+            "chat transcript: loaded newer rows"
+        );
     }
 
     /// Scrolls the transcript to the row for `id`, or to the end if not found.
     pub fn scroll_to_card(&self, id: &str) {
         self.jump_to.take();
         self.reveal_after_jump.set(false);
-        // It may be in the part of the window still filling in. Built now, it has no position
-        // until the next layout: `settle` scrolls to it then, and nothing else (the fill's
-        // "keep my place" above all) moves the view meanwhile.
-        if !self.rows.borrow().contains_key(id)
-            && self.finish_fill()
-            && self.rows.borrow().contains_key(id)
-        {
-            self.stick.set(false);
-            self.anchor.set(None);
-            self.restore_to.set(None);
-            *self.jump_to.borrow_mut() = Some(id.to_owned());
-            return;
+        // It may be in the part of the window still filling in, outside the window, or a
+        // card's earlier step. Built now, it has no position until the next layout: `settle`
+        // scrolls to it then, and nothing else (the fill's "keep my place" above all) moves the
+        // view meanwhile.
+        if !self.rows.borrow().contains_key(id) {
+            if !(self.finish_fill() && self.rows.borrow().contains_key(id)) {
+                self.build_for(id);
+            }
+            if self.rows.borrow().contains_key(id) {
+                self.stick.set(false);
+                self.anchor.set(None);
+                self.restore_to.set(None);
+                *self.jump_to.borrow_mut() = Some(id.to_owned());
+                return;
+            }
         }
         if let Some(row) = self.rows.borrow().get(id) {
             if let Some(bounds) = row.widget().compute_bounds(&self.scroller) {
@@ -814,11 +947,7 @@ impl TranscriptView {
         }
         self.jump_to.take();
         self.reveal_after_jump.set(false);
-        for (_, row) in self.rows.borrow_mut().drain() {
-            if row.widget().parent().as_ref() == Some(self.list.upcast_ref()) {
-                self.list.remove(&row.widget());
-            }
-        }
+        self.clear_rows();
         let order = model.order();
         let first = order.len().saturating_sub(FIRST_PAINT);
         self.first.set(first);
@@ -865,24 +994,26 @@ impl TranscriptView {
     }
 
     /// Prepends older rows until the window is full or `budget` is spent, keeping the viewport
-    /// where it was. Whether the window is full.
+    /// where it was. Whether the window is full: [`WINDOW`] top-level rows, or [`ROW_BUDGET`]
+    /// rows in all.
     fn fill_step(&self, model: &Transcript, budget: Duration) -> bool {
         let order = model.order();
         // Recomputed each step: rows streamed in since the reset move the window's start.
-        let target = order.len().saturating_sub(WINDOW);
-        if self.first.get() <= target {
+        let target = (order.len() - self.tail.get()).saturating_sub(WINDOW);
+        let full =
+            |view: &Self| view.first.get() <= target || view.rows.borrow().len() >= ROW_BUDGET;
+        if full(self) {
             return true;
         }
         let started = Instant::now();
         self.hold_place();
-        while self.first.get() > target && started.elapsed() < budget {
+        let mut pin = self.pin_index(model);
+        while !full(self) && started.elapsed() < budget {
             let first = self.first.get() - 1;
-            if let Some(w) = self.build_tree(model, &order[first]) {
-                self.list.prepend(&w);
-            }
+            self.prepend_at(model, first, &mut pin);
             self.first.set(first);
         }
-        self.first.get() <= target
+        full(self)
     }
 
     /// Builds the rest of the window now, for a caller that needs one of its rows. Whether a
@@ -907,13 +1038,26 @@ impl TranscriptView {
         self.anchor.set(Some(adj.upper() - adj.value()));
     }
 
-    /// Builds a row and its nested children, registering every one.
+    /// Builds a row and its nested children, registering every one. A card builds only its
+    /// newest [`CHILD_CAP`] children, under a button that builds the rest.
     fn build_tree(&self, model: &Transcript, id: &str) -> Option<gtk4::Widget> {
         let item = model.get(id)?;
         let row = Row::build(item, &self.sink);
         let widget = row.widget();
         if let Some(children) = row.children_box() {
-            for child in &item.children {
+            let from = if self.uncapped.borrow().contains(id) {
+                0
+            } else {
+                item.children.len().saturating_sub(CHILD_CAP)
+            };
+            if from > 0 {
+                let button = self.earlier_button(id, from);
+                children.append(&button);
+                self.earlier
+                    .borrow_mut()
+                    .insert(id.to_owned(), (from, button));
+            }
+            for child in &item.children[from..] {
                 if let Some(w) = self.build_tree(model, child) {
                     children.append(&w);
                 }
@@ -925,9 +1069,354 @@ impl TranscriptView {
 
     fn unregister_tree(&self, model: &Transcript, id: &str) {
         self.rows.borrow_mut().remove(id);
+        self.earlier.borrow_mut().remove(id);
+        self.uncapped.borrow_mut().remove(id);
         if let Some(item) = model.get(id) {
             for child in &item.children {
                 self.unregister_tree(model, child);
+            }
+        }
+    }
+
+    /// Takes every row down (a reset, or a jump that starts the window over).
+    fn clear_rows(&self) {
+        for (_, row) in self.rows.borrow_mut().drain() {
+            if row.widget().parent().as_ref() == Some(self.list.upcast_ref()) {
+                self.list.remove(&row.widget());
+            }
+        }
+        self.earlier.borrow_mut().clear();
+        self.uncapped.borrow_mut().clear();
+        self.pinned.take();
+        self.tail.set(0);
+    }
+
+    /// The pinned row's index in the order and its widget.
+    fn pin_index(&self, model: &Transcript) -> Option<(usize, gtk4::Widget)> {
+        let id = self.pinned.borrow().clone()?;
+        let widget = self.rows.borrow().get(&id).map(Row::widget)?;
+        let at = model.order().iter().position(|o| *o == id)?;
+        Some((at, widget))
+    }
+
+    /// Builds the top-level row at `index`, just above the window: first in the list, or right
+    /// under the pinned row when that is older. Reaching the pinned row's own index takes it
+    /// back into the window, built as it is.
+    fn prepend_at(
+        &self,
+        model: &Transcript,
+        index: usize,
+        pin: &mut Option<(usize, gtk4::Widget)>,
+    ) {
+        match pin {
+            Some((at, _)) if *at == index => {
+                self.pinned.take();
+                *pin = None;
+            }
+            Some((at, under)) if *at < index => {
+                if let Some(w) = self.build_tree(model, &model.order()[index]) {
+                    self.list.insert_child_after(&w, Some(&*under));
+                }
+            }
+            _ => {
+                if let Some(w) = self.build_tree(model, &model.order()[index]) {
+                    self.list.prepend(&w);
+                }
+            }
+        }
+    }
+
+    /// The pinned row goes once focus has left it.
+    fn release_pin(&self, model: &Transcript) {
+        let Some(id) = self.pinned.borrow().clone() else {
+            return;
+        };
+        if self.holds_focus(&id) {
+            return;
+        }
+        self.pinned.take();
+        let widget = self.rows.borrow().get(&id).map(Row::widget);
+        if let Some(w) = widget {
+            self.list.remove(&w);
+        }
+        self.unregister_tree(model, &id);
+    }
+
+    /// The button above a card's built children that builds the `count` earlier ones.
+    fn earlier_button(&self, id: &str, count: usize) -> gtk4::Button {
+        let button = gtk4::Button::new();
+        button.add_css_class("flat");
+        button.add_css_class("earlier-steps");
+        button.set_halign(gtk4::Align::Start);
+        Self::set_earlier_count(&button, count);
+        let weak = self.this.clone();
+        let id = id.to_owned();
+        button.connect_clicked(move |_| {
+            if let Some(view) = weak.upgrade() {
+                view.show_earlier(&id);
+            }
+        });
+        button
+    }
+
+    fn set_earlier_count(button: &gtk4::Button, count: usize) {
+        let steps = if count == 1 { "step" } else { "steps" };
+        button.set_label(&format!("{count} earlier {steps}"));
+        button.set_tooltip_text(Some("Show the steps before these"));
+        button.update_property(&[gtk4::accessible::Property::Label(&format!(
+            "Show {count} earlier {steps}"
+        ))]);
+    }
+
+    /// The user asked for a card's earlier children: builds them all, and keeps focus on the
+    /// first of them (the button that had it goes).
+    fn show_earlier(&self, id: &str) {
+        let Some(model) = self.model.borrow().upgrade() else {
+            return;
+        };
+        let Ok(model) = model.try_borrow() else {
+            return;
+        };
+        self.uncapped.borrow_mut().insert(id.to_owned());
+        self.build_earlier(&model, id, 0);
+    }
+
+    /// Builds the children of card `id` from index `to` up to its first built one, in place
+    /// under its button, which then counts what is left (and goes when nothing is). The first
+    /// row built.
+    fn build_earlier(&self, model: &Transcript, id: &str, to: usize) -> Option<gtk4::Widget> {
+        let (from, button) = self
+            .earlier
+            .borrow()
+            .get(id)
+            .map(|(from, button)| (*from, button.clone()))?;
+        let item = model.get(id)?;
+        let children = self
+            .rows
+            .borrow()
+            .get(id)
+            .and_then(|r| r.children_box().cloned())?;
+        let from = from.min(item.children.len());
+        let mut after: gtk4::Widget = button.clone().upcast();
+        let mut first = None;
+        for child in &item.children[to.min(from)..from] {
+            if let Some(w) = self.build_tree(model, child) {
+                children.insert_child_after(&w, Some(&after));
+                after = w.clone();
+                first.get_or_insert(w);
+            }
+        }
+        if to == 0 {
+            if button.is_focus() {
+                if let Some(w) = &first {
+                    w.child_focus(gtk4::DirectionType::TabForward);
+                }
+            }
+            self.earlier.borrow_mut().remove(id);
+            children.remove(&button);
+        } else if let Some(entry) = self.earlier.borrow_mut().get_mut(id) {
+            entry.0 = to;
+            Self::set_earlier_count(&entry.1, to);
+        }
+        first
+    }
+
+    /// Keeps a capped card at its newest [`CHILD_CAP`] built children after one was added:
+    /// drops the oldest, unless dropping it would move what the user sees or it holds focus
+    /// or a pending request.
+    fn cap_children(&self, model: &Transcript, id: &str) {
+        if self.uncapped.borrow().contains(id) {
+            return;
+        }
+        let (Some(item), Some(children)) = (
+            model.get(id),
+            self.rows
+                .borrow()
+                .get(id)
+                .and_then(|r| r.children_box().cloned()),
+        ) else {
+            return;
+        };
+        let mut from = self.earlier.borrow().get(id).map_or(0, |(from, _)| *from);
+        while item.children.len().saturating_sub(from) > CHILD_CAP {
+            let oldest = &item.children[from];
+            let widget = self.rows.borrow().get(oldest).map(Row::widget);
+            if let Some(w) = &widget {
+                if self.moves_view(w) || self.protected(model, oldest) {
+                    break;
+                }
+                children.remove(w);
+            }
+            self.unregister_tree(model, oldest);
+            from += 1;
+        }
+        let mut earlier = self.earlier.borrow_mut();
+        match earlier.get_mut(id) {
+            Some(entry) => {
+                entry.0 = from;
+                Self::set_earlier_count(&entry.1, from);
+            }
+            None if from > 0 => {
+                let button = self.earlier_button(id, from);
+                children.prepend(&button);
+                earlier.insert(id.to_owned(), (from, button));
+            }
+            None => {}
+        }
+    }
+
+    /// Whether taking `widget` out would move what the user sees: the view is not following
+    /// and the row starts above the bottom of the visible area. A row not laid out (a collapsed
+    /// card's) moves nothing.
+    fn moves_view(&self, widget: &gtk4::Widget) -> bool {
+        if self.stick.get() || !widget.is_mapped() {
+            return false;
+        }
+        widget
+            .compute_bounds(&self.scroller)
+            .is_some_and(|b| f64::from(b.y()) < f64::from(self.scroller.height()))
+    }
+
+    /// Whether the row for `id` must stay built: it holds keyboard focus, or it (or a row inside
+    /// it) is an approval, question or form waiting on the user.
+    fn protected(&self, model: &Transcript, id: &str) -> bool {
+        self.holds_focus(id) || Self::waits_on_user(model, id)
+    }
+
+    /// Whether the row for `id`, or a widget in it, has keyboard focus.
+    fn holds_focus(&self, id: &str) -> bool {
+        let focus = self.list.root().and_then(|r| r.focus());
+        let row = self.rows.borrow().get(id).map(Row::widget);
+        matches!((focus, row), (Some(focus), Some(row)) if focus == row || focus.is_ancestor(&row))
+    }
+
+    /// Whether `id`, or an item inside it, is an approval, question or form waiting on the user.
+    fn waits_on_user(model: &Transcript, id: &str) -> bool {
+        fn pending(model: &Transcript, id: &str) -> bool {
+            let Some(item) = model.get(id) else {
+                return false;
+            };
+            let waiting = match &item.body {
+                Body::Approval(a) => a.state == ApprovalState::Pending,
+                Body::Question(q) => q.state == QuestionState::Pending,
+                Body::Form(f) => f.state == FormState::Pending,
+                _ => false,
+            };
+            waiting || item.children.iter().any(|c| pending(model, c))
+        }
+        pending(model, id)
+    }
+
+    /// Builds what a jump to `id` needs: its top-level row (and the window up to it), then each
+    /// card on the way down to it, from the child on the way to its first built one.
+    fn build_for(&self, id: &str) {
+        let Some(model) = self.model.borrow().upgrade() else {
+            return;
+        };
+        let Ok(model) = model.try_borrow() else {
+            return;
+        };
+        let mut chain = vec![id.to_owned()];
+        let mut item = model.get(id);
+        while let Some(parent) = item.and_then(|i| i.parent.clone()) {
+            item = model.get(&parent);
+            chain.push(parent);
+        }
+        chain.reverse();
+        if !self.rows.borrow().contains_key(&chain[0]) {
+            let Some(index) = model.order().iter().position(|o| *o == chain[0]) else {
+                return;
+            };
+            self.build_window_at(&model, index);
+        }
+        for pair in chain.windows(2) {
+            let (card, child) = (&pair[0], &pair[1]);
+            if self.rows.borrow().contains_key(child) {
+                continue;
+            }
+            let at = model
+                .get(card)
+                .and_then(|c| c.children.iter().position(|x| x == child));
+            match at {
+                Some(at) => {
+                    self.build_earlier(&model, card, at);
+                }
+                None => return,
+            }
+        }
+    }
+
+    /// Makes the top-level item at `index` (not built) part of the window: the rows between it
+    /// and the window are built when they are at most a window's worth, or focus is in the
+    /// transcript; otherwise the window starts over at it, the rows after it built up to a
+    /// window (the rest load as the user scrolls either way).
+    fn build_window_at(&self, model: &Transcript, index: usize) {
+        let order = model.order();
+        let first = self.first.get();
+        let end = order.len() - self.tail.get();
+        if index >= end && (index - end < WINDOW || self.focus_in_list()) {
+            for id in &order[end..=index] {
+                if let Some(w) = self.build_tree(model, id) {
+                    self.list.append(&w);
+                }
+            }
+            self.tail.set(order.len() - index - 1);
+            return;
+        }
+        if index < first && (first - index <= WINDOW || self.focus_in_list()) {
+            let mut pin = self.pin_index(model);
+            for at in (index..first).rev() {
+                self.prepend_at(model, at, &mut pin);
+            }
+            self.first.set(index);
+            return;
+        }
+        self.clear_rows();
+        let mut end = index;
+        while end < order.len()
+            && (end - index < FIRST_PAINT
+                || (end - index < WINDOW && self.rows.borrow().len() < ROW_BUDGET))
+        {
+            if let Some(w) = self.build_tree(model, &order[end]) {
+                self.list.append(&w);
+            }
+            end += 1;
+        }
+        self.first.set(index);
+        self.tail.set(order.len() - end);
+        self.jump.set_visible(self.tail.get() > 0);
+    }
+
+    /// After an item that was not built left the transcript, which side of the window it was
+    /// on is unknown: the window's bounds are read back from its first and last rows.
+    fn resync_bounds(&self, model: &Transcript) {
+        let order = model.order();
+        let id_of = |w: Option<gtk4::Widget>| {
+            let w = w?;
+            self.rows
+                .borrow()
+                .iter()
+                .find(|(_, row)| row.widget() == w)
+                .map(|(id, _)| id.clone())
+        };
+        let position = |id: Option<String>| id.and_then(|id| order.iter().position(|o| *o == id));
+        let pinned = self.pin_index(model).map(|(_, w)| w);
+        let first = self
+            .list
+            .first_child()
+            .filter(|w| Some(w) != pinned.as_ref())
+            .or_else(|| self.list.first_child().and_then(|w| w.next_sibling()));
+        match (
+            position(id_of(first)),
+            position(id_of(self.list.last_child())),
+        ) {
+            (Some(first), Some(last)) => {
+                self.first.set(first);
+                self.tail.set(order.len() - last - 1);
+            }
+            _ => {
+                self.first.set(order.len());
+                self.tail.set(0);
             }
         }
     }
@@ -951,7 +1440,11 @@ impl TranscriptView {
             .and_then(|p| siblings.get(p))
             .and_then(|p| self.rows.borrow().get(p).map(Row::widget))
             .filter(|w| w.parent().as_ref() == Some(container.upcast_ref()));
-        match before {
+        // First of what is built: under a card's "earlier steps" button, if it has one.
+        let button = container
+            .first_child()
+            .filter(|c| c.has_css_class("earlier-steps"));
+        match before.or(button) {
             Some(before) => container.insert_child_after(widget, Some(&before)),
             None => container.prepend(widget),
         }
@@ -973,11 +1466,35 @@ impl TranscriptView {
                     .get(parent)
                     .and_then(|r| r.children_box().cloned());
                 if let Some(children) = parent_box {
-                    if let Some(w) = self.build_tree(model, id) {
-                        let siblings = model.get(parent).map_or(&[][..], |p| &p.children[..]);
-                        self.place(&children, siblings, id, &w);
+                    let siblings = model.get(parent).map_or(&[][..], |p| &p.children[..]);
+                    let pos = if siblings.last().is_some_and(|s| s == id) {
+                        siblings.len() - 1
+                    } else {
+                        siblings
+                            .iter()
+                            .position(|s| s == id)
+                            .unwrap_or(siblings.len())
+                    };
+                    let from = self.earlier.borrow().get(parent).map(|(from, _)| *from);
+                    match from {
+                        // Among the children not built: one more for the button to count.
+                        Some(from) if pos < from => {
+                            if let Some(entry) = self.earlier.borrow_mut().get_mut(parent) {
+                                entry.0 = from + 1;
+                                Self::set_earlier_count(&entry.1, from + 1);
+                            }
+                        }
+                        _ => {
+                            if let Some(w) = self.build_tree(model, id) {
+                                self.place(&children, siblings, id, &w);
+                            }
+                            self.cap_children(model, parent);
+                        }
                     }
                     self.updated(model, parent);
+                    if self.stick.get() {
+                        self.trim(model);
+                    }
                 }
             }
             None => {
@@ -991,6 +1508,26 @@ impl TranscriptView {
                     // Above the materialised window: it appears when older rows load. The window
                     // still starts at the same item, now one further down.
                     self.first.set(self.first.get() + 1);
+                    return;
+                }
+                // After the materialised window (the tail), or past the budget while the view is
+                // away from the bottom: not built until the user comes back down to it.
+                let tail = self.tail.get();
+                let in_tail = if tail > 0 {
+                    pos + 1 + tail >= order.len()
+                } else {
+                    pos + 1 == order.len()
+                        && !self.stick.get()
+                        && self.rows.borrow().len() >= ROW_BUDGET
+                };
+                if in_tail {
+                    self.tail.set(tail + 1);
+                    if self.stick.get() {
+                        // Following, with a tail left from when the model was busy: build it.
+                        self.build_tail_of(model);
+                    } else {
+                        self.jump.set_visible(true);
+                    }
                     return;
                 }
                 if let Some(w) = self.build_tree(model, id) {
@@ -1045,10 +1582,19 @@ impl TranscriptView {
         }
     }
 
-    /// An item was removed from the transcript (e.g. popping a queued user message).
-    pub fn removed(&self, id: &str) {
-        if let Some(row) = self.rows.borrow_mut().remove(id) {
-            row.widget().unparent();
+    /// An item was removed from the transcript (e.g. popping a queued user message). A built
+    /// row leaves the window's bounds as they were; one that was not built was above or after
+    /// the window, which moves.
+    pub fn removed(&self, model: &Transcript, id: &str) {
+        let row = self.rows.borrow_mut().remove(id);
+        self.earlier.borrow_mut().remove(id);
+        self.uncapped.borrow_mut().remove(id);
+        if self.pinned.borrow().as_deref() == Some(id) {
+            self.pinned.take();
+        }
+        match row {
+            Some(row) => row.widget().unparent(),
+            None => self.resync_bounds(model),
         }
     }
 
@@ -1061,38 +1607,80 @@ impl TranscriptView {
         }
         let new_first = first.saturating_sub(PAGE);
         self.hold_place();
-        for id in model.order()[new_first..first].iter().rev() {
-            if let Some(w) = self.build_tree(model, id) {
-                self.list.prepend(&w);
-            }
+        let mut pin = self.pin_index(model);
+        for index in (new_first..first).rev() {
+            self.prepend_at(model, index, &mut pin);
         }
         self.first.set(new_first);
         tracing::debug!(first = new_first, "chat transcript: loaded older rows");
     }
 
-    /// Back at the bottom: drop rows beyond the window so memory stays bounded.
+    /// Back at the bottom: drop the oldest rows beyond the window, and beyond the
+    /// [`ROW_BUDGET`] counting nested ones, so memory and a resize's cost stay bounded. The
+    /// newest [`FIRST_PAINT`] rows stay whatever they hold, and so does a pending request (with
+    /// everything after it). A row holding focus stays too, pinned above the window.
     fn trim(&self, model: &Transcript) {
-        let order = model.order();
-        let keep_from = order.len().saturating_sub(WINDOW);
-        let first = self.first.get();
-        // Only trim once the excess is worth a relayout.
-        if keep_from <= first + PAGE {
+        if self.tail.get() > 0 {
             return;
         }
-        for id in &order[first..keep_from] {
-            let widget = self.rows.borrow().get(id).map(Row::widget);
+        self.release_pin(model);
+        let order = model.order();
+        let first = self.first.get();
+        // Only trim once the excess is worth a relayout.
+        let over_window = order.len().saturating_sub(first) > WINDOW + PAGE;
+        let over_budget = self.rows.borrow().len() > ROW_BUDGET;
+        if !over_window && !over_budget {
+            return;
+        }
+        let keep = order.len().saturating_sub(FIRST_PAINT);
+        let mut at = first;
+        while at < keep {
+            let needed = (over_window && order.len() - at > WINDOW)
+                || (over_budget && self.rows.borrow().len() > ROW_BUDGET - PAGE);
+            if !needed || Self::waits_on_user(model, &order[at]) {
+                break;
+            }
+            // Keeps focus where it is: the row stays, pinned above the window.
+            if self.holds_focus(&order[at]) {
+                if self.pinned.borrow().is_some() {
+                    break;
+                }
+                *self.pinned.borrow_mut() = Some(order[at].clone());
+                at += 1;
+                continue;
+            }
+            let widget = self.rows.borrow().get(&order[at]).map(Row::widget);
             if let Some(w) = widget {
                 self.list.remove(&w);
             }
-            self.unregister_tree(model, id);
+            self.unregister_tree(model, &order[at]);
+            at += 1;
         }
-        self.first.set(keep_from);
+        self.first.set(at);
     }
 
     /// Rows built as widgets, nested ones included (tests and measurements).
     #[cfg(test)]
     pub fn row_count(&self) -> usize {
         self.rows.borrow().len()
+    }
+
+    /// Top-level items after the built ones, not built (tests).
+    #[cfg(test)]
+    pub fn tail_len(&self) -> usize {
+        self.tail.get()
+    }
+
+    /// A card's "earlier steps" button and how many children it stands for (tests).
+    #[cfg(test)]
+    pub fn earlier_of(&self, id: &str) -> Option<(usize, gtk4::Button)> {
+        self.earlier.borrow().get(id).cloned()
+    }
+
+    /// Whether the jump-to-latest button shows (tests).
+    #[cfg(test)]
+    pub fn jump_shown(&self) -> bool {
+        self.jump.is_visible()
     }
 
     /// Top-level rows built as widgets.

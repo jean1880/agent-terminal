@@ -699,7 +699,7 @@ impl Inner {
                 }
                 Change::Removed(id) => {
                     self.dirty.borrow_mut().retain(|d| d != &id);
-                    self.transcript.removed(&id);
+                    self.transcript.removed(&self.model.borrow(), &id);
                 }
                 Change::Plan => self.plan.set(&self.model.borrow().plan),
                 Change::Gauge => self.header.set_gauge(self.model.borrow().gauge.as_ref()),
@@ -865,6 +865,12 @@ impl Inner {
             return;
         }
         let panel = subagents::SubagentPanel::new(id, self.row_sink.clone());
+        let weak = Rc::downgrade(self);
+        panel.set_refresher(move || {
+            if let Some(inner) = weak.upgrade() {
+                inner.refresh_subagents(&[]);
+            }
+        });
         {
             let model = self.model.borrow();
             let summary = model.subagents().into_iter().find(|a| a.id == id);
@@ -2909,8 +2915,143 @@ pub(crate) mod tests {
         window.destroy();
     }
 
+    /// Live appends keep the rows built (nested ones included) within the budget while following,
+    /// after a jump left the bottom, and after coming back; a jump to a step not built (evicted
+    /// with its card, or under a card's cap) builds it and lands on it; "earlier steps" builds
+    /// the rest of a card and keeps focus; a focused row is never evicted.
+    pub(crate) fn live_append_keeps_the_window_bounded() {
+        use agent_core::event::{ItemKind, ItemStatus};
+        use transcript::{CHILD_CAP, ROW_BUDGET};
+        let ctx = glib::MainContext::default();
+        let pump = || while ctx.iteration(false) {};
+        let view = ChatView::new(StubBackend::new(Driver::Claude));
+        let window = gtk4::Window::new();
+        window.set_default_size(700, 600);
+        window.set_child(Some(&view));
+        window.present();
+        let inner = view.inner().expect("view");
+        let t = &inner.transcript;
+        let step = |id: &str, parent: Option<&str>| {
+            view.apply(&Envelope::item_started(
+                id,
+                ItemKind::Command,
+                format!("echo {id}"),
+                None,
+                parent,
+            ));
+            view.apply(&Envelope::item_completed(
+                id,
+                ItemStatus::Completed,
+                Some("ok"),
+                None,
+            ));
+        };
+        let built = |id: &str| t.with_row(id, |_| ()).is_some();
+        // Twelve sub-agents of 100 steps each, with plain steps between them, all live.
+        for a in 0..12 {
+            let agent = format!("a{a}");
+            view.apply(&Envelope::item_started(
+                &agent,
+                ItemKind::Subagent,
+                "Agent",
+                None,
+                None,
+            ));
+            for c in 0..100 {
+                step(&format!("{agent}-c{c}"), Some(&agent));
+                assert!(t.row_count() <= ROW_BUDGET, "{} rows", t.row_count());
+            }
+            view.apply(&Envelope::item_completed(
+                &agent,
+                ItemStatus::Completed,
+                None,
+                None,
+            ));
+            for s in 0..20 {
+                step(&format!("{agent}-s{s}"), None);
+            }
+            pump();
+            assert!(t.row_count() <= ROW_BUDGET, "{} rows", t.row_count());
+        }
+        assert!(!built("a0"), "the oldest card went with the budget");
+        assert!(built("a11-c99") && built(&format!("a11-c{}", 100 - CHILD_CAP)));
+        assert!(
+            !built(&format!("a11-c{}", 99 - CHILD_CAP)),
+            "a card builds its newest"
+        );
+        let (count, _) = t.earlier_of("a11").expect("an earlier-steps button");
+        assert_eq!(count, 100 - CHILD_CAP);
+
+        // A jump leaves the bottom; what arrives meanwhile stays within the budget.
+        assert!(crate::testutil::pump_until(&ctx, 10, || {
+            t.row_bounds_in_viewport("a11-s19")
+                .is_some_and(|(b, _)| b.height() > 0.0)
+        }));
+        t.scroll_to_card("a11-s0");
+        for s in 0..300 {
+            step(&format!("late-{s}"), None);
+        }
+        pump();
+        assert!(t.row_count() <= ROW_BUDGET, "{} rows", t.row_count());
+        assert!(t.tail_len() > 0 && t.jump_shown(), "the rest waits below");
+        assert!(built("a11-s0"), "the view kept what it showed");
+        // Back to the end: the newest rows are built, and the window is bounded again.
+        view.scroll_to_end();
+        pump();
+        assert!(built("late-299") && t.tail_len() == 0);
+        assert!(t.row_count() <= ROW_BUDGET, "{} rows", t.row_count());
+
+        // A jump to a step of an evicted card builds it and lands on it.
+        assert!(!built("a0-c99"));
+        t.scroll_to_card("a0-c99");
+        assert!(built("a0-c99"), "the jump built what it needs");
+        let landed = || {
+            t.row_bounds_in_viewport("a0-c99")
+                .is_some_and(|(b, _)| (0.0..=160.0).contains(&b.y()))
+        };
+        assert!(
+            crate::testutil::pump_until(&ctx, 10, landed),
+            "the jump never showed the step: {}",
+            t.scroll_debug()
+        );
+        // A step under a built card's cap: built from it on, the button counting the rest.
+        assert!(!built("a0-c3"));
+        t.scroll_to_card("a0-c3");
+        assert!(built("a0-c3") && built("a0-c59"));
+        assert_eq!(t.earlier_of("a0").map(|(n, _)| n), Some(3));
+        // "3 earlier steps" builds the rest, and focus moves to the first of them.
+        let (_, button) = t.earlier_of("a0").expect("the button");
+        assert_eq!(button.label().as_deref(), Some("3 earlier steps"));
+        assert!(button.grab_focus());
+        button.emit_clicked();
+        assert!(built("a0-c0") && t.earlier_of("a0").is_none());
+        let focus = gtk4::prelude::RootExt::focus(&window).expect("focus stays in the window");
+        let first = t.with_row("a0-c0", |r| r.widget()).expect("built");
+        assert!(
+            focus.is_ancestor(&first),
+            "focus moved to the first earlier step"
+        );
+
+        // A focused row is never evicted, however much arrives while following.
+        view.scroll_to_end();
+        for s in 0..400 {
+            step(&format!("later-{s}"), None);
+        }
+        pump();
+        assert!(built("a0-c0"), "the focused row stays");
+        assert_eq!(
+            gtk4::prelude::RootExt::focus(&window).as_ref(),
+            Some(&focus),
+            "and keeps focus"
+        );
+        assert!(t.row_count() <= ROW_BUDGET, "{} rows", t.row_count());
+        assert!(!built("a1"), "the rows after it still go");
+        window.destroy();
+    }
+
     pub(crate) fn ui_checks() {
         replay_fills_the_window_in_steps();
+        live_append_keeps_the_window_bounded();
         all_subagent_cards_toggle_together();
         model_chip_follows_pending_acceptance_and_rejection();
         stale_replay_checks();
@@ -2935,6 +3076,7 @@ pub(crate) mod tests {
         live_rows_make_an_entrance_and_replayed_rows_do_not();
         subagent_shelf::tests::shelf_follows_running_subagents();
         subagents::tests::worker_group_updates_without_rebuilding_its_row();
+        subagents::tests::a_long_sub_agent_opens_on_its_newest_steps();
         subagents::tests::names_are_never_squeezed_into_a_column();
         delegation::tests::ui_checks();
         let backend = StubBackend::new(Driver::Claude);
