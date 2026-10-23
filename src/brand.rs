@@ -80,11 +80,6 @@ pub fn rgb_on_light(driver: Driver) -> (f64, f64, f64) {
         .unwrap_or((0.0, 0.0, 0.0))
 }
 
-fn hex((r, g, b): (f64, f64, f64)) -> String {
-    let byte = |c: f64| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
-    format!("#{:02x}{:02x}{:02x}", byte(r), byte(g), byte(b))
-}
-
 /// The stylesheet defining every agent's colour name: the accents themselves on a dark window,
 /// their [`rgb_on_light`] shades on a light one.
 pub fn css(dark: bool) -> String {
@@ -94,7 +89,8 @@ pub fn css(dark: bool) -> String {
             let value = if dark {
                 driver.info().accent_hex.to_owned()
             } else {
-                hex(rgb_on_light(driver))
+                let (r, g, b) = rgb_on_light(driver);
+                crate::palette::Rgb(r, g, b).hex()
             };
             format!("@define-color {} {value};\n", colour_name(driver))
         })
@@ -254,6 +250,10 @@ pub fn set_working(dots: &gtk4::Box, lead: Driver, also: &[Driver]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hex((r, g, b): (f64, f64, f64)) -> String {
+        crate::palette::Rgb(r, g, b).hex()
+    }
 
     #[test]
     fn every_agent_has_a_named_colour_from_agent_core() {

@@ -12,15 +12,14 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
-use agent_core::catalog::{parse_codex_models, CatalogModel};
-use agent_core::event::{Account, QuotaWindow};
+use agent_core::catalog::parse_codex_models;
 use agent_core::quota::{codex_account, codex_rate_limits, codex_signed_out};
 use gtk4::glib;
 use serde_json::{json, Value};
 use tracing::warn;
 
 use crate::agent_proc::{AgentEnv, AgentProcess, SpawnSpec};
-use crate::probe::{InFlight, ProbeTarget};
+use crate::probe::{InFlight, ProbeReading, ProbeTarget};
 
 const INIT_ID: u64 = 1;
 const MODELS_ID: u64 = 2;
@@ -32,16 +31,8 @@ const MODELS_TIMEOUT: Duration = Duration::from_secs(15);
 const ACCOUNT_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(50);
 
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct CodexProbe {
-    pub models: Vec<CatalogModel>,
-    pub account: Option<Account>,
-    pub windows: Vec<QuotaWindow>,
-    /// No one is signed in (`codex login` has not been run, or the login expired).
-    pub signed_out: bool,
-}
-
-pub type ProbeResult = Result<CodexProbe, &'static str>;
+/// What the probe read; `signed_out` when `codex login` has not been run, or the login expired.
+pub type ProbeResult = Result<ProbeReading, &'static str>;
 
 fn argv(program: &str) -> Vec<String> {
     vec![program.to_owned(), "app-server".to_owned()]
@@ -156,7 +147,7 @@ pub async fn probe_codex(program: &str, env: &AgentEnv) -> ProbeResult {
         }
     };
     let ok = |id: u64| replies.get(&id).and_then(|r| r.as_ref().ok());
-    Ok(CodexProbe {
+    Ok(ProbeReading {
         models: parse_codex_models(&models),
         account: ok(ACCOUNT_ID).and_then(codex_account),
         windows: ok(LIMITS_ID).map(codex_rate_limits).unwrap_or_default(),
@@ -176,44 +167,31 @@ pub fn probe_shared(program: &str, env: &AgentEnv, done: impl FnOnce(&ProbeResul
         program: program.to_owned(),
         env: env.clone(),
     };
-    if !IN_FLIGHT.with(|f| f.join(&target, done)) {
-        return;
-    }
-    glib::spawn_future_local(async move {
-        let mut next = Some(target);
-        while let Some(target) = next {
+    InFlight::request(
+        &IN_FLIGHT,
+        target,
+        |target| async move {
             let result = probe_codex(&target.program, &target.env).await;
             if let Err(why) = &result {
                 warn!(why, "codex probe failed");
             }
-            next = IN_FLIGHT.with(|f| f.finish(&result));
-        }
-    });
+            result
+        },
+        done,
+    );
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     use std::path::Path;
 
     use super::*;
-    use crate::testutil::{in_loop, pump_until};
+    use crate::probe::fixtures::{fake_script, run_to_end, serve_concurrently};
 
-    /// A stand-in for `codex` (never the real one). It appends every request line it receives to
-    /// `requests.log` beside it, and answers by id.
+    /// A stand-in for `codex` (never the real one). `$D` is the folder it is in: the answering
+    /// body appends every request line it receives to `requests.log` there, and answers by id.
     fn fake_codex(dir: &Path, body: &str) -> String {
-        let path = dir.join("fake-codex");
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o755)
-            .open(&path)
-            .unwrap();
-        f.write_all(format!("#!/bin/sh\nD=$(dirname \"$0\")\n{body}\n").as_bytes())
-            .unwrap();
-        path.display().to_string()
+        fake_script(dir, "fake-codex", &format!("D=$(dirname \"$0\")\n{body}"))
     }
 
     const MODELS: &str = r#"{"id":2,"result":{"data":[{"id":"a","model":"gpt-5-codex","displayName":"GPT-5 Codex","supportedReasoningEfforts":[{"reasoningEffort":"low"},{"reasoningEffort":"high"}],"defaultReasoningEffort":"low","hidden":false,"isDefault":true}],"nextCursor":null}}"#;
@@ -227,15 +205,8 @@ mod tests {
     }
 
     fn run_probe(program: String) -> ProbeResult {
-        in_loop(|ctx| {
-            let out = Rc::new(RefCell::new(None));
-            let o = out.clone();
-            glib::spawn_future_local(async move {
-                *o.borrow_mut() = Some(probe_codex(&program, &AgentEnv::default()).await);
-            });
-            assert!(pump_until(ctx, 20, || out.borrow().is_some()), "no result");
-            let r = out.borrow_mut().take().unwrap();
-            r
+        run_to_end(20, async move {
+            probe_codex(&program, &AgentEnv::default()).await
         })
     }
 
@@ -309,19 +280,9 @@ mod tests {
         let count = dir.path().join("launches");
         let body = format!("echo x >> '{}'\n{}", count.display(), answering());
         let program = fake_codex(dir.path(), &body);
-        let got = in_loop(|ctx| {
-            let got = Rc::new(Cell::new(0));
-            for _ in 0..3 {
-                let got = got.clone();
-                probe_shared(&program, &AgentEnv::default(), move |r| {
-                    assert!(r.is_ok());
-                    got.set(got.get() + 1);
-                });
-            }
-            assert!(pump_until(ctx, 20, || got.get() == 3), "callers not served");
-            got.get()
+        serve_concurrently(20, 3, |done| {
+            probe_shared(&program, &AgentEnv::default(), move |r| done(r.is_ok()));
         });
-        assert_eq!(got, 3);
         let launches = std::fs::read_to_string(count).unwrap();
         assert_eq!(launches.lines().count(), 1, "one process for three callers");
     }

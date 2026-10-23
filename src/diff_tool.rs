@@ -304,34 +304,10 @@ pub fn remove_own() {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
-    use std::process::Command;
+
+    use agent_kit::test_support;
 
     use super::*;
-
-    fn sh(dir: &Path, args: &[&str]) {
-        let out = Command::new("git")
-            .args([
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "-c",
-                "commit.gpgsign=false",
-            ])
-            .args([
-                "-c",
-                "core.hooksPath=/dev/null",
-                "-c",
-                "init.defaultBranch=main",
-            ])
-            .args(args)
-            .current_dir(dir)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .output()
-            .expect("git");
-        assert!(out.status.success(), "git {args:?}");
-    }
 
     /// A repo whose file has a space in its name, plus a tool that records its argv.
     struct Fixture {
@@ -342,16 +318,14 @@ mod tests {
     }
 
     fn fixture() -> Option<Fixture> {
-        if !agent_kit::git::git_installed() {
-            eprintln!("git not installed; skipping");
+        if !test_support::git_or_skip() {
             return None;
         }
         let repo = tempfile::tempdir().expect("repo");
-        sh(repo.path(), &["init", "-q"]);
-        std::fs::write(repo.path().join("my file.txt"), "before\n").expect("file");
-        std::fs::write(repo.path().join("-dash.txt"), "before\n").expect("dash");
-        sh(repo.path(), &["add", "."]);
-        sh(repo.path(), &["commit", "-q", "-m", "init"]);
+        test_support::init_repo_at(
+            repo.path(),
+            &[("my file.txt", b"before\n"), ("-dash.txt", b"before\n")],
+        );
         let run = tempfile::tempdir().expect("run");
         let log = run.path().join("argv.log");
         let recorder = run.path().join("recorder");
@@ -373,12 +347,7 @@ mod tests {
     }
 
     fn head(dir: &Path) -> String {
-        let out = Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(dir)
-            .output()
-            .expect("git");
-        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        test_support::git(dir, &["rev-parse", "HEAD"])
     }
 
     fn tool(argv: &[&str]) -> DiffTool {

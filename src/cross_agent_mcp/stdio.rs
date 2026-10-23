@@ -442,7 +442,10 @@ where
                                 "arguments",
                                 "not_an_object",
                             ));
-                        let mut result = serde_json::to_value(result).ok()?;
+                        let Ok(mut result) = serde_json::to_value(result) else {
+                            self.ended = true;
+                            return None;
+                        };
                         if value
                             .pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion")
                             .and_then(Value::as_str)
@@ -482,9 +485,14 @@ where
                 }
             };
             if let Some(id) = id.filter(|_| value.get("method").is_some()) {
-                let encoded = serde_json::to_string(&id).ok()?;
+                let Ok(encoded) = serde_json::to_string(&id) else {
+                    self.ended = true;
+                    return None;
+                };
                 let admitted = {
                     let Ok(mut pending) = self.pending.lock() else {
+                        // The pending set can no longer be trusted: stop taking requests.
+                        self.ended = true;
                         return None;
                     };
                     if pending.len() >= MAX_PENDING || pending.contains(&encoded) {
@@ -537,6 +545,32 @@ mod tests {
                 let second = Transport::<RoleServer>::receive(&mut transport).await;
                 (first.is_some(), second.is_some())
             })
+    }
+
+    #[test]
+    fn a_poisoned_pending_set_ends_the_transport() {
+        let (first, second) = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let (output, _peer) = tokio::io::duplex(4096);
+                let input = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n\
+                             {\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n";
+                let mut transport = BoundedTransport::with_io(input.as_bytes(), output);
+                let pending = transport.pending.clone();
+                let _ = std::thread::spawn(move || {
+                    let _held = pending.lock();
+                    panic!("poison the pending set");
+                })
+                .join();
+                let first = Transport::<RoleServer>::receive(&mut transport).await;
+                // A notification needs no pending entry, so only an ended transport refuses it.
+                let second = Transport::<RoleServer>::receive(&mut transport).await;
+                (first.is_some(), second.is_some())
+            });
+        assert_eq!((first, second), (false, false));
     }
 
     #[test]

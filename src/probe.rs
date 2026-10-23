@@ -1,9 +1,17 @@
 //! Small pieces the background probes share (Claude, Codex, agy): coalescing concurrent callers
-//! onto one process, and joining a fixed number of background tasks.
+//! onto one process, what a Claude or Codex probe reads, and joining a fixed number of
+//! background tasks.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::future::Future;
 use std::rc::Rc;
+use std::thread::LocalKey;
+
+use agent_core::adapter::Driver;
+use agent_core::catalog::CatalogModel;
+use agent_core::event::{Account, QuotaWindow};
+use gtk4::glib;
 
 use crate::agent_proc::AgentEnv;
 
@@ -108,6 +116,68 @@ impl<R> InFlight<R> {
     }
 }
 
+impl<R: 'static> InFlight<R> {
+    /// Runs `run` for `target`, or joins the probe of `target` already running or queued in
+    /// `flights` (one provider's own queue); `done` gets the result on the main loop. The first
+    /// caller's loop then runs every target queued meanwhile, in arrival order, one at a time.
+    pub fn request<F: Future<Output = R> + 'static>(
+        flights: &'static LocalKey<Self>,
+        target: ProbeTarget,
+        run: impl Fn(ProbeTarget) -> F + 'static,
+        done: impl FnOnce(&R) + 'static,
+    ) {
+        if !flights.with(|f| f.join(&target, done)) {
+            return;
+        }
+        glib::spawn_future_local(async move {
+            let mut next = Some(target);
+            while let Some(target) = next {
+                let result = run(target).await;
+                next = flights.with(|f| f.finish(&result));
+            }
+        });
+    }
+}
+
+/// What a Claude or Codex probe read: the models, the account, the plan windows, and whether
+/// no one is signed in.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ProbeReading {
+    pub models: Vec<CatalogModel>,
+    pub account: Option<Account>,
+    pub windows: Vec<QuotaWindow>,
+    /// No one is signed in (a fresh install, a login that was removed or expired).
+    pub signed_out: bool,
+}
+
+/// Runs Claude's or Codex's shared probe for `target` (the model catalogue and the usage
+/// indicator both read it, so one refresh costs one process) and hands `done` what it read.
+/// agy has no shared probe (its callers run their own command): it gets an `Err` at once.
+pub fn read_shared(
+    driver: Driver,
+    target: &ProbeTarget,
+    done: impl FnOnce(Result<&ProbeReading, &'static str>) + 'static,
+) {
+    match driver {
+        Driver::Claude => {
+            crate::claude_probe::probe_shared(&target.program, &target.env, move |result| {
+                done(
+                    result
+                        .as_ref()
+                        .map(|probe| &probe.reading)
+                        .map_err(|why| *why),
+                );
+            });
+        }
+        Driver::Codex => {
+            crate::codex_probe::probe_shared(&target.program, &target.env, move |result| {
+                done(result.as_ref().map_err(|why| *why));
+            });
+        }
+        Driver::Agy => done(Err("agy has no shared probe")),
+    }
+}
+
 /// Change listeners that can be disconnected: a view that goes away must not leave its
 /// callback behind in an app-wide object.
 #[derive(Default)]
@@ -155,6 +225,89 @@ pub fn join_n(n: u8, all_done: impl Fn() + 'static) -> Rc<dyn Fn()> {
             all_done();
         }
     })
+}
+
+/// Test plumbing for the Claude and Codex probes and their consumers.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::{Path, PathBuf};
+
+    use super::*;
+    use crate::testutil::{in_loop, pump_until};
+
+    /// Writes an executable `/bin/sh` script `name` in `dir` running `body`; returns its path.
+    pub(crate) fn fake_script(dir: &Path, name: &str, body: &str) -> String {
+        let path = dir.join(name);
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o755)
+            .open(&path)
+            .unwrap();
+        f.write_all(format!("#!/bin/sh\n{body}\n").as_bytes())
+            .unwrap();
+        path.display().to_string()
+    }
+
+    /// Runs `probe` on its own main context until it ends; fails after `secs`.
+    pub(crate) fn run_to_end<R: 'static>(secs: u64, probe: impl Future<Output = R> + 'static) -> R {
+        in_loop(|ctx| {
+            let out = Rc::new(RefCell::new(None));
+            let o = out.clone();
+            glib::spawn_future_local(async move {
+                *o.borrow_mut() = Some(probe.await);
+            });
+            assert!(
+                pump_until(ctx, secs, || out.borrow().is_some()),
+                "no result"
+            );
+            let r = out.borrow_mut().take().unwrap();
+            r
+        })
+    }
+
+    /// Starts `callers` probes at once through `start`, each handed a callback taking whether
+    /// its result was a success, and asserts all are served (successfully) within `secs`.
+    pub(crate) fn serve_concurrently(
+        secs: u64,
+        callers: u32,
+        start: impl Fn(Box<dyn FnOnce(bool)>),
+    ) {
+        let got = in_loop(|ctx| {
+            let got = Rc::new(Cell::new(0));
+            for _ in 0..callers {
+                let got = got.clone();
+                start(Box::new(move |ok| {
+                    assert!(ok);
+                    got.set(got.get() + 1);
+                }));
+            }
+            assert!(
+                pump_until(ctx, secs, || got.get() == callers),
+                "callers not served"
+            );
+            got.get()
+        });
+        assert_eq!(got, callers);
+    }
+
+    /// A fake agent that leaves a line in the returned mark file each time it is started, then
+    /// fails.
+    pub(crate) fn marking_target(dir: &Path) -> (ProbeTarget, PathBuf) {
+        let mark = dir.join("started");
+        let program = crate::claude_probe::tests::fake_claude(
+            dir,
+            &format!("echo x >> '{}'\nexit 1", mark.display()),
+        );
+        let target = ProbeTarget {
+            program,
+            env: AgentEnv::default(),
+        };
+        (target, mark)
+    }
 }
 
 #[cfg(test)]
@@ -239,6 +392,47 @@ mod tests {
         assert_eq!(got.get(), 0);
         assert_eq!(flight.finish(&2), None);
         assert_eq!(got.get(), 2);
+    }
+
+    /// The first caller's loop runs each target once, in arrival order, and every caller gets
+    /// its own target's result.
+    #[test]
+    fn a_request_runs_each_target_once_in_arrival_order() {
+        use crate::testutil::{in_loop, pump_until};
+        thread_local! {
+            static FLIGHTS: InFlight<String> = const { InFlight::new() };
+        }
+        let target = |program: &str| ProbeTarget {
+            program: program.into(),
+            ..Default::default()
+        };
+        let runs = Rc::new(RefCell::new(Vec::new()));
+        let got = Rc::new(RefCell::new(Vec::new()));
+        in_loop(|ctx| {
+            for (i, program) in [(0, "a"), (1, "b"), (2, "a"), (3, "b")] {
+                let (runs, got) = (runs.clone(), got.clone());
+                InFlight::request(
+                    &FLIGHTS,
+                    target(program),
+                    move |t| {
+                        runs.borrow_mut().push(t.program.clone());
+                        async move { t.program }
+                    },
+                    move |r: &String| got.borrow_mut().push((i, r.clone())),
+                );
+            }
+            assert!(pump_until(ctx, 5, || got.borrow().len() == 4));
+        });
+        assert_eq!(*runs.borrow(), ["a", "b"]);
+        assert_eq!(
+            *got.borrow(),
+            [
+                (0, "a".to_owned()),
+                (2, "a".to_owned()),
+                (1, "b".to_owned()),
+                (3, "b".to_owned())
+            ]
+        );
     }
 
     #[test]
