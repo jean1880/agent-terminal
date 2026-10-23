@@ -3052,6 +3052,7 @@ pub(crate) mod tests {
     pub(crate) fn ui_checks() {
         replay_fills_the_window_in_steps();
         live_append_keeps_the_window_bounded();
+        cards::tests::a_closed_revealer_measures_its_child_unless_hidden();
         all_subagent_cards_toggle_together();
         model_chip_follows_pending_acceptance_and_rejection();
         stale_replay_checks();
