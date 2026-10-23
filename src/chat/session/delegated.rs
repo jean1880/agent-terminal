@@ -344,11 +344,14 @@ impl Inner {
     /// would stop being one) nor beside a `handoff`, which frames what rides with it as the
     /// user's message, nor while a prompt could wait inside the adapter, out of the session's
     /// sight: Codex keeps prompts in its own queue until its thread has started or resumed, and
-    /// drops them if that fails, so news is attached only once this process reported its
-    /// session. It waits for the next prompt then.
+    /// drops them if that fails, so news is attached only while the live process of the current
+    /// start has reported its session. A gone process never counts: the prompt would restart
+    /// the agent, and wait in that queue. It waits for the next prompt then.
     pub(super) fn news_for_prompt(&self, text: &str, handoff: bool) -> Option<TakenNews> {
-        let adapter_may_queue =
-            self.adapter.borrow().driver() == Driver::Codex && !self.provider_session_up.get();
+        let adapter_may_queue = self.adapter.borrow().driver() == Driver::Codex
+            && !(self.provider_session_up.get() == Some(self.generation.get())
+                && self.starting.borrow().is_none()
+                && self.proc.borrow().as_ref().is_some_and(|p| p.is_alive()));
         if handoff
             || self.child.is_some()
             || self.state.borrow().mode != Mode::Bypass

@@ -2154,6 +2154,71 @@ fn held_news_waits_until_the_codex_thread_is_up() {
     });
 }
 
+/// Readiness belongs to the process that reported it: once a ready Codex root's process is
+/// gone, the next message restarts it and waits in the adapter's queue for the resume, so it
+/// carries no news (not taken, no notice: a failed resume could only drop it). The news goes,
+/// once, with a message sent after the replacement is up.
+#[test]
+fn held_news_never_rides_on_a_message_that_restarts_a_gone_codex_process() {
+    in_loop(|ctx| {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let thread = fresh(&store, &dir.path().to_string_lossy());
+        let (sink, seen) = make_sink();
+        let session = ChatSession::with_env(
+            Box::new(CodexAdapter::new()),
+            codex_open(dir.path(), Mode::Ask),
+            store,
+            thread,
+            sink,
+            Err(None),
+            bare_env(dir.path()),
+        );
+        let starts = || {
+            seen.borrow()
+                .iter()
+                .filter(|e| matches!(e.event, Event::SessionStarted { .. }))
+                .count()
+        };
+        let notices = || {
+            seen.borrow()
+                .iter()
+                .filter(
+                    |e| matches!(&e.event, Event::Notice { text } if text.contains("held news")),
+                )
+                .count()
+        };
+        let idle = |s: &ChatSession| s.status().alive && !s.status().running_turn;
+        assert!(pump_until(ctx, 10, || starts() == 1 && idle(&session)));
+        session.confirm_mode(Mode::Bypass);
+        let news = Rc::new(FakeNews::default());
+        *news.text.borrow_mut() = Some("[agent-terminal] held news".into());
+        session.hold_news_for_user(news.clone());
+
+        // The process goes; its readiness goes with it.
+        session.inner.stop_current();
+        assert!(!session.status().alive);
+        session.send_prompt("after the exit\nsuccess");
+        assert_eq!(
+            news.taken.get(),
+            0,
+            "never framed into the restart's queued prompt"
+        );
+        assert_eq!(notices(), 0);
+        assert_eq!(news.given_back.get(), 0);
+
+        assert!(pump_until(ctx, 10, || starts() == 2 && idle(&session)));
+        session.send_prompt("once it is up\nsuccess");
+        assert_eq!(news.taken.get(), 1);
+        assert!(pump_until(ctx, 10, || idle(&session)));
+        assert_eq!(notices(), 1, "delivered once");
+        let frames = std::fs::read_to_string(dir.path().join("frames.ndjson")).unwrap_or_default();
+        assert_eq!(frames.matches("held news").count(), 1, "{frames}");
+        assert_eq!(news.given_back.get(), 0);
+        session.shutdown(false);
+    });
+}
+
 /// A message the user writes while a turn runs (live input) carries held news like any other:
 /// framed ahead of it, shown as the app's notice, and taken from the supervisor.
 #[test]
