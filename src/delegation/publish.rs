@@ -1,6 +1,6 @@
 //! One sanitisation boundary feeds persistence, inspection and subscribers.
 use super::seam::ChildPublish;
-use super::supervisor::Supervisor;
+use super::supervisor::{Supervisor, HISTORY_BYTES, HISTORY_EVENTS};
 use agent_core::delegation::scope::{Scope, ScopedEnvelope};
 use agent_core::delegation::wire::EventCategory;
 use agent_core::delegation::{ProcessGeneration, WorkerId};
@@ -120,7 +120,7 @@ impl Publisher {
             None
         };
         let bytes = serde_json::to_vec(&event.envelope)
-            .map_or(4 * 1024 * 1024, |v| v.len())
+            .map_or(HISTORY_BYTES, |v| v.len())
             .saturating_add(event.links.len() * 512)
             .saturating_add(
                 completion
@@ -128,8 +128,8 @@ impl Publisher {
                     .and_then(|c| c.result.as_ref())
                     .map_or(0, String::len),
             );
-        if self.pending.borrow().len() >= 4096
-            || self.pending_bytes.get().saturating_add(bytes) > 4 * 1024 * 1024
+        if self.pending.borrow().len() >= HISTORY_EVENTS
+            || self.pending_bytes.get().saturating_add(bytes) > HISTORY_BYTES
         {
             self.failed.set(true);
             sup.fail_worker(

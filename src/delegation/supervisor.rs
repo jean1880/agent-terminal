@@ -32,6 +32,13 @@ pub(crate) trait RouteTable {
     fn admit(&self, q: &RouteQuery) -> RouteSpec;
 }
 
+/// The most delegated events held in memory at once: the replay gate's buffer, an inspector
+/// replay, a worker's unpublished events. Each says what happens past it.
+pub(super) const HISTORY_EVENTS: usize = 4096;
+/// The most serialised envelope bytes held with them. An envelope that cannot be measured
+/// counts as all of it.
+pub(super) const HISTORY_BYTES: usize = 4 * 1024 * 1024;
+
 /// Buffers committed live delivery while a history snapshot is read, retaining sequence
 /// numbers so events included in that snapshot are never delivered twice.
 struct ReplayGate {
@@ -50,9 +57,9 @@ impl WorkerSubscriber for ReplayGate {
         self.committed(env, i64::MAX);
     }
     fn committed(&self, env: &agent_core::delegation::scope::ScopedEnvelope, seq: i64) {
-        let bytes = serde_json::to_vec(&env.envelope).map_or(4 * 1024 * 1024, |v| v.len());
-        if self.buffered.borrow().len() >= 4096
-            || self.bytes.get().saturating_add(bytes) > 4 * 1024 * 1024
+        let bytes = serde_json::to_vec(&env.envelope).map_or(HISTORY_BYTES, |v| v.len());
+        if self.buffered.borrow().len() >= HISTORY_EVENTS
+            || self.bytes.get().saturating_add(bytes) > HISTORY_BYTES
         {
             self.overflow.set(true);
             return;
@@ -3011,7 +3018,7 @@ impl Supervisor {
                                     run=link.run_id.and_then(|r|RunId::parse(&r).ok());
                                 }
                                 bytes += serde_json::to_vec(&envelope)?.len();
-                                if bytes > 4 * 1024 * 1024 || out.len() >= 4096 {
+                                if bytes > HISTORY_BYTES || out.len() >= HISTORY_EVENTS {
                                     out.push(agent_core::delegation::scope::ScopedEnvelope{scope:agent_core::delegation::scope::Scope{root:root_id.clone(),worker:worker.clone(),generation,run:run.clone()},envelope:agent_core::event::Envelope::new(agent_core::event::Event::Notice{text:format!("Inspector replay truncated before event {seq}; older history remains available through paginated worker read.")})});
                                     break 'workers;
                                 }
