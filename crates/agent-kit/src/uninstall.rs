@@ -1009,18 +1009,7 @@ mod tests {
         let home = tmp.path().join("home");
         let repo = tmp.path().join("repo");
         fs::create_dir_all(&repo).unwrap();
-        let sh = |args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
-                .args(args)
-                .current_dir(&repo)
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .output()
-                .unwrap();
-            assert!(out.status.success(), "{args:?}");
-            String::from_utf8_lossy(&out.stdout).trim().to_owned()
-        };
+        let sh = |args: &[&str]| crate::test_support::git(&repo, args);
         sh(&["init", "-q", "-b", "main"]);
         fs::write(repo.join("f"), "x").unwrap();
         sh(&["add", "f"]);
@@ -1183,18 +1172,7 @@ mod tests {
         }
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path();
-        let sh = |args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
-                .args(args)
-                .current_dir(repo)
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .output()
-                .unwrap();
-            assert!(out.status.success(), "{args:?}");
-            String::from_utf8_lossy(&out.stdout).trim().to_owned()
-        };
+        let sh = |args: &[&str]| crate::test_support::git(repo, args);
         sh(&["init", "-q", "-b", "main"]);
         sh(&["commit", "-q", "--allow-empty", "-m", "one"]);
         sh(&[
