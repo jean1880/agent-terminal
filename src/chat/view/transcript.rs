@@ -178,6 +178,11 @@ pub struct TranscriptView {
     /// A card a jump built just now: it has no position until the next layout, so
     /// [`Self::settle`] scrolls to it then.
     jump_to: RefCell<Option<String>>,
+    /// The frame the pending jump started waiting at (see [`Self::jump_gives_up`]).
+    jump_since: Cell<Option<i64>>,
+    /// Tests: the content never counts as laid out, as if a layout never came.
+    #[cfg(test)]
+    never_laid_out: Cell<bool>,
     /// The pending jump also brings the card's focused control into view (an interruption
     /// shelf jump focuses the card's first answer).
     reveal_after_jump: Cell<bool>,
@@ -298,6 +303,9 @@ impl TranscriptView {
             model: RefCell::new(Weak::new()),
             fill: RefCell::new(None),
             jump_to: RefCell::new(None),
+            jump_since: Cell::new(None),
+            #[cfg(test)]
+            never_laid_out: Cell::new(false),
             reveal_after_jump: Cell::new(false),
         });
         view.connect_scrolling();
@@ -474,33 +482,33 @@ impl TranscriptView {
         let pending = self.jump_to.borrow().clone();
         if let Some(id) = pending {
             let row = self.rows.borrow().get(&id).map(Row::widget);
-            // In a card still opening: placed once it has opened.
-            if row.as_ref().is_some_and(|w| self.opening(w)) {
-                return;
-            }
-            // The value moved since the content was last allocated: its bounds would mix the old
-            // layout with the new value. The layout after it places the row.
-            if !self.laid_out_at_value(&adj) {
-                return;
-            }
-            // Gone meanwhile, or hidden (never allocated): nothing to jump to.
-            let row = row.filter(WidgetExt::is_mapped);
-            match row {
-                // Built since the last layout: no allocation yet (the frame tick runs before
-                // layout), and its bounds would be a stale zero-sized rectangle. A later
-                // settle, after the layout, places it.
-                Some(w) if w.height() == 0 => return,
-                Some(w) => {
-                    self.jump_to.take();
-                    let reveal = self.reveal_after_jump.replace(false);
-                    if let Some(bounds) = w.compute_bounds(&self.scroller) {
-                        self.move_to(self.jump_target(&adj, bounds.y(), reveal));
-                        return;
-                    }
+            // In a card still opening: placed once it has opened. Gone meanwhile (evicted,
+            // removed), or hidden (never allocated): nothing to jump to, whatever the layout.
+            let waiting = match &row {
+                Some(w) if self.opening(w) => true,
+                Some(w) if w.is_mapped() => {
+                    // The value moved since the content was last allocated (its bounds would
+                    // mix the old layout with the new value), or the row was built since the
+                    // last layout (no allocation yet: the frame tick runs before layout). The
+                    // layout after it places the row.
+                    !self.laid_out_at_value(&adj) || w.height() == 0
                 }
-                None => {
-                    self.jump_to.take();
+                _ => {
+                    self.clear_jump();
                     self.reveal_after_jump.set(false);
+                    false
+                }
+            };
+            if waiting {
+                if !self.jump_gives_up(&id) {
+                    return;
+                }
+            } else if let Some(w) = row.filter(|_| self.jump_to.borrow().is_some()) {
+                self.clear_jump();
+                let reveal = self.reveal_after_jump.replace(false);
+                if let Some(bounds) = w.compute_bounds(&self.scroller) {
+                    self.move_to(self.jump_target(&adj, bounds.y(), reveal));
+                    return;
                 }
             }
         }
@@ -620,7 +628,7 @@ impl TranscriptView {
             };
             // The user scrolling, either way, takes over from a jump still waiting for layout.
             if Self::user_moved(now, last) {
-                view.jump_to.take();
+                view.clear_jump();
                 view.reveal_after_jump.set(false);
             }
             if Self::user_moved_up(now, last) {
@@ -742,7 +750,7 @@ impl TranscriptView {
     }
 
     pub fn scroll_to_end(&self) {
-        self.jump_to.take();
+        self.clear_jump();
         self.reveal_after_jump.set(false);
         self.stick.set(true);
         self.anchor.set(None);
@@ -839,7 +847,7 @@ impl TranscriptView {
 
     /// Scrolls the transcript to the row for `id`, or to the end if not found.
     pub fn scroll_to_card(&self, id: &str) {
-        self.jump_to.take();
+        self.clear_jump();
         self.reveal_after_jump.set(false);
         // It may be in the part of the window still filling in, outside the window, or a
         // card's earlier step. Built now, it has no position until the next layout: `settle`
@@ -857,6 +865,7 @@ impl TranscriptView {
                 self.stick.set(false);
                 self.anchor.set(None);
                 self.restore_to.set(None);
+                self.jump_since.set(None);
                 *self.jump_to.borrow_mut() = Some(id.to_owned());
                 return;
             }
@@ -872,6 +881,7 @@ impl TranscriptView {
             self.stick.set(false);
             self.anchor.set(None);
             self.restore_to.set(None);
+            self.jump_since.set(None);
             *self.jump_to.borrow_mut() = Some(id.to_owned());
             return;
         }
@@ -920,8 +930,13 @@ impl TranscriptView {
     }
 
     /// Whether the content is allocated at the scroll position the adjustment holds: the
-    /// viewport has laid its child out since the value last changed.
+    /// viewport has laid its child out since the value last changed. The viewport places its
+    /// child at a whole-pixel offset, so a fractional value matches within a pixel.
     fn laid_out_at_value(&self, adj: &gtk4::Adjustment) -> bool {
+        #[cfg(test)]
+        if self.never_laid_out.get() {
+            return false;
+        }
         let Some(viewport) = self.scroller.child() else {
             return true;
         };
@@ -930,7 +945,41 @@ impl TranscriptView {
         };
         content
             .compute_bounds(&viewport)
-            .is_none_or(|b| (f64::from(b.y()) + adj.value()).abs() < 0.5)
+            .is_none_or(|b| (f64::from(b.y()) + adj.value()).abs() < 1.0)
+    }
+
+    /// Ends the pending jump without moving.
+    fn clear_jump(&self) {
+        self.jump_to.take();
+        self.jump_since.set(None);
+    }
+
+    /// Frames a pending jump waits for its layout before it gives up.
+    const JUMP_PATIENCE: i64 = 30;
+
+    /// A pending jump still waiting: true once it has waited [`Self::JUMP_PATIENCE`] frames,
+    /// when it is dropped (with a debug log), so no layout that never comes leaves one hanging.
+    fn jump_gives_up(&self, id: &str) -> bool {
+        let Some(frame) = self.scroller.frame_clock().map(|c| c.frame_counter()) else {
+            return false;
+        };
+        match self.jump_since.get() {
+            None => {
+                self.jump_since.set(Some(frame));
+                false
+            }
+            Some(since) if frame - since > Self::JUMP_PATIENCE => {
+                tracing::debug!(
+                    id,
+                    frames = frame - since,
+                    "chat transcript: gave up a jump"
+                );
+                self.clear_jump();
+                self.reveal_after_jump.set(false);
+                true
+            }
+            Some(_) => false,
+        }
     }
 
     /// Whether a card `widget` sits in is still opening: it is laid out where it ends up only
@@ -1039,7 +1088,7 @@ impl TranscriptView {
         if let Some(fill) = self.fill.take() {
             fill.remove();
         }
-        self.jump_to.take();
+        self.clear_jump();
         self.reveal_after_jump.set(false);
         self.clear_rows();
         let order = model.order();
@@ -1934,6 +1983,24 @@ impl TranscriptView {
             at += 1;
         }
         self.first.set(at);
+    }
+
+    /// Runs [`Self::settle`] now (tests).
+    #[cfg(test)]
+    pub fn settle_now(&self) {
+        self.settle();
+    }
+
+    /// Whether a jump is waiting to be placed (tests).
+    #[cfg(test)]
+    pub fn jump_pending(&self) -> bool {
+        self.jump_to.borrow().is_some()
+    }
+
+    /// Makes the content never count as laid out, as if its layout never came (tests).
+    #[cfg(test)]
+    pub fn set_never_laid_out(&self, never: bool) {
+        self.never_laid_out.set(never);
     }
 
     /// Rows built as widgets, nested ones included (tests and measurements).

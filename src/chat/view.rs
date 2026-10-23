@@ -3413,8 +3413,74 @@ pub(crate) mod tests {
         window.destroy();
     }
 
+    /// A pending jump always ends: it lands once from a fractional scroll position (the viewport
+    /// lays its content out at a whole-pixel offset), it is dropped when its row goes while it
+    /// waits, and it gives up after a bounded number of frames if its layout never comes.
+    pub(crate) fn a_pending_jump_lands_or_ends() {
+        use agent_core::event::ItemKind;
+        let ctx = glib::MainContext::default();
+        let (view, window, inner) = live_window();
+        let t = &inner.transcript;
+        for i in 0..80 {
+            live_step(&view, &format!("s{i}"), None);
+        }
+        let (_, adj) = t.scroll_parts();
+        assert!(crate::testutil::pump_until(&ctx, 10, || {
+            adj.upper() > adj.page_size() + 1000.0
+                && adj.value() + adj.page_size() >= adj.upper() - 1.0
+        }));
+        let settle = || {
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(1000);
+            let _ = crate::testutil::pump_until(&ctx, 3, || std::time::Instant::now() > until);
+        };
+        // The user scrolls to a fractional position, then jumps.
+        adj.set_value((adj.upper() - adj.page_size() - 600.0).floor() + 0.75);
+        settle();
+        assert!((adj.value().fract() - 0.75).abs() < 1e-6, "{}", adj.value());
+        let before = t.settle_counts().1;
+        t.scroll_to_card("s20");
+        settle();
+        assert!(!t.jump_pending(), "the jump ended: {}", t.scroll_debug());
+        assert!(
+            t.row_bounds_in_viewport("s20")
+                .is_some_and(|(b, _)| (30.0..=50.0).contains(&b.y())),
+            "landed on the row: {}",
+            t.scroll_debug()
+        );
+        assert_eq!(t.settle_counts().1 - before, 1, "once");
+
+        // Its row goes while it waits: the jump goes with it, whatever the layout.
+        view.apply(&Envelope::item_started(
+            "q1",
+            ItemKind::UserMessage,
+            "queued",
+            None,
+            None,
+        ));
+        t.set_never_laid_out(true);
+        t.scroll_to_card("q1");
+        assert!(t.jump_pending());
+        let changes = inner.model.borrow_mut().remove_item("q1");
+        inner.handle(changes);
+        t.settle_now();
+        assert!(!t.jump_pending(), "a gone row ends its jump");
+
+        // A layout that never comes: the jump gives up after a bounded wait.
+        t.scroll_to_card("s30");
+        assert!(t.jump_pending());
+        let from = t.frames();
+        assert!(
+            crate::testutil::pump_until(&ctx, 15, || !t.jump_pending()),
+            "the jump never gave up"
+        );
+        assert!(t.frames() - from >= 30, "it waited its frames first");
+        t.set_never_laid_out(false);
+        window.destroy();
+    }
+
     pub(crate) fn ui_checks() {
         replay_fills_the_window_in_steps();
+        a_pending_jump_lands_or_ends();
         a_jump_to_a_built_row_moves_once_onto_it();
         a_focused_later_steps_button_hands_focus_on_back_at_the_end();
         live_append_keeps_the_window_bounded();
