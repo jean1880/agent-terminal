@@ -2683,10 +2683,7 @@ impl Supervisor {
             task_mode,
             app_pid: self.services.app_pid,
             bridge_command: self.services.bridge_command.clone(),
-            endpoint: self
-                .rundir
-                .path()
-                .join(format!("delegation-{}.sock", self.services.app_pid)),
+            endpoint: super::ipc::socket_path(&self.rundir, self.services.app_pid),
             instance: self.instance.clone(),
             rundir: self.rundir.clone(),
         };
