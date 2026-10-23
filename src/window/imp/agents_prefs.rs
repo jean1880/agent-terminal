@@ -1173,24 +1173,28 @@ impl AgentTerminalWindow {
         glib::spawn_future_local(async move {
             let codex = codex_target(codex_inputs).await.ok();
             let computed = gtk4::gio::spawn_blocking(move || {
-                let rules = crate::always_allow::AlwaysRules::load(&path);
+                let (rules, blocked) = open_rules_for_display(&path);
                 let available = codex.as_ref().is_some_and(|t| t.available());
                 (
                     rules.check_sync_status(None, &sources, codex.as_ref()),
+                    blocked,
                     available,
                 )
             })
             .await;
-            let (Ok((status, codex)), Some(parent)) = (computed, parent.upgrade()) else {
+            let (Ok((status, blocked, codex)), Some(parent)) = (computed, parent.upgrade()) else {
                 return;
             };
-            Self::present_sync_differences(&parent, &status, codex);
+            Self::present_sync_differences(&parent, &status, blocked, codex);
         });
     }
 
+    /// The differences dialog. A rules file that cannot be used is named in its body, and the
+    /// rules are then never called synchronised.
     fn present_sync_differences(
         parent: &gtk4::Widget,
         status: &crate::always_allow::PermissionSyncStatus,
+        blocked: Option<String>,
         codex: bool,
     ) {
         let content = gtk4::Box::new(gtk4::Orientation::Vertical, 16);
@@ -1257,7 +1261,10 @@ impl AgentTerminalWindow {
             content.append(&list);
         }
 
-        if status.unimported_rules.is_empty() && status.unexported_rules.is_empty() {
+        if blocked.is_none()
+            && status.unimported_rules.is_empty()
+            && status.unexported_rules.is_empty()
+        {
             let label = gtk4::Label::new(Some("All permission rules are currently synchronized!"));
             label.add_css_class("heading");
             label.set_halign(gtk4::Align::Center);
@@ -1272,10 +1279,9 @@ impl AgentTerminalWindow {
             .child(&content)
             .build();
 
-        let dialog = adw::AlertDialog::new(
-            Some("Permission Synchronization Differences"),
-            Some(&status.summary()),
-        );
+        let body = blocked.unwrap_or_else(|| status.summary());
+        let dialog =
+            adw::AlertDialog::new(Some("Permission Synchronization Differences"), Some(&body));
         dialog.set_extra_child(Some(&scroller));
         dialog.add_response("close", "Close");
         dialog.set_default_response(Some("close"));
@@ -2253,6 +2259,20 @@ fn confirm_export_first(button: &Button, warning: &str) -> bool {
     false
 }
 
+/// The rules file for display: its rules, and why it cannot be used, if it cannot (an unusable
+/// file is named, never shown as no rules). Blocking: run it off the main thread.
+fn open_rules_for_display(
+    path: &std::path::Path,
+) -> (crate::always_allow::AlwaysRules, Option<String>) {
+    match crate::always_allow::AlwaysRules::open(path) {
+        Ok(rules) => (rules, None),
+        Err(e) => (
+            Default::default(),
+            Some(crate::always_allow::blocked_notice(path, &e)),
+        ),
+    }
+}
+
 /// Antigravity's remembered "Always allow" rules, each with a Remove button. A removal is saved at once
 /// and applies to Antigravity sessions started after it (a running one keeps what it already allowed).
 fn always_allowed_rows() -> adw::ExpanderRow {
@@ -2988,6 +3008,24 @@ pub(super) mod tests {
             assert_eq!(finished.get(), Some(1));
             assert_eq!(AlwaysRules::open(&path).expect("open").rules.len(), 1);
         });
+    }
+
+    #[test]
+    fn the_differences_read_names_an_unusable_rules_file() {
+        use crate::always_allow::{AlwaysRules, FILE_NAME};
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join(FILE_NAME);
+        let (rules, blocked) = open_rules_for_display(&path);
+        assert!(rules.rules.is_empty());
+        assert_eq!(blocked, None, "no file yet is no rules, not a problem");
+        std::fs::write(&path, "not a rules file {").expect("write");
+        let (rules, blocked) = open_rules_for_display(&path);
+        assert!(rules.rules.is_empty());
+        let err = AlwaysRules::open(&path).expect_err("unusable");
+        assert_eq!(
+            blocked,
+            Some(crate::always_allow::blocked_notice(&path, &err))
+        );
     }
 
     #[test]
