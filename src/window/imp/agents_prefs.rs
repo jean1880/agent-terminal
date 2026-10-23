@@ -766,17 +766,43 @@ impl AgentTerminalWindow {
             .css_classes(["pill"])
             .build();
 
-        // Manage rules row
-        let rule_count = crate::always_allow::path()
-            .map(|p| crate::always_allow::AlwaysRules::load(&p).rules.len())
-            .unwrap_or(0);
+        // Manage rules row. The rules file is read off the main thread: the row says so until
+        // the count is in, and the full check below (`sync_cb`) has the last word.
+        let rule_count = |count: usize| {
+            format!(
+                "{count} active rules stored in {}",
+                crate::always_allow::FILE_NAME
+            )
+        };
+        let reading = format!(
+            "Reading the rules stored in {}…",
+            crate::always_allow::FILE_NAME
+        );
+        let rules_path = crate::always_allow::path();
         let manage_row = adw::ActionRow::builder()
             .title("Saved Permission Rules")
-            .subtitle(format!(
-                "{rule_count} active rules stored in {}",
-                crate::always_allow::FILE_NAME
-            ))
+            .subtitle(if rules_path.is_some() {
+                reading.clone()
+            } else {
+                rule_count(0)
+            })
             .build();
+        if let Some(p) = rules_path {
+            let row = manage_row.downgrade();
+            glib::spawn_future_local(async move {
+                let count = blocking_or(
+                    move || crate::always_allow::AlwaysRules::load(&p).rules.len(),
+                    0,
+                )
+                .await;
+                if let Some(row) = row
+                    .upgrade()
+                    .filter(|r| r.subtitle().as_deref() == Some(reading.as_str()))
+                {
+                    row.set_subtitle(&rule_count(count));
+                }
+            });
+        }
         let manage_btn = gtk4::Button::builder()
             .label("Manage Rules…")
             .valign(gtk4::Align::Center)
