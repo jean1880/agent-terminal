@@ -315,12 +315,9 @@ impl AgentTerminalWindow {
 
     /// What the sidebar calls the thread.
     pub(super) fn thread_title_of(&self, thread: &str) -> String {
-        let open = self.tabs.borrow().iter().find_map(|t| {
-            t.chat
-                .as_ref()
-                .filter(|c| c.thread == thread && !c.title.is_empty())
-                .map(|c| c.title.clone())
-        });
+        let open = self
+            .with_chat(thread, |c| c.title.clone())
+            .filter(|t| !t.is_empty());
         open.or_else(|| {
             self.summary_of(thread)
                 .map(|s| s.title)
@@ -456,15 +453,7 @@ impl AgentTerminalWindow {
     fn rename_thread_to(&self, thread: &str, title: &str) {
         let (id, stored) = (thread.to_owned(), title.to_owned());
         self.write_store("rename the thread", move |s| s.rename_thread(&id, &stored));
-        if let Some(chat) = self
-            .tabs
-            .borrow_mut()
-            .iter_mut()
-            .filter_map(|t| t.chat.as_mut())
-            .find(|c| c.thread == thread)
-        {
-            chat.title = title.to_owned();
-        }
+        self.with_chat_mut(thread, |chat| chat.title = title.to_owned());
         if let Some(page) = self.page_of_thread(thread) {
             page.set_title(title);
             if self.selected_row_key() == Some(RowKey::Thread(thread.to_owned())) {
@@ -753,12 +742,9 @@ pub(super) mod tests {
         let ctx = glib::MainContext::default();
         let settle = |cond: &dyn Fn() -> bool| assert!(pump_until(&ctx, 5, cond), "timed out");
         let chat_of = |thread: &str| {
-            imp.tabs
-                .borrow()
-                .iter()
-                .filter_map(|t| t.chat.as_ref())
-                .find(|c| c.thread == thread)
-                .map(|c| (c.title.clone(), c.driver, c.pending_switch.clone()))
+            imp.with_chat(thread, |c| {
+                (c.title.clone(), c.driver, c.pending_switch.clone())
+            })
         };
         let dir = tempfile::tempdir().expect("tmp");
         let folder = dir.path().to_string_lossy().into_owned();
@@ -1010,11 +996,8 @@ pub(super) mod tests {
             "the switch waits for the session"
         );
         settle(&|| {
-            imp.tabs
-                .borrow()
-                .iter()
-                .filter_map(|t| t.chat.as_ref())
-                .any(|c| c.thread == thread && c.view.is_some())
+            imp.with_chat(&thread, |c| c.view.is_some())
+                .unwrap_or(false)
         });
         assert_eq!(
             chat_of(&thread).and_then(|c| c.2),

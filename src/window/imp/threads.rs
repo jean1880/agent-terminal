@@ -2125,12 +2125,8 @@ fn agent_launch(driver: Driver, thread: &str, cwd: &str) -> Result<AgentLaunch, 
     let profile_id = thread_owner(thread).and_then(|window| {
         window
             .imp()
-            .tabs
-            .borrow()
-            .iter()
-            .filter_map(|t| t.chat.as_ref())
-            .find(|c| c.thread == thread)
-            .and_then(|c| c.profile_id.clone())
+            .with_chat(thread, |c| c.profile_id.clone())
+            .flatten()
     });
     agent_launch_with(
         &AgentAvailability::shared().get(driver),
@@ -3674,11 +3670,7 @@ impl AgentTerminalWindow {
         let RowKey::Thread(id) = key else {
             return false;
         };
-        self.tabs
-            .borrow()
-            .iter()
-            .filter_map(|t| t.chat.as_ref())
-            .any(|c| &c.thread == id && c.busy())
+        self.with_chat(id, ChatTab::busy).unwrap_or(false)
     }
 
     /// What closing `key`'s page would lose ([`ChatTab::closing_loses`]); `None` for a terminal
@@ -3687,12 +3679,7 @@ impl AgentTerminalWindow {
         let RowKey::Thread(id) = key else {
             return None;
         };
-        self.tabs
-            .borrow()
-            .iter()
-            .filter_map(|t| t.chat.as_ref())
-            .find(|c| &c.thread == id)
-            .and_then(ChatTab::closing_loses)
+        self.with_chat(id, ChatTab::closing_loses).flatten()
     }
 
     /// On a window close request: when any thread is busy or holds an unsent message, asks once
@@ -3747,12 +3734,10 @@ impl AgentTerminalWindow {
     ) {
         // At most one question per thread: a second click on X while it is open does nothing.
         let first = self
-            .tabs
-            .borrow_mut()
-            .iter_mut()
-            .filter_map(|t| t.chat.as_mut())
-            .find(|c| c.thread == thread)
-            .is_some_and(|c| !std::mem::replace(&mut c.confirming_close, true));
+            .with_chat_mut(thread, |c| {
+                !std::mem::replace(&mut c.confirming_close, true)
+            })
+            .unwrap_or(false);
         if !first {
             return;
         }
@@ -3769,16 +3754,9 @@ impl AgentTerminalWindow {
                 .choose_future(Some(window.upcast_ref::<gtk4::Widget>()))
                 .await;
             // Reopened for a later close; the tab may be gone already.
-            if let Some(c) = window
+            window
                 .imp()
-                .tabs
-                .borrow_mut()
-                .iter_mut()
-                .filter_map(|t| t.chat.as_mut())
-                .find(|c| c.thread == thread)
-            {
-                c.confirming_close = false;
-            }
+                .with_chat_mut(&thread, |c| c.confirming_close = false);
             if response == "stop" {
                 then(window.imp());
             }
@@ -3811,12 +3789,10 @@ impl AgentTerminalWindow {
         }
         // At most one question per thread: another pick while it is open does nothing.
         let first = self
-            .tabs
-            .borrow_mut()
-            .iter_mut()
-            .filter_map(|t| t.chat.as_mut())
-            .find(|c| c.thread == thread)
-            .is_some_and(|c| !std::mem::replace(&mut c.confirming_switch, true));
+            .with_chat_mut(thread, |c| {
+                !std::mem::replace(&mut c.confirming_switch, true)
+            })
+            .unwrap_or(false);
         if !first {
             return;
         }
@@ -3832,16 +3808,9 @@ impl AgentTerminalWindow {
             let response = dialog
                 .choose_future(Some(window.upcast_ref::<gtk4::Widget>()))
                 .await;
-            if let Some(c) = window
+            window
                 .imp()
-                .tabs
-                .borrow_mut()
-                .iter_mut()
-                .filter_map(|t| t.chat.as_mut())
-                .find(|c| c.thread == thread)
-            {
-                c.confirming_switch = false;
-            }
+                .with_chat_mut(&thread, |c| c.confirming_switch = false);
             if response != "stop" {
                 return;
             }
@@ -3893,10 +3862,8 @@ impl AgentTerminalWindow {
     }
 
     pub(super) fn selected_row_key(&self) -> Option<RowKey> {
-        let page = self.tab_view.borrow().as_ref()?.selected_page()?;
-        let tabs = self.tabs.borrow();
-        let tab = tabs.iter().find(|t| t.page == page)?;
-        Some(match &tab.chat {
+        let page = self.selected_page()?;
+        self.with_page_tab(&page, |tab| match &tab.chat {
             Some(c) => RowKey::Thread(c.thread.clone()),
             None => RowKey::Terminal(tab.key),
         })
@@ -3963,11 +3930,8 @@ impl AgentTerminalWindow {
     /// closed, and its page's detach discards it ([`Self::discard_if_blank`]).
     fn leave_shown_thread(&self, now: Option<&adw::TabPage>) {
         let now_thread = now.and_then(|page| {
-            self.tabs
-                .borrow()
-                .iter()
-                .find(|t| &t.page == page)
-                .and_then(|t| t.chat.as_ref().map(|c| c.thread.clone()))
+            self.with_page_tab(page, |t| t.chat.as_ref().map(|c| c.thread.clone()))
+                .flatten()
         });
         let Some(left) = self
             .shown_thread
@@ -3978,15 +3942,7 @@ impl AgentTerminalWindow {
         };
         // Idle suspension counts from the moment it went out of sight. A shared borrow: this
         // runs inside the selection change, which a caller holding the registry can trigger.
-        if let Some(chat) = self
-            .tabs
-            .borrow()
-            .iter()
-            .filter_map(|t| t.chat.as_ref())
-            .find(|c| c.thread == left)
-        {
-            chat.last_seen.set(std::time::Instant::now());
-        }
+        self.with_chat(&left, |chat| chat.last_seen.set(std::time::Instant::now()));
         if !self.thread_page_looks_blank(&left) {
             return;
         }
@@ -4011,11 +3967,8 @@ impl AgentTerminalWindow {
             return false;
         }
         let blank = self
-            .tabs
-            .borrow()
-            .iter()
-            .filter_map(|t| t.chat.as_ref())
-            .any(|c| c.thread == thread && c.looks_blank());
+            .with_chat(thread, ChatTab::looks_blank)
+            .unwrap_or(false);
         blank && !self.row_is_busy(&RowKey::Thread(thread.to_owned()))
     }
 
@@ -4131,17 +4084,15 @@ impl AgentTerminalWindow {
     /// A page came into view: build a thread on first show, clear its unread state, and put
     /// its title and folder in the header.
     pub(super) fn page_shown(&self, page: &adw::TabPage) {
-        let info = {
-            let mut tabs = self.tabs.borrow_mut();
-            let Some(tab) = tabs.iter_mut().find(|t| &t.page == page) else {
-                return;
-            };
+        let Some(info) = self.with_page_tab_mut(page, |tab| {
             let dir = tab.dir.clone();
             tab.chat.as_mut().map(|chat| {
                 chat.unread = false;
                 chat.last_seen.set(std::time::Instant::now());
                 (chat.thread.clone(), chat.title.clone(), dir)
             })
+        }) else {
+            return;
         };
         // Also here: a first page is selected before it is registered, then shown directly.
         *self.shown_thread.borrow_mut() = info.as_ref().map(|(thread, ..)| thread.clone());
@@ -4440,13 +4391,7 @@ impl AgentTerminalWindow {
         if self.is_closing() {
             return None;
         }
-        let existing = self.tabs.borrow().iter().find_map(|t| {
-            t.chat
-                .as_ref()
-                .is_some_and(|c| c.thread == thread)
-                .then(|| t.page.clone())
-        });
-        let page = match existing {
+        let page = match self.page_of_thread(thread) {
             Some(page) => page,
             None => self.add_thread_page(thread)?,
         };
@@ -4861,20 +4806,14 @@ impl AgentTerminalWindow {
 
     /// A thread's page whose store read failed: left unbuilt, so showing it again retries.
     fn thread_load_failed(&self, page: &adw::TabPage) {
-        if let Some(chat) = self
-            .tabs
-            .borrow_mut()
-            .iter_mut()
-            .find(|t| &t.page == page)
-            .and_then(|t| t.chat.as_mut())
-        {
+        self.with_page_chat_mut(page, |chat| {
             chat.building = false;
             chat.pending_switch = None;
             // Not loading any more: the skeleton holds still until a retry.
             if let Some(skeleton) = chat.holder.first_child() {
                 loading::settle(&skeleton);
             }
-        }
+        });
         // Not starting any more: the row stops spinning.
         self.refresh_sidebar();
         self.show_toast("Could not read this thread from the store. Select it again to retry.");
@@ -4893,14 +4832,8 @@ impl AgentTerminalWindow {
             loaded,
             hook,
         } = job;
-        let Some((slot, holder, diffs)) = self.tabs.borrow().iter().find_map(|t| {
-            (&t.page == page)
-                .then(|| {
-                    t.chat
-                        .as_ref()
-                        .map(|c| (c.slot.clone(), c.holder.clone(), c.diffs.clone()))
-                })
-                .flatten()
+        let Some((slot, holder, diffs)) = self.with_page_chat(page, |c| {
+            (c.slot.clone(), c.holder.clone(), c.diffs.clone())
         }) else {
             return; // closed while resolving
         };
@@ -4944,27 +4877,23 @@ impl AgentTerminalWindow {
                 obj.imp().view_action(&thread_id, action);
             }
         });
-        let mut worktree_branch = None;
-        if let Some(tab) = self.tabs.borrow_mut().iter_mut().find(|t| &t.page == page) {
-            // A reopened worktree thread is one again: its tooltip, and the removal offer when
-            // it closes (checked as still registered first: `offer_worktree_removal`).
-            if tab.worktree.is_none() {
-                if let Some(info) = loaded.attributes.worktree.clone() {
-                    worktree_branch = Some(info.branch.clone());
-                    tab.worktree = Some(info);
+        let worktree_branch = self
+            .with_page_tab_mut(page, |tab| {
+                // A reopened worktree thread is one again: its tooltip, and the removal offer
+                // when it closes (checked as still registered first: `offer_worktree_removal`).
+                if tab.worktree.is_some() {
+                    return None;
                 }
-            }
-        }
+                let info = loaded.attributes.worktree.clone()?;
+                let branch = info.branch.clone();
+                tab.worktree = Some(info);
+                Some(branch)
+            })
+            .flatten();
         if let Some(branch) = worktree_branch {
             page.set_tooltip(&tab_tooltip(Some(&branch), None));
         }
-        if let Some(chat) = self
-            .tabs
-            .borrow_mut()
-            .iter_mut()
-            .find(|t| &t.page == page)
-            .and_then(|t| t.chat.as_mut())
-        {
+        self.with_page_chat_mut(page, |chat| {
             chat.view = Some(view.clone());
             chat.profile_id = loaded.attributes.profile_id.clone();
             if chat.pending_prompt.is_none() {
@@ -4979,7 +4908,7 @@ impl AgentTerminalWindow {
                 crate::chat::session::undelivered_handoff(history.iter().map(|(_, env)| env));
             chat.chosen_mode =
                 crate::chat::session::chosen_mode(history.iter().map(|(_, env)| env));
-        }
+        });
 
         // The demo window starts no agent session (see `start_session`): the script plays.
         if let Some(demo) = demo {
@@ -5013,27 +4942,21 @@ impl AgentTerminalWindow {
             // A switch parked while the thread was being built: its own agent will not start
             // it (still being detected excepted), so the thread moves to the new agent now.
             let parked = self
-                .tabs
-                .borrow_mut()
-                .iter_mut()
-                .find(|t| &t.page == page)
-                .and_then(|t| t.chat.as_mut())
-                .filter(|_| !keep_pending_switch(true, &AgentAvailability::shared().get(driver)))
-                .and_then(|chat| chat.pending_switch.take());
+                .with_page_chat_mut(page, |chat| {
+                    if keep_pending_switch(true, &AgentAvailability::shared().get(driver)) {
+                        None
+                    } else {
+                        chat.pending_switch.take()
+                    }
+                })
+                .flatten();
             if let Some((target, model, effort)) = parked {
                 self.switch_in_place_with(&thread, target, model, effort);
             }
             self.update_unavailable_banners();
             // Built, with no agent to start: the row stops spinning.
             self.refresh_sidebar();
-            if self
-                .tab_view
-                .borrow()
-                .as_ref()
-                .and_then(|v| v.selected_page())
-                .as_ref()
-                == Some(page)
-            {
+            if self.is_selected(page) {
                 view.focus_composer();
             }
         }
@@ -5047,15 +4970,11 @@ impl AgentTerminalWindow {
         thread: &str,
         slot: &Rc<SessionSlot>,
     ) -> delegation::PendingStart {
-        if let Some(chat) = self
-            .tabs
-            .borrow_mut()
-            .iter_mut()
-            .filter_map(|t| t.chat.as_mut())
-            .find(|c| c.thread == thread && Rc::ptr_eq(&c.slot, slot))
-        {
-            chat.starting = true;
-        }
+        self.with_chat_mut(thread, |chat| {
+            if Rc::ptr_eq(&chat.slot, slot) {
+                chat.starting = true;
+            }
+        });
         delegation::PendingStart::new(slot)
     }
 
@@ -5140,14 +5059,13 @@ impl AgentTerminalWindow {
             hook,
         } = job;
         let (thread, dir, profile) = (thread.as_str(), dir.as_str(), &profile);
-        let Some((slot, view)) = self.tabs.borrow_mut().iter_mut().find_map(|t| {
-            (&t.page == page).then(|| {
-                t.chat.as_mut().and_then(|c| {
-                    c.starting = false;
-                    Some((c.slot.clone(), c.view.clone()?))
-                })
-            })?
-        }) else {
+        let Some((slot, view)) = self
+            .with_page_chat_mut(page, |c| {
+                c.starting = false;
+                Some((c.slot.clone(), c.view.clone()?))
+            })
+            .flatten()
+        else {
             return; // closed while resolving
         };
         if slot.get().is_some() {
@@ -5175,12 +5093,8 @@ impl AgentTerminalWindow {
         let resume = provider.as_ref().and_then(|p| p.native_id.clone());
         // An effort chosen for this thread (continued in another agent) beats the profile's.
         let effort = self
-            .tabs
-            .borrow_mut()
-            .iter_mut()
-            .find(|t| &t.page == page)
-            .and_then(|t| t.chat.as_mut())
-            .and_then(|c| c.pending_effort.take())
+            .with_page_chat_mut(page, |c| c.pending_effort.take())
+            .flatten()
             .or_else(|| profile.default_effort.clone());
         // A model its agent no longer offers (judged on a list fetched in this run) is never
         // started: the thread resumes on the replacement, and says so.
@@ -5198,13 +5112,7 @@ impl AgentTerminalWindow {
         // the agent ran in another, and could reopen a switched thread in a laxer mode. A mode the
         // agent moved to on its own (Claude entering plan mode) is not a choice: the user's own
         // last choice wins on reopen.
-        let chosen = self
-            .tabs
-            .borrow()
-            .iter()
-            .find(|t| &t.page == page)
-            .and_then(|t| t.chat.as_ref())
-            .and_then(|c| c.chosen_mode);
+        let chosen = self.with_page_chat(page, |c| c.chosen_mode).flatten();
         let mode = start_mode(chosen, view.replayed_mode(), profile.default_mode);
         let program = resolved
             .program
@@ -5280,25 +5188,17 @@ impl AgentTerminalWindow {
             }
         }
 
-        let (prompt, switch, stored) = {
-            let mut tabs = self.tabs.borrow_mut();
-            let chat = tabs
-                .iter_mut()
-                .find(|t| &t.page == page)
-                .and_then(|t| t.chat.as_mut());
-            match chat {
-                Some(chat) => {
-                    // A new thread's own handoff was stored with it: it is in `stored_handoff`.
-                    chat.pending_handoff = false;
-                    (
-                        chat.pending_prompt.take(),
-                        chat.pending_switch.take(),
-                        chat.stored_handoff.take(),
-                    )
-                }
-                None => (None, None, None),
-            }
-        };
+        let (prompt, switch, stored) = self
+            .with_page_chat_mut(page, |chat| {
+                // A new thread's own handoff was stored with it: it is in `stored_handoff`.
+                chat.pending_handoff = false;
+                (
+                    chat.pending_prompt.take(),
+                    chat.pending_switch.take(),
+                    chat.stored_handoff.take(),
+                )
+            })
+            .unwrap_or((None, None, None));
         if let Some(stored) = stored {
             session.restore_handoff(stored);
         }
@@ -5310,14 +5210,7 @@ impl AgentTerminalWindow {
         }
         // The thread is built: judge its model against the current catalogue too.
         self.evaluate_models();
-        if self
-            .tab_view
-            .borrow()
-            .as_ref()
-            .and_then(|v| v.selected_page())
-            .as_ref()
-            == Some(page)
-        {
+        if self.is_selected(page) {
             view.focus_composer();
         }
     }
@@ -5339,13 +5232,7 @@ impl AgentTerminalWindow {
                     return;
                 };
                 let imp = obj.imp();
-                let view = imp
-                    .tabs
-                    .borrow()
-                    .iter()
-                    .filter_map(|t| t.chat.as_ref())
-                    .find(|c| c.thread == thread)
-                    .and_then(|c| c.view.clone());
+                let view = imp.with_chat(&thread, |c| c.view.clone()).flatten();
                 if let Some(view) = view {
                     view.refresh_status();
                 }
@@ -5359,13 +5246,7 @@ impl AgentTerminalWindow {
     /// Whether `thread`'s agent activity ([`ChatTab::activity`]) differs from what its drawn
     /// sidebar row shows. A row not drawn (folded away, filtered out) is never outdated.
     fn activity_outdated(&self, thread: &str) -> bool {
-        let now = self
-            .tabs
-            .borrow()
-            .iter()
-            .filter_map(|t| t.chat.as_ref())
-            .find(|c| c.thread == thread)
-            .and_then(ChatTab::activity);
+        let now = self.with_chat(thread, ChatTab::activity).flatten();
         let Some(sidebar) = self.sidebar.borrow().clone() else {
             return false;
         };
@@ -5720,20 +5601,11 @@ impl AgentTerminalWindow {
         }
         let in_view = self.selected_row_key() == Some(RowKey::Thread(thread.to_owned()));
         let focused = self.obj().is_active();
-        let page = {
-            let mut tabs = self.tabs.borrow_mut();
-            let Some(tab) = tabs
-                .iter_mut()
-                .find(|t| t.chat.as_ref().is_some_and(|c| c.thread == thread))
-            else {
-                return;
-            };
+        let due = self.with_thread_tab_mut(thread, |tab| {
             let page = tab.page.clone();
-            let Some(chat) = tab.chat.as_mut() else {
-                return;
-            };
+            let chat = tab.chat.as_mut()?;
             if !held_finish_due(chat.finish_held, chat.running, chat.background_work(false)) {
-                return;
+                return None;
             }
             chat.finish_held = false;
             let r = react(
@@ -5743,7 +5615,10 @@ impl AgentTerminalWindow {
                 self.config.borrow().notify_on_bell,
             );
             chat.unread |= r.unread;
-            r.notify.then_some(page)
+            Some(r.notify.then_some(page))
+        });
+        let Some(page) = due.flatten() else {
+            return;
         };
         if in_view && focused {
             let id = thread.to_owned();
@@ -5764,12 +5639,7 @@ impl AgentTerminalWindow {
         let Some(app) = self.obj().application() else {
             return;
         };
-        let key = self
-            .tabs
-            .borrow()
-            .iter()
-            .find(|t| &t.page == page)
-            .map(|t| t.key);
+        let key = self.with_page_tab(page, |t| t.key);
         let notification = gtk4::gio::Notification::new(heading);
         let title = page.title();
         notification.set_body(Some(if title.is_empty() {
@@ -5793,19 +5663,10 @@ impl AgentTerminalWindow {
     pub(super) fn add_toast(&self, toast: adw::Toast) {
         #[cfg(test)]
         self.test_toasts.borrow_mut().push(toast.clone());
-        let selected = self
-            .tab_view
-            .borrow()
-            .as_ref()
-            .and_then(|view| view.selected_page());
+        let selected = self.selected_page();
         let local = selected.and_then(|page| {
-            self.tabs
-                .borrow()
-                .iter()
-                .find(|t| t.page == page)
-                .and_then(|t| t.chat.as_ref())
-                .and_then(|chat| chat.view.as_ref())
-                .and_then(|view| view.toast_overlay())
+            self.with_page_chat(&page, |chat| chat.view.as_ref()?.toast_overlay())
+                .flatten()
         });
         if let Some(overlay) = local.or_else(|| self.toast_overlay.borrow().clone()) {
             overlay.add_toast(toast);
@@ -5904,44 +5765,98 @@ impl AgentTerminalWindow {
             return;
         };
         let was_unread = self
-            .tabs
-            .borrow_mut()
-            .iter_mut()
-            .filter_map(|t| t.chat.as_mut())
-            .find(|c| c.thread == thread)
-            .is_some_and(|c| std::mem::take(&mut c.unread));
+            .with_chat_mut(&thread, |c| std::mem::take(&mut c.unread))
+            .unwrap_or(false);
         self.withdraw_thread_notifications(&thread);
         if was_unread {
             self.write_store("mark the thread read", move |s| s.mark_read(&thread));
         }
     }
 
+    /// Runs `f` on `thread`'s chat page, if it is open here. The registry stays borrowed while
+    /// `f` runs, so `f` returns owned data and calls nothing that can re-enter the window (a
+    /// setter that notifies, the session, GApplication): the caller does that afterwards.
+    pub(super) fn with_chat<R>(&self, thread: &str, f: impl FnOnce(&ChatTab) -> R) -> Option<R> {
+        self.tabs
+            .borrow()
+            .iter()
+            .filter_map(|t| t.chat.as_ref())
+            .find(|c| c.thread == thread)
+            .map(f)
+    }
+
+    /// [`Self::with_chat`], mutably.
+    pub(super) fn with_chat_mut<R>(
+        &self,
+        thread: &str,
+        f: impl FnOnce(&mut ChatTab) -> R,
+    ) -> Option<R> {
+        self.tabs
+            .borrow_mut()
+            .iter_mut()
+            .filter_map(|t| t.chat.as_mut())
+            .find(|c| c.thread == thread)
+            .map(f)
+    }
+
+    /// [`Self::with_chat`] on the whole registry entry of `thread`'s page.
+    pub(super) fn with_thread_tab<R>(
+        &self,
+        thread: &str,
+        f: impl FnOnce(&TabState) -> R,
+    ) -> Option<R> {
+        self.tabs
+            .borrow()
+            .iter()
+            .find(|t| t.chat.as_ref().is_some_and(|c| c.thread == thread))
+            .map(f)
+    }
+
+    /// [`Self::with_thread_tab`], mutably.
+    pub(super) fn with_thread_tab_mut<R>(
+        &self,
+        thread: &str,
+        f: impl FnOnce(&mut TabState) -> R,
+    ) -> Option<R> {
+        self.tabs
+            .borrow_mut()
+            .iter_mut()
+            .find(|t| t.chat.as_ref().is_some_and(|c| c.thread == thread))
+            .map(f)
+    }
+
+    /// [`Self::with_chat`] on `page`'s thread: `None` for a terminal page or a page not here.
+    pub(super) fn with_page_chat<R>(
+        &self,
+        page: &adw::TabPage,
+        f: impl FnOnce(&ChatTab) -> R,
+    ) -> Option<R> {
+        self.with_page_tab(page, |t| t.chat.as_ref().map(f))
+            .flatten()
+    }
+
+    /// [`Self::with_page_chat`], mutably.
+    pub(super) fn with_page_chat_mut<R>(
+        &self,
+        page: &adw::TabPage,
+        f: impl FnOnce(&mut ChatTab) -> R,
+    ) -> Option<R> {
+        self.with_page_tab_mut(page, |t| t.chat.as_mut().map(f))
+            .flatten()
+    }
+
     pub(super) fn page_of_thread(&self, thread: &str) -> Option<adw::TabPage> {
-        self.tabs.borrow().iter().find_map(|t| {
-            t.chat
-                .as_ref()
-                .is_some_and(|c| c.thread == thread)
-                .then(|| t.page.clone())
-        })
+        self.with_thread_tab(thread, |t| t.page.clone())
     }
 
     pub(super) fn slot_of(&self, thread: &str) -> Option<Rc<SessionSlot>> {
-        self.tabs.borrow().iter().find_map(|t| {
-            t.chat
-                .as_ref()
-                .filter(|c| c.thread == thread)
-                .map(|c| c.slot.clone())
-        })
+        self.with_chat(thread, |c| c.slot.clone())
     }
 
     /// The selected page's thread session, when it is a chat page.
     pub(super) fn current_slot(&self) -> Option<Rc<SessionSlot>> {
-        let page = self.tab_view.borrow().as_ref()?.selected_page()?;
-        self.tabs
-            .borrow()
-            .iter()
-            .find(|t| t.page == page)
-            .and_then(|t| t.chat.as_ref().map(|c| c.slot.clone()))
+        let page = self.selected_page()?;
+        self.with_page_chat(&page, |c| c.slot.clone())
     }
 
     /// Whether handing `thread` to agy would let it edit files unasked: the thread forbids that
@@ -5954,12 +5869,7 @@ impl AgentTerminalWindow {
             .slot_of(thread)
             .and_then(|s| s.get())
             .map(|s| s.wanted_mode());
-        let cwd = self.tabs.borrow().iter().find_map(|t| {
-            t.chat
-                .as_ref()
-                .filter(|c| c.thread == thread)
-                .map(|_| t.dir.clone().into())
-        });
+        let cwd = self.with_thread_tab(thread, |t| t.dir.clone().into());
         forbids_unasked_edits(wanted)
             && cached_agy_hook_target(cwd)
                 .is_none_or(|target| cached_hook_verdict(&target).is_err())
@@ -6008,15 +5918,7 @@ impl AgentTerminalWindow {
             return;
         }
         let own = AgentAvailability::shared().get(slot.driver());
-        let route = {
-            let mut tabs = self.tabs.borrow_mut();
-            let Some(chat) = tabs
-                .iter_mut()
-                .filter_map(|t| t.chat.as_mut())
-                .find(|c| c.thread == thread)
-            else {
-                return;
-            };
+        let Some(route) = self.with_chat_mut(thread, |chat| {
             if chat.rebinding {
                 None
             } else {
@@ -6026,6 +5928,8 @@ impl AgentTerminalWindow {
                 }
                 Some(route)
             }
+        }) else {
+            return;
         };
         match route {
             None => self.show_toast("This thread is already switching agent"),
@@ -6050,18 +5954,12 @@ impl AgentTerminalWindow {
         model: Option<String>,
         effort: Option<String>,
     ) {
-        let from = {
-            let mut tabs = self.tabs.borrow_mut();
-            let Some(chat) = tabs
-                .iter_mut()
-                .filter_map(|t| t.chat.as_mut())
-                .find(|c| c.thread == thread)
-            else {
-                return;
-            };
+        let Some(from) = self.with_chat_mut(thread, |chat| {
             chat.rebinding = true;
             chat.pending_switch = None;
             chat.slot.driver()
+        }) else {
+            return;
         };
         info!(
             "Switching thread {thread} from {} to {} before any session ran it",
@@ -6145,12 +6043,7 @@ impl AgentTerminalWindow {
             }
             // Not built: the build waited for this (`ensure_built`); it reads the new agent now.
             None => {
-                let shown = self
-                    .tab_view
-                    .borrow()
-                    .as_ref()
-                    .and_then(|v| v.selected_page())
-                    .is_some_and(|p| p == page);
+                let shown = self.is_selected(&page);
                 if shown {
                     self.ensure_built(&page);
                 }
@@ -6161,12 +6054,8 @@ impl AgentTerminalWindow {
 
     /// The thread of the page in view, if it is a chat thread.
     pub(super) fn current_thread(&self) -> Option<String> {
-        let page = self.tab_view.borrow().as_ref()?.selected_page()?;
-        self.tabs
-            .borrow()
-            .iter()
-            .find(|t| t.page == page)
-            .and_then(|t| t.chat.as_ref().map(|c| c.thread.clone()))
+        let page = self.selected_page()?;
+        self.with_page_chat(&page, |c| c.thread.clone())
     }
 
     /// Runs `then` (an in-place switch of `thread`) now, or, while the thread's turn runs, once
@@ -6179,12 +6068,10 @@ impl AgentTerminalWindow {
             return;
         }
         let busy = self
-            .tabs
-            .borrow()
-            .iter()
-            .filter_map(|t| t.chat.as_ref())
-            .find(|c| c.thread == thread && c.busy())
-            .and_then(|c| {
+            .with_chat(thread, |c| {
+                if !c.busy() {
+                    return None;
+                }
                 busy_reason(
                     c.running,
                     c.background.len() + c.workers_active,
@@ -6192,7 +6079,8 @@ impl AgentTerminalWindow {
                     c.waiting_on_user(),
                 )
                 .map(|why| (c.driver, why))
-            });
+            })
+            .flatten();
         let Some((from, why)) = busy else {
             then(self);
             return;
@@ -6267,13 +6155,7 @@ impl AgentTerminalWindow {
         let Some(slot) = self.slot_of(thread) else {
             return;
         };
-        let dir = self.page_of_thread(thread).and_then(|p| {
-            self.tabs
-                .borrow()
-                .iter()
-                .find(|t| t.page == p)
-                .map(|t| t.dir.clone())
-        });
+        let dir = self.with_thread_tab(thread, |t| t.dir.clone());
         match action {
             // In this thread's folder unless a more specific one applies; it may be gone.
             ViewAction::NewThread => {
@@ -6354,28 +6236,21 @@ impl AgentTerminalWindow {
     }
 
     fn thread_carry_settings(&self, thread: &str) -> CarriedSettings {
-        let tabs = self.tabs.borrow();
-        let chat = tabs
-            .iter()
-            .filter_map(|t| t.chat.as_ref())
-            .find(|c| c.thread == thread);
-        match chat {
-            Some(chat) => {
-                let session = chat.slot.get();
-                carried_settings(
-                    session.as_ref().and_then(|s| s.selected_model()),
-                    session
-                        .as_ref()
-                        .map_or_else(|| chat.pending_effort.clone(), |s| s.selected_effort()),
-                    session
-                        .as_ref()
-                        .map(|s| s.wanted_mode())
-                        .or(chat.chosen_mode)
-                        .or_else(|| chat.view.as_ref().and_then(ChatView::replayed_mode)),
-                )
-            }
-            None => carried_settings(None, None, None),
-        }
+        self.with_chat(thread, |chat| {
+            let session = chat.slot.get();
+            carried_settings(
+                session.as_ref().and_then(|s| s.selected_model()),
+                session
+                    .as_ref()
+                    .map_or_else(|| chat.pending_effort.clone(), |s| s.selected_effort()),
+                session
+                    .as_ref()
+                    .map(|s| s.wanted_mode())
+                    .or(chat.chosen_mode)
+                    .or_else(|| chat.view.as_ref().and_then(ChatView::replayed_mode)),
+            )
+        })
+        .unwrap_or_else(|| carried_settings(None, None, None))
     }
 
     pub(super) fn fork_thread(
@@ -6406,14 +6281,8 @@ impl AgentTerminalWindow {
         compact: bool,
     ) {
         let (title, source_driver, source_profile) = self
-            .tabs
-            .borrow()
-            .iter()
-            .find_map(|t| {
-                t.chat
-                    .as_ref()
-                    .filter(|c| c.thread == thread)
-                    .map(|c| (c.title.clone(), Some(c.driver), c.profile_id.clone()))
+            .with_chat(thread, |c| {
+                (c.title.clone(), Some(c.driver), c.profile_id.clone())
             })
             .unwrap_or_default();
         // A fork on the same agent keeps the profile; continuing in another agent takes that
@@ -6485,13 +6354,7 @@ impl AgentTerminalWindow {
     /// `/rewind`: undo the last turn's changes in the thread's folder, through the 2.x
     /// checkpoint restore (confirmed, and itself undoable).
     fn rewind(&self, page: &adw::TabPage) {
-        let Some((dir, key)) = self
-            .tabs
-            .borrow()
-            .iter()
-            .find(|t| &t.page == page)
-            .map(|t| (t.dir.clone(), t.key))
-        else {
+        let Some((dir, key)) = self.with_page_tab(page, |t| (t.dir.clone(), t.key)) else {
             return;
         };
         let obj = self.obj();
@@ -6613,13 +6476,7 @@ impl AgentTerminalWindow {
 
     /// The profile open thread `thread` runs on `driver` with.
     pub(super) fn thread_profile(&self, thread: &str, driver: Driver) -> Profile {
-        let id = self
-            .tabs
-            .borrow()
-            .iter()
-            .filter_map(|t| t.chat.as_ref())
-            .find(|c| c.thread == thread)
-            .and_then(|c| c.profile_id.clone());
+        let id = self.with_chat(thread, |c| c.profile_id.clone()).flatten();
         self.thread_profile_for(id.as_deref(), driver)
     }
 
@@ -7041,12 +6898,7 @@ impl AgentTerminalWindow {
 
     /// Ctrl+`: shows or hides the current thread's shell, starting it the first time.
     pub(super) fn toggle_drawer(&self) {
-        let Some(page) = self
-            .tab_view
-            .borrow()
-            .as_ref()
-            .and_then(|v| v.selected_page())
-        else {
+        let Some(page) = self.selected_page() else {
             return;
         };
         let state = {
@@ -7094,18 +6946,12 @@ impl AgentTerminalWindow {
     }
 
     fn drawer_exited(&self, page: &adw::TabPage) {
-        let view = {
-            let mut tabs = self.tabs.borrow_mut();
-            let Some(chat) = tabs
-                .iter_mut()
-                .find(|t| &t.page == page)
-                .and_then(|t| t.chat.as_mut())
-            else {
-                return;
-            };
+        let Some(view) = self.with_page_chat_mut(page, |chat| {
             chat.drawer_started = false;
             chat.drawer.set_visible(false);
             chat.view.clone()
+        }) else {
+            return;
         };
         if let Some(view) = view {
             view.focus_composer();
@@ -7411,13 +7257,7 @@ impl AgentTerminalWindow {
 
     /// The model banner's "Choose…": the thread's own model picker.
     fn choose_model(&self, thread: &str) {
-        let view = self
-            .tabs
-            .borrow()
-            .iter()
-            .filter_map(|t| t.chat.as_ref())
-            .find(|c| c.thread == thread)
-            .and_then(|c| c.view.clone());
+        let view = self.with_chat(thread, |c| c.view.clone()).flatten();
         if let Some(view) = view {
             view.open_model_picker();
         }
@@ -7657,26 +7497,20 @@ impl AgentTerminalWindow {
                 let ready = own.is_ready() && resolved.program.is_some();
                 let Some(provider) = provider.filter(|_| ready) else {
                     // Gone again while resolving, or the store failed: wait for the next change.
-                    let parked = if let Some(chat) = obj
+                    let parked = obj
                         .imp()
-                        .tabs
-                        .borrow_mut()
-                        .iter_mut()
-                        .find(|t| t.page == page)
-                        .and_then(|t| t.chat.as_mut())
-                    {
-                        chat.starting = false;
-                        if !read_ok {
-                            chat.pending_switch = None;
-                            None
-                        } else if !keep_switch {
-                            chat.pending_switch.take()
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
+                        .with_page_chat_mut(&page, |chat| {
+                            chat.starting = false;
+                            if !read_ok {
+                                chat.pending_switch = None;
+                                None
+                            } else if !keep_switch {
+                                chat.pending_switch.take()
+                            } else {
+                                None
+                            }
+                        })
+                        .flatten();
                     if let Some((target, model, effort)) = parked {
                         obj.imp()
                             .switch_in_place_with(&thread, target, model, effort);
@@ -7783,11 +7617,8 @@ pub(super) mod tests {
         let built = || {
             window
                 .imp()
-                .tabs
-                .borrow()
-                .iter()
-                .filter_map(|t| t.chat.as_ref())
-                .any(|c| c.thread == thread && c.view.is_some() && !c.building && !c.starting)
+                .with_chat(&thread, |c| c.view.is_some() && !c.building && !c.starting)
+                .unwrap_or(false)
         };
         assert!(crate::testutil::pump_until(&ctx, 5, built));
         assert!(window.imp().slot_of(&thread).unwrap().get().is_none());
@@ -8351,14 +8182,7 @@ pub(super) mod tests {
             })
             .collect();
         let view = imp.tab_view.borrow().clone().unwrap();
-        let page_of = |id: &str| {
-            imp.tabs.borrow().iter().find_map(|t| {
-                t.chat
-                    .as_ref()
-                    .filter(|c| c.thread == id)
-                    .map(|_| t.page.clone())
-            })
-        };
+        let page_of = |id: &str| imp.page_of_thread(id);
         // Closed, then reopened without being shown: a page that was never built.
         view.close_page(&page_of(&ids[1]).unwrap());
         imp.reload_summaries();
@@ -8366,14 +8190,7 @@ pub(super) mod tests {
             .is_none()
             && imp.summary_of(&ids[1]).is_some()));
         imp.open_thread(&ids[1], false).expect("reopened");
-        let skeleton = || {
-            imp.tabs.borrow().iter().find_map(|t| {
-                t.chat
-                    .as_ref()
-                    .filter(|c| c.thread == ids[1])
-                    .and_then(|c| c.holder.first_child())
-            })
-        };
+        let skeleton = || imp.with_chat(&ids[1], |c| c.holder.first_child()).flatten();
         let first = skeleton().expect("an unbuilt page holds its skeleton");
         assert!(
             first.has_css_class("skeleton-idle"),
@@ -8950,30 +8767,18 @@ pub(super) mod tests {
             .last()
             .and_then(|t| t.chat.as_ref().map(|c| c.thread.clone()))
             .expect("a thread page");
-        let state = |f: &dyn Fn(&ChatTab) -> bool| {
-            imp.tabs
-                .borrow()
-                .iter()
-                .filter_map(|t| t.chat.as_ref())
-                .find(|c| c.thread == thread)
-                .is_some_and(f)
-        };
+        let state = |f: &dyn Fn(&ChatTab) -> bool| imp.with_chat(&thread, f).unwrap_or(false);
         let slot = imp.slot_of(&thread).expect("the page's slot");
         let page_state = || {
-            imp.tabs
-                .borrow()
-                .iter()
-                .filter_map(|t| t.chat.as_ref())
-                .find(|c| c.thread == thread)
-                .map(|c| {
-                    format!(
-                        "view built {}, building {}, starting {}, unavailable {}",
-                        c.view.is_some(),
-                        c.building,
-                        c.starting,
-                        c.unavailable
-                    )
-                })
+            imp.with_chat(&thread, |c| {
+                format!(
+                    "view built {}, building {}, starting {}, unavailable {}",
+                    c.view.is_some(),
+                    c.building,
+                    c.starting,
+                    c.unavailable
+                )
+            })
         };
         assert!(
             pump_until(&ctx, 15, || slot.get().is_some()),
@@ -11076,14 +10881,7 @@ pub(super) mod tests {
                 .is_some_and(|t| Some(&t) != before.as_ref())));
             imp.current_thread().unwrap()
         };
-        let built = |id: &str| {
-            imp.tabs
-                .borrow()
-                .iter()
-                .filter_map(|t| t.chat.as_ref())
-                .find(|c| c.thread == id)
-                .and_then(|c| c.view.clone())
-        };
+        let built = |id: &str| imp.with_chat(id, |c| c.view.clone()).flatten();
         // Answers the open dialog with `heading` by clicking `button`, as a user does.
         let answer = |heading: &str, button: &str| {
             let open = || {

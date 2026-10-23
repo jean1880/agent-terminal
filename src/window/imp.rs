@@ -605,6 +605,14 @@ impl TabState {
     fn known_session_id(&self) -> Option<&str> {
         self.session_id.as_deref().or(self.pinned_id.as_deref())
     }
+
+    /// The repository this tab's diffs and branch come from: the one its session was found
+    /// to run in, else its own folder.
+    fn repo_dir(&self) -> String {
+        self.discovered_repo
+            .clone()
+            .unwrap_or_else(|| self.dir.clone())
+    }
 }
 
 /// A request to open a tab resuming a session.
@@ -1385,6 +1393,48 @@ impl ApplicationWindowImpl for AgentTerminalWindow {}
 impl AdwApplicationWindowImpl for AgentTerminalWindow {}
 
 impl AgentTerminalWindow {
+    /// The page in view, once the window has its tab view.
+    fn selected_page(&self) -> Option<adw::TabPage> {
+        self.tab_view
+            .borrow()
+            .as_ref()
+            .and_then(|v| v.selected_page())
+    }
+
+    /// Whether `page` is the page in view.
+    fn is_selected(&self, page: &adw::TabPage) -> bool {
+        self.selected_page().is_some_and(|p| &p == page)
+    }
+
+    /// Runs `f` on `page`'s registry entry, if it has one. The registry stays borrowed while
+    /// `f` runs, so `f` returns owned data and never calls back into the window.
+    fn with_page_tab<R>(&self, page: &adw::TabPage, f: impl FnOnce(&TabState) -> R) -> Option<R> {
+        self.tabs.borrow().iter().find(|t| &t.page == page).map(f)
+    }
+
+    /// [`Self::with_page_tab`], mutably.
+    fn with_page_tab_mut<R>(
+        &self,
+        page: &adw::TabPage,
+        f: impl FnOnce(&mut TabState) -> R,
+    ) -> Option<R> {
+        self.tabs
+            .borrow_mut()
+            .iter_mut()
+            .find(|t| &t.page == page)
+            .map(f)
+    }
+
+    /// Runs `f` on the registry entry whose diff panel is rooted at `root`, as
+    /// [`Self::with_page_tab`] does.
+    fn tab_by_panel<R>(&self, root: &gtk4::Box, f: impl FnOnce(&TabState) -> R) -> Option<R> {
+        self.tabs
+            .borrow()
+            .iter()
+            .find(|t| t.diff_panel.root == *root)
+            .map(f)
+    }
+
     /// Tells the user, once, that their settings file could not be used.
     /// Deferred to idle so the dialog has a presented window to attach to.
     fn report_config_problem(&self) {
@@ -1407,12 +1457,7 @@ impl AgentTerminalWindow {
                 return;
             }
             let imp = window.imp();
-            let selected = imp
-                .tab_view
-                .borrow()
-                .as_ref()
-                .and_then(|view| view.selected_page());
-            if let Some(page) = selected {
+            if let Some(page) = imp.selected_page() {
                 imp.acknowledge_bell(&page);
             }
         });
@@ -1421,9 +1466,7 @@ impl AgentTerminalWindow {
     /// Clears `page`'s pending bell, and withdraws the bell notification once
     /// no tab in any window is still waiting on it.
     fn acknowledge_bell(&self, page: &adw::TabPage) {
-        if let Some(tab) = self.tabs.borrow_mut().iter_mut().find(|t| &t.page == page) {
-            tab.bell_pending = false;
-        }
+        self.with_page_tab_mut(page, |tab| tab.bell_pending = false);
         self.withdraw_bell_if_answered();
     }
 
@@ -1569,15 +1612,13 @@ impl AgentTerminalWindow {
 
     /// Returns the terminal of the currently selected tab, if any.
     fn current_terminal(&self) -> Option<Terminal> {
-        let page = self.tab_view.borrow().as_ref()?.selected_page()?;
-        self.tabs
-            .borrow()
-            .iter()
-            .find(|t| t.page == page)
+        let page = self.selected_page()?;
+        self.with_page_tab(&page, |t| {
             // A thread's drawer shell counts only while it has the keyboard: copy, paste and
             // search otherwise belong to the chat.
-            .filter(|t| t.chat.is_none() || t.terminal.has_focus())
-            .map(|t| t.terminal.clone())
+            (t.chat.is_none() || t.terminal.has_focus()).then(|| t.terminal.clone())
+        })
+        .flatten()
     }
 
     /// Applies a closure to every open tab's terminal.
@@ -1608,12 +1649,8 @@ impl AgentTerminalWindow {
 
     /// The launch directory of the currently selected tab, if tracked.
     fn current_dir(&self) -> Option<String> {
-        let page = self.tab_view.borrow().as_ref()?.selected_page()?;
-        self.tabs
-            .borrow()
-            .iter()
-            .find(|t| t.page == page)
-            .map(|t| t.dir.clone())
+        let page = self.selected_page()?;
+        self.with_page_tab(&page, |t| t.dir.clone())
     }
 
     /// Sets up GAction handlers for context menu items.
@@ -1873,11 +1910,7 @@ impl AgentTerminalWindow {
             move |_, _| {
                 debug!("Action: Restart Session");
                 let imp = obj.imp();
-                let page = imp
-                    .tab_view
-                    .borrow()
-                    .as_ref()
-                    .and_then(|v| v.selected_page());
+                let page = imp.selected_page();
                 if let Some(page) = page {
                     imp.restart_tab(&page);
                 }
@@ -1894,11 +1927,7 @@ impl AgentTerminalWindow {
             move |_, _| {
                 debug!("Action: Checkpoint Now");
                 let imp = obj.imp();
-                let page = imp
-                    .tab_view
-                    .borrow()
-                    .as_ref()
-                    .and_then(|v| v.selected_page());
+                let page = imp.selected_page();
                 if let Some(page) = page {
                     imp.request_checkpoint(&page, true);
                 }
@@ -2717,10 +2746,8 @@ impl AgentTerminalWindow {
                     imp.acknowledge_bell(&page);
                     // A thread page titles the window itself (title and folder).
                     if imp
-                        .tabs
-                        .borrow()
-                        .iter()
-                        .any(|t| t.page == page && t.chat.is_some())
+                        .with_page_tab(&page, |t| t.chat.is_some())
+                        .unwrap_or(false)
                     {
                         return;
                     }
@@ -3401,13 +3428,7 @@ impl AgentTerminalWindow {
                     return;
                 };
                 let imp = obj.imp();
-                let is_active = imp
-                    .tab_view
-                    .borrow()
-                    .as_ref()
-                    .and_then(|view| view.selected_page())
-                    .as_ref()
-                    == Some(&page);
+                let is_active = imp.is_selected(&page);
                 if !is_active {
                     return;
                 }
@@ -3441,13 +3462,7 @@ impl AgentTerminalWindow {
                 if imp.config.borrow().checkpoints {
                     imp.request_checkpoint(&page, false);
                 }
-                let is_selected = imp
-                    .tab_view
-                    .borrow()
-                    .as_ref()
-                    .and_then(|view| view.selected_page())
-                    .as_ref()
-                    == Some(&page);
+                let is_selected = imp.is_selected(&page);
                 // The tab in view of a focused window is already being looked
                 // at. The tab in view of a window in the background is not:
                 // that is the "finished while I was elsewhere" case the
@@ -3524,12 +3539,7 @@ impl AgentTerminalWindow {
         let thread_in_view = self
             .thread_selected_by_restore
             .get()
-            .then(|| {
-                self.tab_view
-                    .borrow()
-                    .as_ref()
-                    .and_then(|v| v.selected_page())
-            })
+            .then(|| self.selected_page())
             .flatten();
         let mut missing = Vec::new();
         for tab in &state.tabs {
@@ -3582,10 +3592,7 @@ impl AgentTerminalWindow {
 
         // Among the tabs saved (terminal pages only), as `restore_previous_session` reads it.
         let selected = self
-            .tab_view
-            .borrow()
-            .as_ref()
-            .and_then(|view| view.selected_page())
+            .selected_page()
             .and_then(|page| {
                 self.tabs
                     .borrow()
@@ -3632,15 +3639,10 @@ impl AgentTerminalWindow {
         // which opens a second window rather than showing this tab.
         // Marked pending under the borrow, sent after it: GApplication is not
         // called into with a tab borrowed.
-        let key = self
-            .tabs
-            .borrow_mut()
-            .iter_mut()
-            .find(|t| &t.page == page)
-            .map(|t| {
-                t.bell_pending = true;
-                t.key
-            });
+        let key = self.with_page_tab_mut(page, |t| {
+            t.bell_pending = true;
+            t.key
+        });
         if let Some(key) = key {
             notification
                 .set_default_action_and_target_value("app.show-tab", Some(&key.to_variant()));
@@ -3657,12 +3659,7 @@ impl AgentTerminalWindow {
 
     /// Reveals the current tab's search bar and puts the cursor in it.
     fn toggle_search(&self) {
-        let Some(page) = self
-            .tab_view
-            .borrow()
-            .as_ref()
-            .and_then(|view| view.selected_page())
-        else {
+        let Some(page) = self.selected_page() else {
             return;
         };
         let tabs = self.tabs.borrow();
@@ -3719,11 +3716,8 @@ impl AgentTerminalWindow {
         };
         // A thread keeps its page: its agent process restarts on the same conversation.
         let chat = self
-            .tabs
-            .borrow()
-            .iter()
-            .find(|t| &t.page == page)
-            .and_then(|t| t.chat.as_ref().map(|c| c.view.clone()));
+            .with_page_tab(page, |t| t.chat.as_ref().map(|c| c.view.clone()))
+            .flatten();
         if let Some(view) = chat {
             if let Some(view) = view {
                 view.restart_agent();
@@ -3731,11 +3725,9 @@ impl AgentTerminalWindow {
             return;
         }
         let (dir, session_id, profile) = self
-            .tabs
-            .borrow()
-            .iter()
-            .find(|t| &t.page == page)
-            .map(|t| (Some(t.dir.clone()), t.session_id.clone(), t.profile.clone()))
+            .with_page_tab(page, |t| {
+                (Some(t.dir.clone()), t.session_id.clone(), t.profile.clone())
+            })
             .unwrap_or_default();
         info!("Restarting session in {:?}", dir);
         match session_id {
@@ -5407,12 +5399,7 @@ impl AgentTerminalWindow {
             );
             return;
         };
-        let Some(page) = self
-            .tab_view
-            .borrow()
-            .as_ref()
-            .and_then(|view| view.selected_page())
-        else {
+        let Some(page) = self.selected_page() else {
             return;
         };
 
@@ -5751,15 +5738,17 @@ impl AgentTerminalWindow {
         if let Some(cmd) = &self.config.borrow().turn_command {
             if let Some(prog) = cmd.first() {
                 let prog = prog.clone();
-                let (sess, dir) = {
-                    let tabs = self.tabs.borrow();
-                    let tab = tabs.iter().find(|t| &t.page == page);
-                    (
-                        tab.and_then(|t| t.session_id.clone().or_else(|| t.pinned_id.clone()))
-                            .unwrap_or_default(),
-                        tab.map(|t| t.dir.clone()).unwrap_or_default(),
-                    )
-                };
+                let (sess, dir) = self
+                    .with_page_tab(page, |t| {
+                        (
+                            t.session_id
+                                .clone()
+                                .or_else(|| t.pinned_id.clone())
+                                .unwrap_or_default(),
+                            t.dir.clone(),
+                        )
+                    })
+                    .unwrap_or_default();
                 let args: Vec<String> = cmd[1..]
                     .iter()
                     .map(|arg| arg.replace("{id}", &sess).replace("{dir}", &dir))
@@ -5795,13 +5784,7 @@ impl AgentTerminalWindow {
                 return;
             };
             let imp = obj.imp();
-            let page = imp
-                .tabs
-                .borrow()
-                .iter()
-                .find(|t| t.diff_panel.root == root)
-                .map(|t| t.page.clone());
-            if let Some(page) = page {
+            if let Some(page) = imp.tab_by_panel(&root, |t| t.page.clone()) {
                 imp.refresh_diff(&page);
             }
         });
@@ -5822,11 +5805,7 @@ impl AgentTerminalWindow {
             };
             let title = obj
                 .imp()
-                .tabs
-                .borrow()
-                .iter()
-                .find(|t| t.diff_panel.root == root)
-                .map(|t| t.page.title().to_string())
+                .tab_by_panel(&root, |t| t.page.title().to_string())
                 .unwrap_or_else(|| "Agent Terminal".to_owned());
             popped.pop_out(obj.upcast_ref(), &title);
         });
@@ -5855,12 +5834,7 @@ impl AgentTerminalWindow {
                 return;
             };
             let imp = obj.imp();
-            let page = imp
-                .tabs
-                .borrow()
-                .iter()
-                .find(|t| t.diff_panel.root == root)
-                .map(|t| t.page.clone());
+            let page = imp.tab_by_panel(&root, |t| t.page.clone());
             let to = match base_of.base() {
                 crate::diff::DiffBase::ThisTab => "how they were when this tab started",
                 _ => "how they were before the last turn",
@@ -5905,21 +5879,10 @@ impl AgentTerminalWindow {
     /// Shows or hides the current tab's diff panel. The choice also becomes
     /// the default for new tabs.
     fn toggle_diff_panel(&self) {
-        let Some(page) = self
-            .tab_view
-            .borrow()
-            .as_ref()
-            .and_then(|v| v.selected_page())
-        else {
+        let Some(page) = self.selected_page() else {
             return;
         };
-        let Some(panel) = self
-            .tabs
-            .borrow()
-            .iter()
-            .find(|t| t.page == page)
-            .map(|t| t.diff_panel.clone())
-        else {
+        let Some(panel) = self.with_page_tab(&page, |t| t.diff_panel.clone()) else {
             return;
         };
         // A panel in its own window is on show already: bring that window up.
@@ -5939,20 +5902,14 @@ impl AgentTerminalWindow {
 
     /// Recomputes `page`'s diff off the main thread, if its panel is showing.
     fn refresh_diff(&self, page: &adw::TabPage) {
-        let Some((dir, key, thread_id, panel)) = self
-            .tabs
-            .borrow()
-            .iter()
-            .find(|t| &t.page == page)
-            .map(|t| {
-                (
-                    t.discovered_repo.clone().unwrap_or_else(|| t.dir.clone()),
-                    t.key,
-                    t.chat.as_ref().map(|c| c.thread.clone()),
-                    t.diff_panel.clone(),
-                )
-            })
-        else {
+        let Some((dir, key, thread_id, panel)) = self.with_page_tab(page, |t| {
+            (
+                t.repo_dir(),
+                t.key,
+                t.chat.as_ref().map(|c| c.thread.clone()),
+                t.diff_panel.clone(),
+            )
+        }) else {
             return;
         };
         if !panel.is_shown() {
@@ -6016,18 +5973,9 @@ impl AgentTerminalWindow {
     /// the Changes toggle to match. The last answer stays on show meanwhile.
     pub(super) fn refresh_repo_presence(&self, page: &adw::TabPage) {
         self.sync_diff_toggle();
-        let Some((dir, thread_id)) = self
-            .tabs
-            .borrow()
-            .iter()
-            .find(|t| &t.page == page)
-            .map(|t| {
-                (
-                    t.discovered_repo.clone().unwrap_or_else(|| t.dir.clone()),
-                    t.chat.as_ref().map(|c| c.thread.clone()),
-                )
-            })
-        else {
+        let Some((dir, thread_id)) = self.with_page_tab(page, |t| {
+            (t.repo_dir(), t.chat.as_ref().map(|c| c.thread.clone()))
+        }) else {
             return;
         };
         let obj = self.obj().downgrade();
@@ -6047,12 +5995,8 @@ impl AgentTerminalWindow {
         let Some(present) = presence else {
             return;
         };
-        let Some((was, panel)) = self
-            .tabs
-            .borrow_mut()
-            .iter_mut()
-            .find(|t| &t.page == page)
-            .map(|t| (t.in_repo.replace(present), t.diff_panel.clone()))
+        let Some((was, panel)) =
+            self.with_page_tab_mut(page, |t| (t.in_repo.replace(present), t.diff_panel.clone()))
         else {
             return;
         };
@@ -6072,16 +6016,10 @@ impl AgentTerminalWindow {
     /// Shows the Changes toggle, and enables its action, only while a page is on show that is
     /// not known to be outside a repository.
     pub(super) fn sync_diff_toggle(&self) {
-        let selected = self
-            .tab_view
-            .borrow()
-            .as_ref()
-            .and_then(|v| v.selected_page());
+        let selected = self.selected_page();
         let usable = selected.is_some_and(|page| {
-            self.tabs
-                .borrow()
-                .iter()
-                .any(|t| t.page == page && t.in_repo != Some(false))
+            self.with_page_tab(&page, |t| t.in_repo != Some(false))
+                .unwrap_or(false)
         });
         if let Some(toggle) = self.diff_toggle.borrow().as_ref() {
             let fits = toggle.first_child().is_some_and(|b| b.is_visible());
@@ -6100,11 +6038,8 @@ impl AgentTerminalWindow {
     /// thread still on show ([`thread_subtitle`]).
     pub(super) fn refresh_branch(&self, page: &adw::TabPage) {
         let Some(dir) = self
-            .tabs
-            .borrow()
-            .iter()
-            .find(|t| &t.page == page && t.chat.is_some())
-            .map(|t| t.discovered_repo.clone().unwrap_or_else(|| t.dir.clone()))
+            .with_page_tab(page, |t| t.chat.is_some().then(|| t.repo_dir()))
+            .flatten()
         else {
             return;
         };
@@ -6129,20 +6064,12 @@ impl AgentTerminalWindow {
         page: &adw::TabPage,
         branch: Option<&Result<agent_kit::github::PrOutcome, String>>,
     ) {
-        let selected = self
-            .tab_view
-            .borrow()
-            .as_ref()
-            .and_then(|v| v.selected_page());
-        if selected.as_ref() != Some(page) {
+        if !self.is_selected(page) {
             return;
         }
         let Some(dir) = self
-            .tabs
-            .borrow()
-            .iter()
-            .find(|t| &t.page == page && t.chat.is_some())
-            .map(|t| t.dir.clone())
+            .with_page_tab(page, |t| t.chat.is_some().then(|| t.dir.clone()))
+            .flatten()
         else {
             return;
         };
@@ -6158,19 +6085,9 @@ impl AgentTerminalWindow {
     /// A branch whose commits are not all on its remote is pushed first (never forced), once the
     /// user confirms it; one never pushed can only be pushed, since its page would be empty.
     fn open_pull_request(&self, panel_root: &gtk4::Box, state: agent_kit::github::PrState) {
-        let Some((page, dir, panel)) = self
-            .tabs
-            .borrow()
-            .iter()
-            .find(|t| t.diff_panel.root == *panel_root)
-            .map(|t| {
-                (
-                    t.page.clone(),
-                    t.discovered_repo.clone().unwrap_or_else(|| t.dir.clone()),
-                    t.diff_panel.clone(),
-                )
-            })
-        else {
+        let Some((page, dir, panel)) = self.tab_by_panel(panel_root, |t| {
+            (t.page.clone(), t.repo_dir(), t.diff_panel.clone())
+        }) else {
             return;
         };
         let Some(url) = state.compare_url() else {
@@ -6281,13 +6198,7 @@ impl AgentTerminalWindow {
             self.show_toast(crate::diff_tool::NO_TOOL_HINT);
             return;
         };
-        let Some(dir) = self
-            .tabs
-            .borrow()
-            .iter()
-            .find(|t| t.diff_panel.root == *panel_root)
-            .map(|t| t.discovered_repo.clone().unwrap_or_else(|| t.dir.clone()))
-        else {
+        let Some(dir) = self.tab_by_panel(panel_root, TabState::repo_dir) else {
             return;
         };
         let new_side = match file.to_checkpoint {
@@ -6773,16 +6684,10 @@ impl AgentTerminalWindow {
     /// `target` would do, and does it only if confirmed. `to` finishes
     /// "Puts … back to" in the confirmation.
     fn confirm_restore(&self, page: &adw::TabPage, target: String, to: &'static str) {
-        let Some((dir, key, mid_turn)) =
-            self.tabs
-                .borrow()
-                .iter()
-                .find(|t| &t.page == page)
-                .map(|t| {
-                    let quiet_for = t.last_output.get().elapsed();
-                    (t.dir.clone(), t.key, quiet_for < CHECKPOINT_QUIET)
-                })
-        else {
+        let Some((dir, key, mid_turn)) = self.with_page_tab(page, |t| {
+            let quiet_for = t.last_output.get().elapsed();
+            (t.dir.clone(), t.key, quiet_for < CHECKPOINT_QUIET)
+        }) else {
             return;
         };
         let obj = self.obj();
@@ -7056,13 +6961,7 @@ impl AgentTerminalWindow {
                     tab.quota_banner.set_revealed(true);
                     // The tab in view shows its banner; a marker there would
                     // stay lit until the user switched away and back.
-                    let in_view = self
-                        .tab_view
-                        .borrow()
-                        .as_ref()
-                        .and_then(|view| view.selected_page())
-                        .as_ref()
-                        == Some(page);
+                    let in_view = self.is_selected(page);
                     if !in_view {
                         page.set_needs_attention(true);
                     }
