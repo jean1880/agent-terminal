@@ -1440,11 +1440,20 @@ impl TranscriptView {
             .and_then(|p| siblings.get(p))
             .and_then(|p| self.rows.borrow().get(p).map(Row::widget))
             .filter(|w| w.parent().as_ref() == Some(container.upcast_ref()));
-        // First of what is built: under a card's "earlier steps" button, if it has one.
+        // First of what is built: under a card's "earlier steps" button, or the transcript's
+        // pinned row (older than the window), if there is one.
         let button = container
             .first_child()
             .filter(|c| c.has_css_class("earlier-steps"));
-        match before.or(button) {
+        let pinned = || {
+            let id = self.pinned.borrow().clone()?;
+            self.rows
+                .borrow()
+                .get(&id)
+                .map(Row::widget)
+                .filter(|w| w.parent().as_ref() == Some(container.upcast_ref()))
+        };
+        match before.or(button).or_else(pinned) {
             Some(before) => container.insert_child_after(widget, Some(&before)),
             None => container.prepend(widget),
         }
