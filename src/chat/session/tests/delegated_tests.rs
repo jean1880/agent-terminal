@@ -2219,6 +2219,71 @@ fn held_news_never_rides_on_a_message_that_restarts_a_gone_codex_process() {
     });
 }
 
+/// A ready root whose stdin closed while its process stays alive takes no news: a line written
+/// to it would be dropped, so the news is neither taken nor spent, and no notice is posted.
+#[test]
+fn held_news_is_never_taken_by_a_process_whose_stdin_failed() {
+    in_loop(|ctx| {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let thread = fresh(&store, &dir.path().to_string_lossy());
+        let (sink, seen) = make_sink();
+        let session = ChatSession::with_env(
+            Box::new(agent_core::claude::ClaudeAdapter::new()),
+            scripted(
+                dir.path(),
+                "IFS= read -r handshake\n\
+                 echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\",\"model\":\"m\",\"claude_code_version\":\"2.1.293\"}'\n\
+                 echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'\n\
+                 exec 0<&-\n\
+                 sleep 30",
+            ),
+            store,
+            thread,
+            sink,
+            Err(None),
+            bare_env(dir.path()),
+        );
+        let writable = |s: &ChatSession| {
+            s.inner
+                .proc
+                .borrow()
+                .as_ref()
+                .is_some_and(|p| p.can_write())
+        };
+        assert!(pump_until(ctx, 10, || has(&seen, |e| matches!(
+            e,
+            Event::TurnCompleted { .. }
+        )) && session.status().alive
+            && !session.status().running_turn));
+        // A write fails once the agent closed its stdin; the process stays alive.
+        session.send_prompt("into a closed pipe");
+        assert!(pump_until(ctx, 10, || !writable(&session)));
+        assert!(session
+            .inner
+            .proc
+            .borrow()
+            .as_ref()
+            .is_some_and(|p| p.is_alive()));
+
+        session.confirm_mode(Mode::Bypass);
+        let news = Rc::new(FakeNews::default());
+        *news.text.borrow_mut() = Some("[agent-terminal] held news".into());
+        session.hold_news_for_user(news.clone());
+        assert!(session.inner.news_for_prompt("now", false).is_none());
+        session.inner.state.borrow_mut().running_turn = false;
+        session.inner.prompt_in_flight.set(false);
+        session.send_prompt("dropped too");
+        assert_eq!(news.taken.get(), 0, "never taken");
+        assert_eq!(news.given_back.get(), 0);
+        assert!(!has(&seen, |e| matches!(
+            e,
+            Event::Notice { text } if text.contains("held news")
+        )));
+        session.shutdown(false);
+    });
+}
+
 /// A message the user writes while a turn runs (live input) carries held news like any other:
 /// framed ahead of it, shown as the app's notice, and taken from the supervisor.
 #[test]

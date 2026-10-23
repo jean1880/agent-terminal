@@ -346,17 +346,28 @@ impl Inner {
     /// sight: Codex keeps prompts in its own queue until its thread has started or resumed, and
     /// drops them if that fails, so news is attached only while the live process of the current
     /// start has reported its session. A gone process never counts: the prompt would restart
-    /// the agent, and wait in that queue. It waits for the next prompt then.
+    /// the agent, and wait in that queue. Nor, for any agent, while its live process can take no
+    /// write (an earlier write to its stdin failed): the line would be dropped. It waits for the
+    /// next prompt then.
+    ///
+    /// Residual, as for an ordinary wake: a line queued to a writable process can still fail
+    /// later in the pipe, after the news was spent; that is not tracked.
     pub(super) fn news_for_prompt(&self, text: &str, handoff: bool) -> Option<TakenNews> {
+        let (live, writable) = self
+            .proc
+            .borrow()
+            .as_ref()
+            .map_or((false, false), |p| (p.is_alive(), p.can_write()));
         let adapter_may_queue = self.adapter.borrow().driver() == Driver::Codex
             && !(self.provider_session_up.get() == Some(self.generation.get())
                 && self.starting.borrow().is_none()
-                && self.proc.borrow().as_ref().is_some_and(|p| p.is_alive()));
+                && writable);
         if handoff
             || self.child.is_some()
             || self.state.borrow().mode != Mode::Bypass
             || Self::is_slash_command(text)
             || adapter_may_queue
+            || (live && !writable)
         {
             return None;
         }
@@ -377,7 +388,16 @@ impl Inner {
             drop(news);
             return;
         }
-        let live = self.proc.borrow().as_ref().is_some_and(|p| p.is_alive());
+        let (live, writable) = self
+            .proc
+            .borrow()
+            .as_ref()
+            .map_or((false, false), |p| (p.is_alive(), p.can_write()));
+        if live && !writable {
+            // Its stdin failed: the line was dropped, not sent. Given back.
+            drop(news);
+            return;
+        }
         let news = if live {
             Some(news)
         } else {

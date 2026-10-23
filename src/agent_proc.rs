@@ -288,6 +288,12 @@ impl AgentProcess {
         !self.shared.exited.get()
     }
 
+    /// Whether a line written now is queued for the agent: it is alive and no earlier write to
+    /// its stdin failed. A queued line may still fail later, in the pipe.
+    pub fn can_write(&self) -> bool {
+        !self.shared.exited.get() && !self.shared.stdin_dead.get()
+    }
+
     /// The process id (also its process group id), when the spawn reported one.
     pub fn pid(&self) -> Option<i32> {
         self.shared.pid
