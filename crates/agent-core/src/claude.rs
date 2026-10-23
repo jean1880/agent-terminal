@@ -656,10 +656,15 @@ impl ClaudeAdapter {
         let msg_id = str_of(msg, "id").unwrap_or_default().to_owned();
         let mut out = Vec::new();
         // A sub-agent's own messages name the model it runs on. A replayed frame is an old
-        // observation: only a frame seen for the first time may update it.
+        // observation: only a frame seen for the first time may update it. A frame with no
+        // uuid cannot be told from a replay, so it counts (the model is still sent only when
+        // it changes); a frame that names no model leaves its uuid free.
         if let Some(parent) = &parent {
-            if self.first_time(format!("{uuid}#model")) {
-                out.extend(self.subagent_model(parent, str_of(msg, "model")));
+            let model = str_of(msg, "model")
+                .map(str::trim)
+                .filter(|m| !m.is_empty() && *m != "<synthetic>");
+            if model.is_some() && (uuid.is_empty() || self.first_time(format!("{uuid}#model"))) {
+                out.extend(self.subagent_model(parent, model));
             }
         }
         for (pos, block) in content.iter().enumerate() {
@@ -2802,6 +2807,38 @@ mod tests {
                 ("toolu_a".to_owned(), "claude-sonnet-5-5".to_owned()),
             ],
             "the replay of s1 reports nothing"
+        );
+    }
+
+    #[test]
+    fn uuid_less_sub_agent_frames_each_report_their_own_model() {
+        let frame = |parent: &str, model: Option<&str>| {
+            let mut message = json!({"id": format!("m-{parent}"), "role": "assistant",
+                "content": [{"type": "text", "text": "working"}]});
+            if let Some(model) = model {
+                message["model"] = json!(model);
+            }
+            json!({"type": "assistant", "parent_tool_use_id": parent, "message": message})
+                .to_string()
+        };
+        let mut a = ClaudeAdapter::new();
+        a.feed(&agent_call("toolu_a", false));
+        a.feed(&agent_call("toolu_b", false));
+        let mut reported = reported_models(&a.feed(&frame("toolu_a", Some("claude-haiku-5-5"))));
+        reported.extend(reported_models(&a.feed(&frame("toolu_b", None))));
+        reported.extend(reported_models(
+            &a.feed(&frame("toolu_b", Some("claude-sonnet-5-5"))),
+        ));
+        reported.extend(reported_models(
+            &a.feed(&frame("toolu_a", Some("claude-haiku-5-5"))),
+        ));
+        assert_eq!(
+            reported,
+            [
+                ("toolu_a".to_owned(), "claude-haiku-5-5".to_owned()),
+                ("toolu_b".to_owned(), "claude-sonnet-5-5".to_owned()),
+            ],
+            "each sub-agent reports once; a frame without a model blocks nothing"
         );
     }
 
