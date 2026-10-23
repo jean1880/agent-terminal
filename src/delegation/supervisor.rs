@@ -375,16 +375,7 @@ mod tests {
             rt.mode = mode;
         }
         let mut state = sup.state.borrow_mut();
-        state.roots.insert(
-            root.worker.clone(),
-            RootRt {
-                row,
-                revoking: false,
-                revision: 0,
-                closed: false,
-                transferring: false,
-            },
-        );
+        state.roots.insert(root.worker.clone(), RootRt::new(row));
         state.threads.insert(thread.clone(), root.worker.clone());
         state.workers.insert(root.worker.clone(), rt);
         (thread, root.worker)
@@ -442,15 +433,12 @@ mod tests {
             let mut state = sup.state.borrow_mut();
             let w = state.workers.get_mut(worker).unwrap();
             let generation = w.generation;
-            w.token = Some(TokenSlot {
+            w.token = Some(TokenSlot::new(
                 epoch,
                 generation,
-                token: cap.clone(),
-                consumed_by: None,
-                live_conn: None,
-                pid: Some(std::process::id()),
-                issued: Instant::now(),
-            });
+                cap.clone(),
+                Some(std::process::id()),
+            ));
         }
         sup.authenticate(
             conn,
@@ -996,15 +984,12 @@ mod tests {
                 let mut state = sup.state.borrow_mut();
                 let w = state.workers.get_mut(&root).unwrap();
                 w.pending_overlay = Some(path.clone());
-                w.token = Some(TokenSlot {
+                w.token = Some(TokenSlot::new(
                     epoch,
-                    generation: ProcessGeneration(9),
-                    token: CapabilityToken::from_random([9; 32]),
-                    consumed_by: None,
-                    live_conn: None,
-                    pid: None,
-                    issued: Instant::now(),
-                });
+                    ProcessGeneration(9),
+                    CapabilityToken::from_random([9; 32]),
+                    None,
+                ));
                 path
             };
             // Never spawned: the overlay goes and the token ends.
@@ -1328,15 +1313,12 @@ mod tests {
         in_context(async {
             let (_dir, sup, root) = harness();
             let cap = CapabilityToken::from_random([4; 32]);
-            sup.state.borrow_mut().workers.get_mut(&root).unwrap().token = Some(TokenSlot {
-                epoch: AuthorityEpoch(0),
-                generation: ProcessGeneration(1),
-                token: cap.clone(),
-                consumed_by: None,
-                live_conn: None,
-                pid: Some(std::process::id()),
-                issued: Instant::now(),
-            });
+            sup.state.borrow_mut().workers.get_mut(&root).unwrap().token = Some(TokenSlot::new(
+                AuthorityEpoch(0),
+                ProcessGeneration(1),
+                cap.clone(),
+                Some(std::process::id()),
+            ));
             let hello = Hello {
                 api: ApiRange { min: 1, max: 1 },
                 instance: sup.instance.clone(),
@@ -2038,6 +2020,18 @@ pub(super) struct RootRt {
     pub closed: bool,
     pub transferring: bool,
 }
+impl RootRt {
+    /// A root just registered: not revoking, open, not moving to another agent.
+    pub fn new(row: RootRow) -> Self {
+        Self {
+            row,
+            revoking: false,
+            revision: 0,
+            closed: false,
+            transferring: false,
+        }
+    }
+}
 pub(super) struct GenRt {
     pub watch: ExitWatch,
     pub overlay: Option<PathBuf>,
@@ -2050,6 +2044,25 @@ pub(super) struct TokenSlot {
     pub live_conn: Option<ConnId>,
     pub pid: Option<u32>,
     pub issued: Instant,
+}
+impl TokenSlot {
+    /// A capability issued now, not yet presented by any connection.
+    pub fn new(
+        epoch: AuthorityEpoch,
+        generation: ProcessGeneration,
+        token: CapabilityToken,
+        pid: Option<u32>,
+    ) -> Self {
+        Self {
+            epoch,
+            generation,
+            token,
+            consumed_by: None,
+            live_conn: None,
+            pid,
+            issued: Instant::now(),
+        }
+    }
 }
 pub(super) struct WorkerRt {
     pub row: WorkerRow,
@@ -2574,16 +2587,7 @@ impl Supervisor {
         {
             let mut state = self.state.borrow_mut();
             state.threads.insert(thread.into(), id.clone());
-            state.roots.insert(
-                id.clone(),
-                RootRt {
-                    row,
-                    revoking: false,
-                    revision: 0,
-                    closed: false,
-                    transferring: false,
-                },
-            );
+            state.roots.insert(id.clone(), RootRt::new(row));
             for child in children.into_iter().filter(|c| c.parent_id.is_some()) {
                 if let Ok(cid) = WorkerId::parse(&child.id) {
                     state
