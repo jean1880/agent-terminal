@@ -1065,11 +1065,7 @@ async fn resolve_active_profile(
 
 /// Presents a one-button informational dialog anchored to `parent`.
 fn present_message(parent: &super::AgentTerminalWindow, heading: &str, body: &str) {
-    let dialog = adw::AlertDialog::new(Some(heading), Some(body));
-    dialog.add_response("ok", "OK");
-    dialog.set_default_response(Some("ok"));
-    dialog.set_close_response("ok");
-    dialog.present(Some(parent.upcast_ref::<gtk4::Widget>()));
+    present_message_over(parent, heading, body);
 }
 
 /// A thread's subtitle: its folder, and the branch checked out when the repository's remote is

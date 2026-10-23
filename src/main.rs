@@ -35,6 +35,7 @@ mod model_catalog;
 mod model_tags_file;
 mod palette;
 mod probe;
+mod style;
 #[cfg(not(feature = "terminal"))]
 pub mod terminal_stub;
 #[cfg(test)]

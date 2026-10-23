@@ -237,19 +237,8 @@ fn command_ok(text: &str) -> bool {
     !text.is_empty() && !text.contains('\n') && !text.starts_with('-')
 }
 
-/// Splits an arguments field as a shell would. `Err` is the reason to show.
-pub(super) fn parse_args(text: &str) -> Result<Vec<String>, String> {
-    if text.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    glib::shell_parse_argv(text)
-        .map(|v| {
-            v.into_iter()
-                .map(|a| a.to_string_lossy().into_owned())
-                .collect()
-        })
-        .map_err(|e| e.message().to_owned())
-}
+// Splits an arguments field as a shell would, as the diff tool's command line is split.
+use super::diff_prefs::parse_argv as parse_args;
 
 /// Whether an env-file field is usable: blank, or a file that exists.
 fn env_file_ok(text: &str) -> bool {

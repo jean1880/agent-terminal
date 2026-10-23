@@ -16,14 +16,7 @@ use gtk4::prelude::*;
 
 const ANIMATION_DURATION_MS: f64 = 200.0;
 
-/// Smooth cubic ease-in-out curve.
-fn ease_in_out(t: f64) -> f64 {
-    if t < 0.5 {
-        4.0 * t * t * t
-    } else {
-        1.0 - (-2.0 * t + 2.0).powi(3) / 2.0
-    }
-}
+use super::pack_animation::ease_in_out;
 
 /// Builds a menu button containing the animated hamburger/vertical-lines icon.
 pub fn build_animated_menu_button(menu_model: &impl IsA<gio::MenuModel>) -> gtk4::MenuButton {

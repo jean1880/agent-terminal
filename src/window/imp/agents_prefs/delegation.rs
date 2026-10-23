@@ -467,14 +467,8 @@ impl AgentTerminalWindow {
     }
 }
 
-/// `path` with the home folder written as `~`, for a narrow table column.
-pub(super) fn tilde(path: &std::path::Path, home: &std::path::Path) -> String {
-    match path.strip_prefix(home) {
-        Ok(rest) if rest.as_os_str().is_empty() => "~".into(),
-        Ok(rest) => format!("~/{}", rest.display()),
-        Err(_) => path.display().to_string(),
-    }
-}
+// `path` with the home folder written as `~`, for a narrow table column.
+use agent_kit::paths::tilde;
 
 /// The review of a registration plan: a Target | Change table, one row per file or folder in
 /// the order Apply changes them, then Cancel and Apply. The receiver gets `true` only for
