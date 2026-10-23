@@ -639,6 +639,33 @@ mod tests {
         });
     }
 
+    /// A capability is current only under its root's present epoch, and never once the root is
+    /// gone or the token is.
+    #[test]
+    fn a_token_is_current_only_under_its_live_roots_epoch() {
+        in_context(async {
+            let (_dir, sup, root) = harness();
+            connect(&sup, &root, ConnId(13)).await;
+            let current = |sup: &Rc<Supervisor>| {
+                let state = sup.state.borrow();
+                state.token_current(&state.workers[&root])
+            };
+            assert!(current(&sup));
+            let row = sup.state.borrow_mut().roots.remove(&root).unwrap();
+            assert!(!current(&sup), "a missing root is stale, not a panic");
+            sup.state.borrow_mut().roots.insert(root.clone(), row);
+            sup.state
+                .borrow_mut()
+                .roots
+                .get_mut(&root)
+                .unwrap()
+                .row
+                .authority_epoch += 1;
+            assert!(!current(&sup), "an older epoch is stale");
+            sup.state.borrow_mut().workers.get_mut(&root).unwrap().token = None;
+            assert!(!current(&sup));
+        });
+    }
     #[test]
     fn spawn_fake_child_runs_task_records_run_and_result() {
         in_context(async {
@@ -2079,6 +2106,17 @@ pub(super) struct Runtime {
     pub wakes: HashMap<WorkerId, agent_core::delegation::wake::Queue>,
     /// Roots with a wake attempt already scheduled.
     pub wake_armed: HashSet<WorkerId>,
+}
+impl Runtime {
+    /// Whether `w` holds a capability issued under its root's current authority epoch. No
+    /// token, or a root no longer registered, is stale.
+    pub fn token_current(&self, w: &WorkerRt) -> bool {
+        w.token.as_ref().is_some_and(|t| {
+            self.roots
+                .get(&w.root)
+                .is_some_and(|r| t.epoch == r.row.epoch())
+        })
+    }
 }
 pub(crate) struct Supervisor {
     pub(super) services: AppServices,

@@ -135,9 +135,7 @@ impl Supervisor {
                     || w.generations.is_empty()
                     || !w.readback.ready
                     || w.row.delegation_status == "rebind_required"
-                    || w.token.as_ref().is_none_or(|t| {
-                        t.epoch.0 != state.roots[&w.root].row.authority_epoch.max(0) as u64
-                    }))
+                    || !state.token_current(w))
         };
         let needs_queue = matches!(plan, DeliveryPlan::QueueNextTurn) || needs_rebind;
         let live = match &plan {

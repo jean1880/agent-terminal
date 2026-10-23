@@ -85,11 +85,7 @@ impl CallDispatcher for Supervisor {
             {
                 let state = sup.state.borrow();
                 let w = &state.workers[&worker];
-                if w.row.parent_id.is_some()
-                    && w.token.as_ref().is_none_or(|t| {
-                        t.epoch.0 != state.roots[&w.root].row.authority_epoch.max(0) as u64
-                    })
-                {
+                if w.row.parent_id.is_some() && !state.token_current(w) {
                     return Err(error(
                         ErrorCode::StaleEpoch,
                         "child credential belongs to an older authority epoch",
@@ -1049,15 +1045,10 @@ impl Supervisor {
         }
         let epoch = self.epoch(worker)?;
         let state = self.state.borrow();
-        let stale = state.workers.get(worker).is_none_or(|w| {
-            w.row.parent_id.is_some()
-                && w.token.as_ref().is_none_or(|t| {
-                    state
-                        .roots
-                        .get(&w.root)
-                        .is_none_or(|r| t.epoch.0 != r.row.authority_epoch.max(0) as u64)
-                })
-        });
+        let stale = state
+            .workers
+            .get(worker)
+            .is_none_or(|w| w.row.parent_id.is_some() && !state.token_current(w));
         if stale {
             return Err(error(
                 ErrorCode::StaleEpoch,
