@@ -67,12 +67,14 @@ impl AgentTerminalWindow {
     /// `remove_data`: the switch's starting state, off when another installed copy that stays
     /// uses the same data.
     fn confirm_uninstall(&self, summary: &str, remove_data: bool, anchor: &gtk4::Button) {
-        let dialog = adw::AlertDialog::new(
-            Some("Uninstall Agent Terminal?"),
-            Some(
-                "Every window closes and running threads stop. The removal finishes after the \
-                 app has quit; a package asks for your password.",
-            ),
+        let dialog = crate::dialogs::confirm_dialog(
+            "Uninstall Agent Terminal?",
+            "Every window closes and running threads stop. The removal finishes after the app \
+             has quit; a package asks for your password.",
+            ("cancel", "Cancel"),
+            ("uninstall", "Uninstall"),
+            adw::ResponseAppearance::Destructive,
+            false,
         );
         let data = adw::SwitchRow::builder()
             .title("Remove Configuration and Data")
@@ -104,11 +106,6 @@ impl AgentTerminalWindow {
         content.append(&rows);
         content.append(&scroller);
         dialog.set_extra_child(Some(&content));
-        dialog.add_response("cancel", "Cancel");
-        dialog.add_response("uninstall", "Uninstall");
-        dialog.set_response_appearance("uninstall", adw::ResponseAppearance::Destructive);
-        dialog.set_default_response(Some("cancel"));
-        dialog.set_close_response("cancel");
         let obj = self.obj();
         dialog.connect_response(
             Some("uninstall"),

@@ -23,7 +23,7 @@ use agent_kit::filediff::{self, TurnBase};
 use gtk4::glib;
 use tracing::{info, warn};
 
-use super::threads::wait_until;
+use super::threads::{off_main, wait_until};
 use crate::chat::{DiffAsk, DiffReply, DiffSource};
 use crate::diff_tool::{self, DiffTools, NewSide, OpenRequest};
 
@@ -158,11 +158,10 @@ impl DiffSource for ThreadDiffs {
         let dir = self.dir.clone();
         glib::MainContext::default().spawn_local(async move {
             let base = me.base_of(&ask.item).await;
-            let reply = gtk4::gio::spawn_blocking(move || {
+            let reply = off_main("computing the diff", move || {
                 filediff::shown_for_item_in(base.as_ref(), &ask.input, Some(Path::new(&dir)))
             })
-            .await
-            .unwrap_or_else(|_| Err("computing the diff panicked".to_owned()));
+            .await;
             done(reply);
         });
     }

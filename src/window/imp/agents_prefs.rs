@@ -237,19 +237,8 @@ fn command_ok(text: &str) -> bool {
     !text.is_empty() && !text.contains('\n') && !text.starts_with('-')
 }
 
-/// Splits an arguments field as a shell would. `Err` is the reason to show.
-pub(super) fn parse_args(text: &str) -> Result<Vec<String>, String> {
-    if text.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    glib::shell_parse_argv(text)
-        .map(|v| {
-            v.into_iter()
-                .map(|a| a.to_string_lossy().into_owned())
-                .collect()
-        })
-        .map_err(|e| e.message().to_owned())
-}
+// Splits an arguments field as a shell would, as the diff tool's command line is split.
+use super::diff_prefs::parse_argv as parse_args;
 
 /// Whether an env-file field is usable: blank, or a file that exists.
 fn env_file_ok(text: &str) -> bool {
@@ -373,7 +362,7 @@ impl AgentTerminalWindow {
         let codex_inputs = self.codex_inputs();
         glib::spawn_future_local(async move {
             let codex = codex_target(codex_inputs).await.ok();
-            Self::store_job(
+            Self::rules_job(
                 move || {
                     crate::always_allow::AlwaysRules::import_into(&target, &sources, codex.as_ref())
                 },
@@ -407,7 +396,7 @@ impl AgentTerminalWindow {
             let codex = codex_target(codex_inputs).await;
             let unresolved = codex.as_ref().err().cloned();
             let codex = codex.ok();
-            Self::store_job(
+            Self::rules_job(
                 move || {
                     crate::always_allow::AlwaysRules::export_from(&target, &sources, codex.as_ref())
                 },
@@ -441,10 +430,7 @@ impl AgentTerminalWindow {
     fn codex_inputs(&self) -> (Profile, Vec<String>) {
         let config = self.config.borrow();
         (
-            config
-                .agent_profile(Driver::Codex)
-                .cloned()
-                .unwrap_or_else(|| crate::config::new_agent_profile(Driver::Codex)),
+            super::threads::agent_profile_or_new(&config, Driver::Codex),
             config.clear_env.clone(),
         )
     }
@@ -452,7 +438,7 @@ impl AgentTerminalWindow {
     /// Runs a rules-store `job` on a worker thread (it may wait for the store lock) and
     /// `finish` on the main thread with its result (`None`: the worker failed). Nothing that
     /// depends on the job's outcome (a toast, the sync indicator) runs before `finish`.
-    fn store_job<T: Send + 'static>(
+    fn rules_job<T: Send + 'static>(
         job: impl FnOnce() -> T + Send + 'static,
         finish: impl FnOnce(Option<T>) + 'static,
     ) {
@@ -469,15 +455,13 @@ impl AgentTerminalWindow {
         done: impl FnOnce(Result<bool, crate::always_allow::StoreError>) + 'static,
     ) {
         glib::spawn_future_local(async move {
-            let result = gtk4::gio::spawn_blocking(move || {
-                crate::always_allow::AlwaysRules::forget(&path, &rule)
-            })
-            .await
-            .unwrap_or_else(|_| {
+            let result = blocking_or(
+                move || crate::always_allow::AlwaysRules::forget(&path, &rule),
                 Err(crate::always_allow::StoreError::Write(
                     "the removal did not finish".to_owned(),
-                ))
-            });
+                )),
+            )
+            .await;
             done(result);
         });
     }
@@ -522,18 +506,12 @@ impl AgentTerminalWindow {
             .iter()
             .find(|(m, _)| *m == mode)
             .map_or("This mode", |(_, n)| *n);
-        let toast = adw::Toast::builder()
-            .title(format!("{name} for this thread"))
-            .use_markup(false)
-            .button_label(format!("Make Default for {}", driver.info().long_label))
-            .timeout(8)
-            .build();
-        let obj = self.obj();
-        toast.connect_button_clicked(glib::clone!(
-            #[weak]
-            obj,
-            move |_| {
-                let imp = obj.imp();
+        self.action_toast(
+            &format!("{name} for this thread"),
+            &format!("Make Default for {}", driver.info().long_label),
+            8,
+            adw::ToastPriority::Normal,
+            move |imp| {
                 // Ask is the built-in default, stored as none (as the Settings row does).
                 imp.edit_agent_profile(driver, |p| {
                     p.default_mode = Some(mode).filter(|m| *m != Mode::Ask);
@@ -542,17 +520,12 @@ impl AgentTerminalWindow {
                     "New {} threads start in {name}",
                     driver.info().long_label
                 ));
-            }
-        ));
-        self.add_toast(toast);
+            },
+        );
     }
 
     fn agent_profile_now(&self, driver: Driver) -> Profile {
-        self.config
-            .borrow()
-            .agent_profile(driver)
-            .cloned()
-            .unwrap_or_else(|| crate::config::new_agent_profile(driver))
+        super::threads::agent_profile_or_new(&self.config.borrow(), driver)
     }
 
     pub(super) fn add_agents_page(&self, dialog: &adw::PreferencesDialog) {
@@ -768,17 +741,43 @@ impl AgentTerminalWindow {
             .css_classes(["pill"])
             .build();
 
-        // Manage rules row
-        let rule_count = crate::always_allow::path()
-            .map(|p| crate::always_allow::AlwaysRules::load(&p).rules.len())
-            .unwrap_or(0);
+        // Manage rules row. The rules file is read off the main thread: the row says so until
+        // the count is in, and the full check below (`sync_cb`) has the last word.
+        let rule_count = |count: usize| {
+            format!(
+                "{count} active rules stored in {}",
+                crate::always_allow::FILE_NAME
+            )
+        };
+        let reading = format!(
+            "Reading the rules stored in {}…",
+            crate::always_allow::FILE_NAME
+        );
+        let rules_path = crate::always_allow::path();
         let manage_row = adw::ActionRow::builder()
             .title("Saved Permission Rules")
-            .subtitle(format!(
-                "{rule_count} active rules stored in {}",
-                crate::always_allow::FILE_NAME
-            ))
+            .subtitle(if rules_path.is_some() {
+                reading.clone()
+            } else {
+                rule_count(0)
+            })
             .build();
+        if let Some(p) = rules_path {
+            let row = manage_row.downgrade();
+            glib::spawn_future_local(async move {
+                let count = blocking_or(
+                    move || crate::always_allow::AlwaysRules::load(&p).rules.len(),
+                    0,
+                )
+                .await;
+                if let Some(row) = row
+                    .upgrade()
+                    .filter(|r| r.subtitle().as_deref() == Some(reading.as_str()))
+                {
+                    row.set_subtitle(&rule_count(count));
+                }
+            });
+        }
         let manage_btn = gtk4::Button::builder()
             .label("Manage Rules…")
             .valign(gtk4::Align::Center)
@@ -1473,17 +1472,7 @@ impl AgentTerminalWindow {
                         });
                     }
                     "export" => {
-                        let confirm = adw::AlertDialog::new(
-                            Some("Export rules outside agent-terminal?"),
-                            Some(&warning),
-                        );
-                        confirm.add_responses(&[("cancel", "Cancel"), ("export", "Export")]);
-                        confirm.set_response_appearance(
-                            "export",
-                            adw::ResponseAppearance::Destructive,
-                        );
-                        confirm.set_default_response(Some("cancel"));
-                        confirm.set_close_response("cancel");
+                        let confirm = export_confirmation(&warning);
                         if confirm.choose_future(root.as_ref()).await == "export" {
                             // Refreshed once the export has finished.
                             imp.export_rules(&p, move || {
@@ -1766,9 +1755,7 @@ impl AgentTerminalWindow {
                 status.set_subtitle("Checking…");
                 let generation = generation.clone();
                 glib::MainContext::default().spawn_local(async move {
-                    let found = gtk4::gio::spawn_blocking(move || detect_agent(&command))
-                        .await
-                        .unwrap_or_else(|_| Err("the check panicked".to_owned()));
+                    let found = off_main("the check", move || detect_agent(&command)).await;
                     if generation.get() != current {
                         return;
                     }
@@ -2160,21 +2147,21 @@ impl AgentTerminalWindow {
             async move {
                 // Settings checks the home-level installation, never a thread's launch proof.
                 let target = super::threads::agy_hook_target(None).await;
-                let (probe, bound) = gtk4::gio::spawn_blocking(move || {
-                    (
-                        crate::hook_config::probe_settings(&target),
-                        crate::approval_server::socket_bindable(),
-                    )
-                })
-                .await
-                .unwrap_or_else(|_| {
+                let (probe, bound) = blocking_or(
+                    move || {
+                        (
+                            crate::hook_config::probe_settings(&target),
+                            crate::approval_server::socket_bindable(),
+                        )
+                    },
                     (
                         crate::hook_config::HookProbe::Unreadable(
                             "the hooks check panicked".into(),
                         ),
                         false,
-                    )
-                });
+                    ),
+                )
+                .await;
                 let badge = crate::hook_config::badge(&probe, bound);
                 crate::hook_config::log_verdict(badge, &probe, bound);
                 let (text, class) = match badge {
@@ -2230,6 +2217,19 @@ fn mark_synced(button: &glib::WeakRef<Button>, refresh: impl Fn() + 'static) {
     });
 }
 
+/// The question an export asks first: `warning` ([`crate::always_allow::export_warning`]),
+/// answered `export` or `cancel`.
+fn export_confirmation(warning: &str) -> adw::AlertDialog {
+    confirm_dialog(
+        "Export rules outside agent-terminal?",
+        warning,
+        ("cancel", "Cancel"),
+        ("export", "Export"),
+        adw::ResponseAppearance::Destructive,
+        false,
+    )
+}
+
 /// The widget name a confirmed export click carries (see [`confirm_export_first`]).
 const EXPORT_CONFIRMED: &str = "export-confirmed";
 
@@ -2241,11 +2241,7 @@ fn confirm_export_first(button: &Button, warning: &str) -> bool {
         button.set_widget_name("");
         return true;
     }
-    let dialog = adw::AlertDialog::new(Some("Export rules outside agent-terminal?"), Some(warning));
-    dialog.add_responses(&[("cancel", "Cancel"), ("export", "Export")]);
-    dialog.set_response_appearance("export", adw::ResponseAppearance::Destructive);
-    dialog.set_default_response(Some("cancel"));
-    dialog.set_close_response("cancel");
+    let dialog = export_confirmation(warning);
     let weak = button.downgrade();
     dialog.connect_response(None, move |_, response| {
         if response == "export" {
@@ -2453,15 +2449,9 @@ pub(super) mod tests {
     fn closing_settings_and_window_flushes_agent_edits() {
         gtk4::init().unwrap();
         adw::init().unwrap();
-        let config_home = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
-        let env_file = config_home.path().join("agent.env");
+        let app = crate::window::imp::test_support::test_app("org.test.SettingsFlush", false);
+        let env_file = app.config_dir().join("agent.env");
         std::fs::write(&env_file, "TEST_FLAG=yes\n").unwrap();
-        let app = adw::Application::builder()
-            .application_id("org.test.SettingsFlush")
-            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
-            .build();
-        app.register(None::<&gtk4::gio::Cancellable>).unwrap();
         let window = crate::window::AgentTerminalWindow::new(&app);
         window.present();
         let prefs = adw::PreferencesDialog::new();
@@ -2533,13 +2523,7 @@ pub(super) mod tests {
     fn invalid_text_keeps_the_saved_command_detection() {
         gtk4::init().unwrap();
         adw::init().unwrap();
-        let config_home = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
-        let app = adw::Application::builder()
-            .application_id("org.test.InvalidDetection")
-            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
-            .build();
-        app.register(None::<&gtk4::gio::Cancellable>).unwrap();
+        let app = crate::window::imp::test_support::test_app("org.test.InvalidDetection", false);
         let window = crate::window::AgentTerminalWindow::new(&app);
         let prefs = adw::PreferencesDialog::new();
         let group = adw::PreferencesGroup::new();
@@ -2580,13 +2564,7 @@ pub(super) mod tests {
     fn typing_a_command_runs_one_scan() {
         gtk4::init().unwrap();
         adw::init().unwrap();
-        let config_home = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
-        let app = adw::Application::builder()
-            .application_id("org.test.AgentDebounce")
-            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
-            .build();
-        app.register(None::<&gtk4::gio::Cancellable>).unwrap();
+        let app = crate::window::imp::test_support::test_app("org.test.AgentDebounce", false);
         let window = crate::window::AgentTerminalWindow::new(&app);
         let ctx = glib::MainContext::default();
         crate::testutil::settle(&ctx);
@@ -2692,10 +2670,9 @@ pub(super) mod tests {
         let group = adw::PreferencesGroup::new();
         let dialog = adw::PreferencesDialog::new();
         imp.add_agent_detail_rows(&group, Driver::Codex, &saved, &dialog);
-        let mut stack = vec![group.upcast::<gtk4::Widget>()];
         let mut fields = Vec::new();
         let mut feedback = Vec::new();
-        while let Some(widget) = stack.pop() {
+        for widget in crate::testutil::descendants(group.upcast_ref()) {
             if let Some(row) = widget.downcast_ref::<adw::EntryRow>() {
                 fields.push(row.clone());
             }
@@ -2703,11 +2680,6 @@ pub(super) mod tests {
                 if row.title() == "Not Saved" {
                     feedback.push(row.clone());
                 }
-            }
-            let mut child = widget.first_child();
-            while let Some(widget) = child {
-                child = widget.next_sibling();
-                stack.push(widget);
             }
         }
         for (title, bad) in [
@@ -2800,14 +2772,7 @@ pub(super) mod tests {
         adw::init().expect("libadwaita init");
         crate::load_css();
         let ctx = glib::MainContext::default();
-        let config_home = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
-        let app = adw::Application::builder()
-            .application_id("org.test.Dropdowns")
-            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
-            .build();
-        app.register(None::<&gtk4::gio::Cancellable>)
-            .expect("registering a non-unique application");
+        let app = crate::window::imp::test_support::test_app("org.test.Dropdowns", false);
         let win = super::super::super::AgentTerminalWindow::new(&app);
         let rows: Vec<adw::ComboRow> = vec![win.imp().default_agent_row()];
         for width in [360, 1400] {
@@ -2993,7 +2958,7 @@ pub(super) mod tests {
             let finished: Rc<std::cell::Cell<Option<usize>>> = Rc::default();
             let seen = finished.clone();
             let target = path.clone();
-            AgentTerminalWindow::store_job(
+            AgentTerminalWindow::rules_job(
                 move || AlwaysRules::import_into(&target, &[source], None),
                 move |result| seen.set(Some(result.and_then(Result::ok).map_or(0, |i| i.added))),
             );
