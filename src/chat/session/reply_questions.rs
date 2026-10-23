@@ -382,20 +382,17 @@ mod tests {
 /// The hook end to end: events through a live session to the view's sink and the store.
 #[cfg(test)]
 mod session_tests {
-    use std::cell::RefCell;
     use std::rc::Rc;
 
     use agent_core::adapter::Adapter;
     use agent_core::event::{Envelope, Event, ItemKind, QuestionSource, StreamKind, TurnState};
     use agent_kit::store::Store;
 
+    use crate::chat::session::tests::{make_sink, Seen};
     use crate::chat::session::ChatSession;
-    use crate::chat::EnvelopeSink;
-    use crate::testutil::{in_loop, pump_until};
+    use crate::testutil::{in_loop, open_session, pump_until};
 
     const ASKS: &str = "Which do you prefer?\n\n- Keep it\n- Drop it";
-
-    type Seen = Rc<RefCell<Vec<Envelope>>>;
 
     /// A session over an inert process, its sink log and its store.
     fn session(
@@ -407,21 +404,12 @@ mod session_tests {
         let thread = store
             .create_thread(&dir.to_string_lossy(), Some("t"))
             .expect("thread");
-        let seen: Seen = Rc::default();
-        let log = seen.clone();
-        let sink: EnvelopeSink = Rc::new(move |e: &Envelope| log.borrow_mut().push(e.clone()));
-        let open = agent_core::adapter::OpenSession {
-            program: "/bin/sh".into(),
-            extra_args: vec!["-c".into(), "cat > /dev/null".into()],
-            cwd: dir.to_string_lossy().into_owned(),
-            model: None,
-            effort: None,
-            mode: agent_core::adapter::Mode::Ask,
-            resume: None,
-            new_session_id: None,
-            approval_hook: false,
-            delegation: None,
-        };
+        let (sink, seen) = make_sink();
+        let open = open_session(
+            "/bin/sh",
+            vec!["-c".into(), "cat > /dev/null".into()],
+            dir.to_string_lossy().into_owned(),
+        );
         let session = ChatSession::new(adapter, open, store.clone(), thread.clone(), sink, None);
         assert!(pump_until(ctx, 10, || session.inner.state.borrow().alive));
         (session, seen, store, thread)

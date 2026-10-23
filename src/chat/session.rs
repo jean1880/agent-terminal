@@ -5559,7 +5559,7 @@ mod scripted_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{in_loop, pump_until};
+    use crate::testutil::{in_loop, open_session, pump_until};
     use agent_core::agy::AgyAdapter;
     use agent_core::caps::Capabilities;
     use std::path::Path;
@@ -5571,9 +5571,9 @@ mod tests {
     const FIXTURE: &str = include_str!("../../crates/agent-core/tests/fixtures/agy-edit.ndjson");
     const CONVERSATION: &str = "3af90996-e4fe-44be-8d6c-ca20da039f6f";
 
-    type Seen = Rc<RefCell<Vec<Envelope>>>;
+    pub(super) type Seen = Rc<RefCell<Vec<Envelope>>>;
 
-    fn make_sink() -> (EnvelopeSink, Seen) {
+    pub(super) fn make_sink() -> (EnvelopeSink, Seen) {
         let seen: Seen = Rc::default();
         let s = seen.clone();
         (
@@ -5639,18 +5639,11 @@ mod tests {
             ),
         )
         .expect("script");
-        OpenSession {
-            program: "/bin/sh".into(),
-            extra_args: vec![script.to_string_lossy().into_owned()],
-            cwd: dir.to_string_lossy().into_owned(),
-            model: None,
-            effort: None,
-            mode: Mode::Ask,
-            resume: None,
-            new_session_id: None,
-            approval_hook: false,
-            delegation: None,
-        }
+        open_session(
+            "/bin/sh",
+            vec![script.to_string_lossy().into_owned()],
+            dir.to_string_lossy().into_owned(),
+        )
     }
 
     fn lines(path: std::path::PathBuf) -> Vec<String> {
@@ -6536,16 +6529,8 @@ mod tests {
 
     fn open_on(model: &str) -> OpenSession {
         OpenSession {
-            program: "/bin/true".into(),
-            extra_args: Vec::new(),
-            cwd: "/".into(),
             model: Some(model.into()),
-            effort: None,
-            mode: Mode::Ask,
-            resume: None,
-            new_session_id: None,
-            approval_hook: false,
-            delegation: None,
+            ..open_session("/bin/true", Vec::new(), "/")
         }
     }
 
@@ -7427,18 +7412,7 @@ mod tests {
                     caps: Capabilities::codex(),
                     outbox: agent_core::adapter::Outbox::default(),
                 }),
-                OpenSession {
-                    program: "unused".into(),
-                    extra_args: Vec::new(),
-                    cwd: "/".into(),
-                    model: None,
-                    effort: None,
-                    mode: Mode::Ask,
-                    resume: None,
-                    new_session_id: None,
-                    approval_hook: false,
-                    delegation: None,
-                },
+                open_session("unused", Vec::new(), "/"),
                 store,
                 thread,
                 sink,
@@ -7484,16 +7458,9 @@ mod tests {
             let session = ChatSession::new(
                 FakeAdapter::boxed(Driver::Agy, &log),
                 OpenSession {
-                    program: "/usr/bin/agy".into(),
-                    extra_args: vec!["--agy-only".into()],
-                    cwd: "/".into(),
                     model: Some("gemini-3.1-pro-high".into()),
-                    effort: None,
                     mode: Mode::Plan,
-                    resume: None,
-                    new_session_id: None,
-                    approval_hook: false,
-                    delegation: None,
+                    ..open_session("/usr/bin/agy", vec!["--agy-only".into()], "/")
                 },
                 store,
                 thread,
@@ -7569,16 +7536,8 @@ mod tests {
         let session = ChatSession::new(
             FakeAdapter::boxed(Driver::Claude, log),
             OpenSession {
-                program: "unused".into(),
-                extra_args: Vec::new(),
-                cwd: "/".into(),
-                model: None,
-                effort: None,
                 mode,
-                resume: None,
-                new_session_id: None,
-                approval_hook: false,
-                delegation: None,
+                ..open_session("unused", Vec::new(), "/")
             },
             store,
             thread,
@@ -7690,16 +7649,9 @@ mod tests {
             let session = ChatSession::new(
                 FakeAdapter::boxed(Driver::Agy, &log_agy),
                 OpenSession {
-                    program: "unused".into(),
-                    extra_args: vec!["--profile-only".into()],
-                    cwd: "/".into(),
                     model: Some("gemini-pro".into()),
-                    effort: None,
                     mode: Mode::Plan,
-                    resume: None,
-                    new_session_id: None,
-                    approval_hook: false,
-                    delegation: None,
+                    ..open_session("unused", vec!["--profile-only".into()], "/")
                 },
                 store.clone(),
                 thread.clone(),
@@ -8123,16 +8075,9 @@ mod tests {
         let session = ChatSession::new(
             FakeAdapter::boxed(Driver::Agy, &log_agy),
             OpenSession {
-                program: "unused".into(),
-                extra_args: Vec::new(),
-                cwd: "/".into(),
                 model: Some("gemini-pro".into()),
-                effort: None,
                 mode: Mode::Plan,
-                resume: None,
-                new_session_id: None,
-                approval_hook: false,
-                delegation: None,
+                ..open_session("unused", Vec::new(), "/")
             },
             store.clone(),
             thread.clone(),
@@ -8320,18 +8265,11 @@ mod tests {
              {body}\n"
         );
         std::fs::write(&script, text).expect("script");
-        OpenSession {
-            program: "/bin/sh".into(),
-            extra_args: vec![script.to_string_lossy().into_owned()],
-            cwd: dir.to_string_lossy().into_owned(),
-            model: None,
-            effort: None,
-            mode: Mode::Ask,
-            resume: None,
-            new_session_id: None,
-            approval_hook: false,
-            delegation: None,
-        }
+        open_session(
+            "/bin/sh",
+            vec![script.to_string_lossy().into_owned()],
+            dir.to_string_lossy().into_owned(),
+        )
     }
 
     /// A Claude known to take `--thinking-display` gets it; one that exits at start with
@@ -9272,16 +9210,9 @@ mod tests {
             let session = ChatSession::new(
                 FakeAdapter::boxed(Driver::Agy, &log),
                 OpenSession {
-                    program: "unused".into(),
-                    extra_args: Vec::new(),
-                    cwd: "/".into(),
                     model: Some("gemini-pro".into()),
-                    effort: None,
                     mode: Mode::Plan,
-                    resume: None,
-                    new_session_id: None,
-                    approval_hook: false,
-                    delegation: None,
+                    ..open_session("unused", Vec::new(), "/")
                 },
                 store,
                 "no-such-thread".into(),
@@ -9313,16 +9244,9 @@ mod tests {
             let session = ChatSession::new(
                 FakeAdapter::boxed(Driver::Agy, &log),
                 OpenSession {
-                    program: "unused".into(),
-                    extra_args: Vec::new(),
-                    cwd: "/".into(),
                     model: Some("gemini-pro".into()),
-                    effort: None,
                     mode: Mode::Plan,
-                    resume: None,
-                    new_session_id: None,
-                    approval_hook: false,
-                    delegation: None,
+                    ..open_session("unused", Vec::new(), "/")
                 },
                 store.clone(),
                 thread.clone(),
@@ -9352,16 +9276,10 @@ mod tests {
             let session = ChatSession::new(
                 FakeAdapter::refusing_set_model(Driver::Agy, &log),
                 OpenSession {
-                    program: "unused".into(),
-                    extra_args: Vec::new(),
-                    cwd: "/".into(),
                     model: Some("gemini-pro".into()),
-                    effort: None,
                     mode: Mode::Plan,
                     resume: Some("native-1".into()),
-                    new_session_id: None,
-                    approval_hook: false,
-                    delegation: None,
+                    ..open_session("unused", Vec::new(), "/")
                 },
                 store,
                 thread,
@@ -9614,11 +9532,20 @@ mod tests {
         let (sink, seen) = make_sink();
         let open = scripted(dir, "cat > \"$D/stdin.log\"");
         let session = ChatSession::new(adapter, open, store, thread, sink, None);
+        (with_rules_in(ctx, dir, session), seen)
+    }
+
+    /// `session` with its Always rules in `dir`, once its process is up.
+    fn with_rules_in(
+        ctx: &glib::MainContext,
+        dir: &Path,
+        session: Rc<ChatSession>,
+    ) -> Rc<ChatSession> {
         *session.inner.saved_rules.borrow_mut() = Some(crate::always_allow::StoreCache::new(
             dir.join(crate::always_allow::FILE_NAME),
         ));
         assert!(pump_until(ctx, 10, || session.inner.state.borrow().alive));
-        (session, seen)
+        session
     }
 
     fn feed(session: &ChatSession, line: &str) {
@@ -10793,16 +10720,8 @@ mod tests {
             let session = ChatSession::new(
                 Box::new(agent_core::agy::AgyAdapter::new("agy")),
                 OpenSession {
-                    program: "unused".into(),
-                    extra_args: Vec::new(),
-                    cwd: "/".into(),
-                    model: None,
-                    effort: None,
                     mode: Mode::Plan,
-                    resume: None,
-                    new_session_id: None,
-                    approval_hook: false,
-                    delegation: None,
+                    ..open_session("unused", Vec::new(), "/")
                 },
                 store,
                 thread,
@@ -10937,16 +10856,8 @@ mod tests {
         let session = ChatSession::new(
             Box::new(agent_core::agy::AgyAdapter::new("agy")),
             OpenSession {
-                program: "unused".into(),
-                extra_args: Vec::new(),
-                cwd: "/".into(),
-                model: None,
-                effort: None,
                 mode: Mode::Plan,
-                resume: None,
-                new_session_id: None,
-                approval_hook: false,
-                delegation: None,
+                ..open_session("unused", Vec::new(), "/")
             },
             store,
             thread,

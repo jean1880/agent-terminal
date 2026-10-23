@@ -32,6 +32,27 @@ pub fn capture_window(window: &gtk4::Window, name: &str) {
     }
 }
 
+/// A session that runs `program` with `extra_args` in `cwd`, in Ask mode, with no model, effort,
+/// resume, hook or delegation: the base every session test changes what it needs on.
+pub fn open_session(
+    program: impl Into<String>,
+    extra_args: Vec<String>,
+    cwd: impl Into<String>,
+) -> agent_core::adapter::OpenSession {
+    agent_core::adapter::OpenSession {
+        program: program.into(),
+        extra_args,
+        cwd: cwd.into(),
+        model: None,
+        effort: None,
+        mode: agent_core::adapter::Mode::Ask,
+        resume: None,
+        new_session_id: None,
+        approval_hook: false,
+        delegation: None,
+    }
+}
+
 /// Runs `body` with a private main context as the thread default, so every test drives its own
 /// loop and tests running in parallel threads never share a context.
 pub fn in_loop<R>(body: impl FnOnce(&glib::MainContext) -> R) -> R {

@@ -2,6 +2,7 @@
 //! gate and publisher, and real adapters over deterministic fake processes. Nothing reaches a
 //! provider or the network.
 
+use super::super::scripted_tests::{minimal_env, recorded_frames, scripted_codex};
 use super::*;
 use crate::agent_proc::{ExitWatch, StopPhase};
 use crate::delegation::seam::{
@@ -242,42 +243,6 @@ fn run() -> RunId {
     RunId::from_suffix("run000001").expect("run id")
 }
 
-/// A private environment for a fake process: no inherited variable reaches it.
-fn bare_env(dir: &Path) -> LaunchEnv {
-    LaunchEnv {
-        unset: std::env::vars_os()
-            .map(|(key, _)| key.to_string_lossy().into_owned())
-            .collect(),
-        env: vec![
-            ("HOME".into(), dir.to_string_lossy().into_owned()),
-            ("PATH".into(), "/usr/bin:/bin".into()),
-            ("LC_ALL".into(), "C".into()),
-        ],
-    }
-}
-
-fn codex_open(dir: &Path, mode: Mode) -> OpenSession {
-    OpenSession {
-        program: "/usr/bin/python3".into(),
-        extra_args: vec![
-            "-I".into(),
-            format!(
-                "{}/tests/support/scripted_codex.py",
-                env!("CARGO_MANIFEST_DIR")
-            ),
-            dir.to_string_lossy().into_owned(),
-        ],
-        cwd: dir.to_string_lossy().into_owned(),
-        model: Some("synthetic-model".into()),
-        effort: None,
-        mode,
-        resume: None,
-        new_session_id: None,
-        approval_hook: false,
-        delegation: None,
-    }
-}
-
 struct Child {
     dir: tempfile::TempDir,
     store: Rc<Store>,
@@ -290,11 +255,7 @@ struct Child {
 
 impl Child {
     fn frames(&self) -> Vec<Value> {
-        std::fs::read_to_string(self.dir.path().join("frames.ndjson"))
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-            .collect()
+        recorded_frames(self.dir.path())
     }
 
     fn sent(&self, method: &str) -> Vec<Value> {
@@ -327,12 +288,12 @@ fn codex_child(mode: Mode, gate: Rc<TestGate>, prepare: impl FnOnce(&Path)) -> C
     let hooks = Rc::new(TestHooks::default());
     let session = ChatSession::with_options(
         Box::new(CodexAdapter::new()),
-        codex_open(dir.path(), mode),
+        scripted_codex(dir.path(), mode, None),
         SessionStore::from(store.clone()),
         thread.clone(),
         sink,
         Err(None),
-        bare_env(dir.path()),
+        minimal_env(dir.path()),
         SessionOptions {
             generation_base: ProcessGeneration(0),
             hooks: Some(hooks.clone()),
@@ -386,18 +347,7 @@ fn claude_child(
             }),
         },
     );
-    *session.inner.saved_rules.borrow_mut() = Some(crate::always_allow::StoreCache::new(
-        dir.join(crate::always_allow::FILE_NAME),
-    ));
-    assert!(pump_until(ctx, 10, || session.inner.state.borrow().alive));
-    (session, seen)
-}
-
-fn claude_tool(id: &str, tool: &str, input: Value) -> String {
-    json!({"type": "control_request", "request_id": id, "request": {
-        "subtype": "can_use_tool", "tool_name": tool, "tool_use_id": format!("tu-{id}"),
-        "input": input}})
-    .to_string()
+    (with_rules_in(ctx, dir, session), seen)
 }
 
 fn stdin_has(ctx: &glib::MainContext, dir: &Path, needle: &str) -> bool {
@@ -1323,12 +1273,12 @@ fn a_child_turn_model_change_and_usage_never_touch_the_root() {
         let (root_sink, root_seen) = make_sink();
         let root = ChatSession::with_env(
             Box::new(CodexAdapter::new()),
-            codex_open(root_dir.path(), Mode::Ask),
+            scripted_codex(root_dir.path(), Mode::Ask, None),
             root_store.clone(),
             root_thread.clone(),
             root_sink,
             Err(None),
-            bare_env(root_dir.path()),
+            minimal_env(root_dir.path()),
         );
         assert!(pump_until(ctx, 10, || has(&root_seen, |e| matches!(
             e,
@@ -1704,7 +1654,7 @@ fn a_delegation_root_suspends_only_with_its_hooks_consent() {
             thread,
             sink,
             Err(None),
-            bare_env(dir.path()),
+            minimal_env(dir.path()),
             SessionOptions {
                 generation_base: ProcessGeneration(0),
                 hooks: Some(hooks.clone()),
@@ -1771,7 +1721,7 @@ fn a_root_is_woken_by_news_only_when_idle_within_the_cap_and_never_after_a_stop(
             thread,
             sink,
             Err(None),
-            bare_env(dir.path()),
+            minimal_env(dir.path()),
             SessionOptions {
                 generation_base: ProcessGeneration(0),
                 hooks: Some(hooks.clone()),
@@ -1863,7 +1813,7 @@ fn a_refused_wake_posts_no_notice_and_its_retry_posts_one() {
             thread,
             sink,
             Err(None),
-            bare_env(dir.path()),
+            minimal_env(dir.path()),
             SessionOptions {
                 generation_base: ProcessGeneration(0),
                 hooks: Some(hooks.clone()),

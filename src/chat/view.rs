@@ -1849,18 +1849,7 @@ pub(crate) mod tests {
         let received = events.clone();
         let session = crate::chat::session::ChatSession::new(
             Box::new(agent_core::claude::ClaudeAdapter::new()),
-            agent_core::adapter::OpenSession {
-                program: "/bin/cat".into(),
-                extra_args: Vec::new(),
-                cwd: "/".into(),
-                model: None,
-                effort: None,
-                mode: Mode::Ask,
-                resume: None,
-                new_session_id: None,
-                approval_hook: false,
-                delegation: None,
-            },
+            crate::testutil::open_session("/bin/cat", Vec::new(), "/"),
             store.clone(),
             thread.clone(),
             Rc::new(move |env| received.borrow_mut().push(env.clone())),
