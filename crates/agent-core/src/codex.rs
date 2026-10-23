@@ -3402,6 +3402,15 @@ mod tests {
         w.remove(0)
     }
 
+    /// The one line a prompt writes. Encodes only: nothing is fed or drained.
+    fn prompt(adapter: &mut CodexAdapter, text: &str) -> Value {
+        one_write(
+            adapter
+                .encode(Command::Prompt { text: text.into() })
+                .expect("prompt"),
+        )
+    }
+
     /// Frames follow the installed app-server JSON schema; no provider prompt is needed.
     #[test]
     fn collaboration_frames_publish_workers_and_explicit_waits() {
@@ -3794,13 +3803,7 @@ mod tests {
         assert_eq!(start["params"]["approvalPolicy"], "untrusted");
         assert_eq!(start["params"]["sandbox"], "workspace-write");
         child.feed(r#"{"id":2,"result":{"thread":{"id":"th-1"}}}"#);
-        let turn = one_write(
-            child
-                .encode(Command::Prompt {
-                    text: "task".into(),
-                })
-                .expect("prompt"),
-        );
+        let turn = prompt(&mut child, "task");
         assert_eq!(turn["params"]["approvalPolicy"], "untrusted");
         assert_eq!(turn["params"]["sandboxPolicy"]["type"], "workspaceWrite");
         assert_eq!(child.workspace_writable(), Some(true));
@@ -3969,12 +3972,7 @@ mod tests {
     #[test]
     fn changing_mode_mid_turn_does_not_claim_the_current_sandbox_changed() {
         let mut a = started(Mode::Ask);
-        let first = one_write(
-            a.encode(Command::Prompt {
-                text: "Review".into(),
-            })
-            .expect("prompt"),
-        );
+        let first = prompt(&mut a, "Review");
         assert_eq!(first["params"]["sandboxPolicy"]["type"], "readOnly");
         a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu"}}}"#);
         a.encode(Command::SetMode {
@@ -4001,12 +3999,7 @@ mod tests {
                 mode: Mode::AcceptEdits
             }
         )));
-        let next = one_write(
-            a.encode(Command::Prompt {
-                text: "Edit".into(),
-            })
-            .expect("prompt"),
-        );
+        let next = prompt(&mut a, "Edit");
         assert_eq!(next["params"]["sandboxPolicy"]["type"], "workspaceWrite");
         assert_eq!(next["params"]["approvalPolicy"], "untrusted");
     }
@@ -4050,12 +4043,7 @@ mod tests {
         a.drain_outbox();
         a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu","status":"interrupted"}}}"#);
         assert_eq!(a.effective_mode, None);
-        let next = one_write(
-            a.encode(Command::Prompt {
-                text: "Plan".into(),
-            })
-            .expect("prompt"),
-        );
+        let next = prompt(&mut a, "Plan");
         assert_eq!(next["params"]["sandboxPolicy"]["type"], "readOnly");
         assert_eq!(next["params"]["approvalPolicy"], "never");
     }
@@ -4063,12 +4051,7 @@ mod tests {
     #[test]
     fn mode_change_during_pending_start_is_deferred_and_failed_start_clears_it() {
         let mut a = started(Mode::Ask);
-        let start = one_write(
-            a.encode(Command::Prompt {
-                text: "Review".into(),
-            })
-            .expect("prompt"),
-        );
+        let start = prompt(&mut a, "Review");
         a.encode(Command::SetMode {
             mode: Mode::AcceptEdits,
         })
@@ -4189,12 +4172,10 @@ mod tests {
                             _ => Decision::Cancel,
                         };
                         let actions = a
-                            .encode(Command::Approve {
-                                request: last_request.clone().expect("approval seen"),
+                            .encode(approve_cmd(
+                                last_request.as_deref().expect("approval seen"),
                                 decision,
-                                updated_input: None,
-                                message: None,
-                            })
+                            ))
                             .expect("approve");
                         wrote.extend(writes(&actions));
                     }
@@ -4492,12 +4473,7 @@ mod tests {
             a.argv(&session(Mode::Ask, Some("th-1")));
             a.handshake();
             a.feed(r#"{"id":2,"result":{"thread":{"id":"th-1"}}}"#);
-            let sent = one_write(
-                a.encode(Command::Prompt {
-                    text: "continue".into(),
-                })
-                .expect("send"),
-            );
+            let sent = prompt(&mut a, "continue");
             let response = if success {
                 json!({"id":sent["id"],"result":{"turn":{"id":"tu"}}})
             } else {
@@ -4586,12 +4562,7 @@ mod tests {
         a.argv(&session(Mode::Ask, Some("th-1")));
         a.handshake();
         a.feed(r#"{"id":2,"result":{"thread":{"id":"th-1"}}}"#);
-        let sent = one_write(
-            a.encode(Command::Prompt {
-                text: "continue".into(),
-            })
-            .expect("send"),
-        );
+        let sent = prompt(&mut a, "continue");
         let failed = a.feed(r#"{"id":1,"error":{"message":"initialize denied"}}"#);
         assert!(failed.iter().any(|e| matches!(
             e.event,
@@ -4613,12 +4584,7 @@ mod tests {
         a.argv(&session(Mode::Ask, Some("th-1")));
         a.handshake();
         a.feed(r#"{"id":2,"result":{"thread":{"id":"th-1"}}}"#);
-        let sent = one_write(
-            a.encode(Command::Prompt {
-                text: "continue".into(),
-            })
-            .expect("send"),
-        );
+        let sent = prompt(&mut a, "continue");
         let reroute = a.feed(r#"{"method":"model/rerouted","params":{"threadId":"th-1","turnId":"tu","toModel":"fallback"}}"#);
         assert!(matches!(&reroute[0].event, Event::ModelChanged { model } if model == "fallback"));
         assert!(reroute[0].request.is_none());
@@ -4702,12 +4668,7 @@ mod tests {
             let flushed = writes(&a.drain_outbox().actions);
             assert_eq!(flushed[0]["params"]["model"], "gpt-5.5");
             assert_eq!(flushed[0]["params"]["effort"], "high");
-            let next = one_write(
-                a.encode(Command::Prompt {
-                    text: "next".into(),
-                })
-                .expect("send"),
-            );
+            let next = prompt(&mut a, "next");
             assert_eq!(next["params"]["model"], "gpt-5.5");
         }
     }
@@ -4749,7 +4710,7 @@ mod tests {
         ];
         for (mode, approval, sandbox) in table {
             let mut a = started(mode);
-            let w = one_write(a.encode(Command::Prompt { text: "hi".into() }).expect("ok"));
+            let w = prompt(&mut a, "hi");
             assert_eq!(
                 w,
                 json!({"id": 3, "method": "turn/start", "params": {
@@ -4796,7 +4757,7 @@ mod tests {
                 }),
             ]
         );
-        let w = one_write(a.encode(Command::Prompt { text: "x".into() }).expect("ok"));
+        let w = prompt(&mut a, "x");
         assert_eq!(w["params"]["model"], "gpt-5.5");
         assert_eq!(w["params"]["approvalPolicy"], "untrusted");
         assert_eq!(
@@ -4824,12 +4785,7 @@ mod tests {
                 .events
                 .iter()
                 .any(|e| matches!(e.event, Event::ModelChanged { .. })));
-            let sent = one_write(
-                a.encode(Command::Prompt {
-                    text: "first".into(),
-                })
-                .expect("send"),
-            );
+            let sent = prompt(&mut a, "first");
             a.encode(Command::SetModel {
                 model: "newer".into(),
                 effort: Some("low".into()),
@@ -4862,12 +4818,7 @@ mod tests {
             assert!(!events
                 .iter()
                 .any(|e| matches!(&e.event, Event::ModelChanged { model } if model == "newer")));
-            let next = one_write(
-                a.encode(Command::Prompt {
-                    text: "next".into(),
-                })
-                .expect("next"),
-            );
+            let next = prompt(&mut a, "next");
             assert_eq!(next["params"]["model"], "newer");
             assert_eq!(next["params"]["effort"], "low");
         }
@@ -4883,12 +4834,7 @@ mod tests {
             })
             .expect("select");
             a.drain_outbox();
-            let sent = one_write(
-                a.encode(Command::Prompt {
-                    text: "first".into(),
-                })
-                .expect("send"),
-            );
+            let sent = prompt(&mut a, "first");
             if newer {
                 a.encode(Command::SetModel {
                     model: "newer".into(),
@@ -4912,12 +4858,7 @@ mod tests {
                     ..
                 }
             )));
-            let next = one_write(
-                a.encode(Command::Prompt {
-                    text: "next".into(),
-                })
-                .expect("next"),
-            );
+            let next = prompt(&mut a, "next");
             assert_eq!(
                 next["params"]["model"],
                 if newer { "newer" } else { "gpt-5-codex" }
@@ -4939,12 +4880,7 @@ mod tests {
         })
         .expect("select");
         a.drain_outbox();
-        let sent = one_write(
-            a.encode(Command::Prompt {
-                text: "first".into(),
-            })
-            .expect("send"),
-        );
+        let sent = prompt(&mut a, "first");
         a.feed(&json!({"id":sent["id"],"result":{"turn":{"id":"tu"}}}).to_string());
         a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu","status":"completed"}}}"#);
         a.encode(Command::SetModel {
@@ -4953,19 +4889,9 @@ mod tests {
         })
         .expect("select invalid");
         a.drain_outbox();
-        let sent = one_write(
-            a.encode(Command::Prompt {
-                text: "second".into(),
-            })
-            .expect("send"),
-        );
+        let sent = prompt(&mut a, "second");
         a.feed(&json!({"id":sent["id"],"error":{"message":"no such model"}}).to_string());
-        let next = one_write(
-            a.encode(Command::Prompt {
-                text: "retry".into(),
-            })
-            .expect("send"),
-        );
+        let next = prompt(&mut a, "retry");
         assert_eq!(next["params"]["model"], "accepted");
         assert_eq!(next["params"]["effort"], "high");
     }
@@ -4979,12 +4905,7 @@ mod tests {
         })
         .expect("select");
         a.drain_outbox();
-        let sent = one_write(
-            a.encode(Command::Prompt {
-                text: "first".into(),
-            })
-            .expect("send"),
-        );
+        let sent = prompt(&mut a, "first");
         a.encode(Command::SetModel {
             model: "newer".into(),
             effort: Some("low".into()),
@@ -5003,12 +4924,7 @@ mod tests {
         assert!(
             matches!(&started[0].event, Event::TurnStarted { model: Some(model) } if model == "fallback")
         );
-        let next = one_write(
-            a.encode(Command::Prompt {
-                text: "next".into(),
-            })
-            .expect("next"),
-        );
+        let next = prompt(&mut a, "next");
         assert_eq!(next["params"]["model"], "newer");
         assert_eq!(next["params"]["effort"], "low");
     }
@@ -5023,12 +4939,7 @@ mod tests {
             })
             .expect("first choice");
             let first_key = a.drain_outbox().events[0].request.clone();
-            let sent = one_write(
-                a.encode(Command::Prompt {
-                    text: "first".into(),
-                })
-                .expect("send"),
-            );
+            let sent = prompt(&mut a, "first");
             for (model, effort) in [("other", "high"), ("same", "low")] {
                 a.encode(Command::SetModel {
                     model: model.into(),
@@ -5062,12 +4973,7 @@ mod tests {
                 .expect("selection acknowledgement");
             assert_eq!(ack.request, first_key);
             assert_ne!(ack.request, latest_key);
-            let next = one_write(
-                a.encode(Command::Prompt {
-                    text: "next".into(),
-                })
-                .expect("next"),
-            );
+            let next = prompt(&mut a, "next");
             assert_eq!(next["params"]["model"], "same");
             assert_eq!(next["params"]["effort"], "low");
         }
@@ -5076,14 +4982,14 @@ mod tests {
     #[test]
     fn effort_rides_on_every_turn_start() {
         let mut a = started(Mode::Ask);
-        let w = one_write(a.encode(Command::Prompt { text: "a".into() }).expect("ok"));
+        let w = prompt(&mut a, "a");
         assert!(w["params"].get("effort").is_none());
         a.encode(Command::SetModel {
             model: "gpt-5-codex".into(),
             effort: Some("high".into()),
         })
         .expect("set");
-        let w = one_write(a.encode(Command::Prompt { text: "b".into() }).expect("ok"));
+        let w = prompt(&mut a, "b");
         assert_eq!(w["params"]["effort"], "high");
         // `None` keeps the effort; no respawn is asked for.
         let actions = a
@@ -5093,7 +4999,7 @@ mod tests {
             })
             .expect("set");
         assert!(actions.is_empty());
-        let w = one_write(a.encode(Command::Prompt { text: "c".into() }).expect("ok"));
+        let w = prompt(&mut a, "c");
         assert_eq!(w["params"]["effort"], "high");
     }
 
@@ -5128,7 +5034,7 @@ mod tests {
         a.argv(&s);
         a.handshake();
         a.feed(r#"{"id":2,"result":{"thread":{"id":"th-1"}}}"#);
-        let w = one_write(a.encode(Command::Prompt { text: "a".into() }).expect("ok"));
+        let w = prompt(&mut a, "a");
         assert_eq!(w["params"]["effort"], "low");
     }
 
@@ -5181,24 +5087,11 @@ mod tests {
             ));
             let request = ev[0].request.clone().expect("canonical request");
             assert_ne!(request, "17");
-            let w = one_write(
-                a.encode(Command::Approve {
-                    request: request.clone(),
-                    decision,
-                    updated_input: None,
-                    message: None,
-                })
-                .expect("approve"),
-            );
+            let w = one_write(a.encode(approve_cmd(&request, decision)).expect("approve"));
             assert_eq!(w, json!({"id": 17, "result": {"decision": wire}}));
             // Answered once: a second answer is invalid, and nothing expires at exit.
             assert!(matches!(
-                a.encode(Command::Approve {
-                    request,
-                    decision,
-                    updated_input: None,
-                    message: None
-                }),
+                a.encode(approve_cmd(&request, decision)),
                 Err(AdapterError::Invalid(_))
             ));
             assert!(!a
@@ -5242,12 +5135,7 @@ mod tests {
             assert_eq!(
                 one_write(
                     resumed
-                        .encode(Command::Approve {
-                            request,
-                            decision: Decision::Allow,
-                            updated_input: None,
-                            message: None,
-                        })
+                        .encode(approve_cmd(&request, Decision::Allow))
                         .expect("approve resumed request")
                 ),
                 json!({"id": rpc_id, "result": {"decision": "accept"}}),
@@ -5311,13 +5199,8 @@ mod tests {
         let request = ev[0].request.clone().expect("canonical request");
         assert_ne!(request, "req-a");
         let w = one_write(
-            a.encode(Command::Approve {
-                request,
-                decision: Decision::Allow,
-                updated_input: None,
-                message: None,
-            })
-            .expect("approve"),
+            a.encode(approve_cmd(&request, Decision::Allow))
+                .expect("approve"),
         );
         assert_eq!(w, json!({"id": "req-a", "result": {"decision": "accept"}}));
     }
@@ -5410,13 +5293,8 @@ mod tests {
             other => panic!("unexpected event: {other:?}"),
         }
         let w = one_write(
-            a.encode(Command::Approve {
-                request: req,
-                decision: Decision::AllowAlways,
-                updated_input: None,
-                message: None,
-            })
-            .expect("allow always"),
+            a.encode(approve_cmd(&req, Decision::AllowAlways))
+                .expect("allow always"),
         );
         assert_eq!(w, json!({"id": 6, "result": {"decision": "accept"}}));
     }
@@ -5464,12 +5342,7 @@ mod tests {
             r#"{"id":5,"method":"item/commandExecution/requestApproval","params":{"itemId":"i","availableDecisions":["decline","cancel"]}}"#,
         );
         let request = ev[0].request.clone().expect("canonical request");
-        let approve = |decision| Command::Approve {
-            request: request.clone(),
-            decision,
-            updated_input: None,
-            message: None,
-        };
+        let approve = |decision| approve_cmd(&request, decision);
         assert!(matches!(
             a.encode(approve(Decision::Allow)),
             Err(AdapterError::Invalid(m)) if m.contains("accept")
@@ -5660,12 +5533,7 @@ mod tests {
         a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-1"}}}"#);
         let frame = approval_request("0", "item/commandExecution/requestApproval");
         let request = a.feed(&frame)[0].request.clone().expect("request");
-        let approve = |request| Command::Approve {
-            request,
-            decision: Decision::Allow,
-            updated_input: None,
-            message: None,
-        };
+        let approve = |request: String| approve_cmd(&request, Decision::Allow);
         assert_eq!(
             one_write(a.encode(approve(request.clone())).expect("answer")),
             json!({"id": 0, "result": {"decision": "accept"}})
@@ -5762,12 +5630,10 @@ mod tests {
         );
         assert_eq!(
             one_write(
-                a.encode(Command::Approve {
-                    request: next[0].request.clone().expect("current request"),
-                    decision: Decision::Allow,
-                    updated_input: None,
-                    message: None,
-                })
+                a.encode(approve_cmd(
+                    next[0].request.as_deref().expect("current request"),
+                    Decision::Allow
+                ))
                 .expect("approve current")
             ),
             json!({"id": 0, "result": {"decision": "accept"}})
@@ -5823,13 +5689,8 @@ mod tests {
             if item == 0 {
                 first = Some((last.clone(), request.clone()));
             }
-            a.encode(Command::Approve {
-                request,
-                decision: Decision::Allow,
-                updated_input: None,
-                message: None,
-            })
-            .expect("approve");
+            a.encode(approve_cmd(&request, Decision::Allow))
+                .expect("approve");
         }
         assert_eq!(
             a.settled_requests.len(),
@@ -5850,23 +5711,10 @@ mod tests {
             "the first answered request cannot revive after 1,024 answers"
         );
         assert!(
-            a.encode(Command::Approve {
-                request: first_key,
-                decision: Decision::Allow,
-                updated_input: None,
-                message: None
-            })
-            .is_err(),
+            a.encode(approve_cmd(&first_key, Decision::Allow)).is_err(),
             "an old answer cannot approve current wire id 0"
         );
-        assert!(a
-            .encode(Command::Approve {
-                request: current,
-                decision: Decision::Allow,
-                updated_input: None,
-                message: None
-            })
-            .is_ok());
+        assert!(a.encode(approve_cmd(&current, Decision::Allow)).is_ok());
         a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"many-requests","status":"completed"}}}"#);
         assert!(
             a.settled_requests.is_empty(),
@@ -5920,13 +5768,8 @@ mod tests {
                 .is_empty(),
             "known child active scope rejects explicit old turns too"
         );
-        a.encode(Command::Approve {
-            request: child_key,
-            decision: Decision::Allow,
-            updated_input: None,
-            message: None,
-        })
-        .expect("answer child");
+        a.encode(approve_cmd(&child_key, Decision::Allow))
+            .expect("answer child");
         let completed = r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu-1","status":"completed"}}}"#;
         assert!(a
             .feed(completed)
@@ -6022,13 +5865,8 @@ mod tests {
         .to_string();
         let child_key = a.feed(&child)[0].request.clone().expect("child request");
         assert!(child_key.contains("child-turn") && !child_key.contains("parent-turn"));
-        a.encode(Command::Approve {
-            request: child_key,
-            decision: Decision::Allow,
-            updated_input: None,
-            message: None,
-        })
-        .expect("settled child request");
+        a.encode(approve_cmd(&child_key, Decision::Allow))
+            .expect("settled child request");
         let pending = a.feed(&child.replace("child-item", "child-pending"))[0]
             .request
             .clone()
@@ -6057,13 +5895,7 @@ mod tests {
             .is_empty());
         assert!(a.feed(&question).is_empty());
         assert!(
-            a.encode(Command::Approve {
-                request: parent_key.clone(),
-                decision: Decision::Allow,
-                updated_input: None,
-                message: None
-            })
-            .is_ok(),
+            a.encode(approve_cmd(&parent_key, Decision::Allow)).is_ok(),
             "parent remains answerable"
         );
         assert!(
@@ -6307,12 +6139,7 @@ mod tests {
     #[test]
     fn compact_prompt_becomes_thread_compact_start() {
         let mut a = started(Mode::Ask);
-        let w = one_write(
-            a.encode(Command::Prompt {
-                text: " /Compact ".into(),
-            })
-            .expect("ok"),
-        );
+        let w = prompt(&mut a, " /Compact ");
         assert_eq!(
             w,
             json!({"id": 3, "method": "thread/compact/start", "params": {"threadId": "th-1"}})
@@ -6337,12 +6164,7 @@ mod tests {
             Err(AdapterError::Invalid(_))
         ));
         // A longer text that merely starts with it is a normal prompt.
-        let w = one_write(
-            a.encode(Command::Prompt {
-                text: "/compact please".into(),
-            })
-            .expect("ok"),
-        );
+        let w = prompt(&mut a, "/compact please");
         assert_eq!(w["method"], "turn/start");
     }
 

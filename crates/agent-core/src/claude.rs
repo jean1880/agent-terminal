@@ -2568,14 +2568,7 @@ mod tests {
                 decision: Decision::Cancel
             }
         ));
-        assert!(a
-            .encode(Command::Approve {
-                request: "r1".into(),
-                decision: Decision::Allow,
-                updated_input: None,
-                message: None,
-            })
-            .is_err());
+        assert!(a.encode(approve(Decision::Allow, "r1")).is_err());
     }
 
     #[test]
@@ -3604,15 +3597,7 @@ mod tests {
         let mut a = ClaudeAdapter::new();
         pending_edit(&mut a);
         assert_eq!(
-            written(
-                &mut a,
-                Command::Approve {
-                    request: "r1".into(),
-                    decision: Decision::Allow,
-                    updated_input: None,
-                    message: None,
-                }
-            ),
+            written(&mut a, approve(Decision::Allow, "r1")),
             json!({"type": "control_response", "response": {"subtype": "success", "request_id": "r1",
                 "response": {"behavior": "allow", "updatedInput": {"file_path": "/x"}, "toolUseID": "tu1"}}})
         );
@@ -3646,27 +3631,14 @@ mod tests {
         );
         pending_edit(&mut a);
         assert_eq!(
-            written(
-                &mut a,
-                Command::Approve {
-                    request: "r1".into(),
-                    decision: Decision::Cancel,
-                    updated_input: None,
-                    message: None,
-                }
-            ),
+            written(&mut a, approve(Decision::Cancel, "r1")),
             json!({"type": "control_response", "response": {"subtype": "success", "request_id": "r1",
                 "response": {"behavior": "deny", "message": "The user denied this request",
                     "interrupt": true, "toolUseID": "tu1"}}})
         );
         // Answered requests are gone.
         assert!(matches!(
-            a.encode(Command::Approve {
-                request: "r1".into(),
-                decision: Decision::Allow,
-                updated_input: None,
-                message: None,
-            }),
+            a.encode(approve(Decision::Allow, "r1")),
             Err(AdapterError::Invalid(_))
         ));
     }
