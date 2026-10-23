@@ -21,8 +21,7 @@ use crate::chat::session::build_handoff;
 use crate::chat::ChatBackend;
 use crate::model_catalog::ModelCatalog;
 use crate::window::sidebar_model::{
-    driver_label, menu_agents, thread_menu, MenuAgent, MenuEntry, RowKey, ThreadAction,
-    ThreadMenuInput,
+    menu_agents, thread_menu, MenuAgent, MenuEntry, RowKey, ThreadAction, ThreadMenuInput,
 };
 
 /// The action every enabled menu item activates, with the encoded [`ThreadAction`] as target.
@@ -605,7 +604,7 @@ impl AgentTerminalWindow {
 
 /// `<source title> (→ <Agent>)`: the title of a thread continued in another agent.
 fn continued_title(source: &str, driver: Driver) -> String {
-    format!("{source} (→ {})", driver_label(driver))
+    format!("{source} (→ {})", driver.info().label)
 }
 
 #[cfg(test)]

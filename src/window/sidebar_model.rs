@@ -236,7 +236,7 @@ pub fn reopen_offer(n: usize) -> Option<String> {
 pub fn sessions_added_toast(drivers: &[Driver]) -> Option<String> {
     let mut names: Vec<&str> = Vec::new();
     for d in drivers {
-        let name = driver_label(*d);
+        let name = d.info().label;
         if !names.contains(&name) {
             names.push(name);
         }
@@ -631,21 +631,10 @@ pub fn limit_over(event: &Event) -> bool {
 /// The "Continue in a new thread with…" button for a target from [`safe_handoff_target`].
 pub fn continue_label(target: Driver, unasked: bool) -> String {
     if unasked {
-        format!(
-            "Continue in {} (edits without asking)",
-            driver_label(target)
-        )
+        format!("Continue in {} (edits without asking)", target.info().label)
     } else {
-        format!("Continue in {}", driver_label(target))
+        format!("Continue in {}", target.info().label)
     }
-}
-
-pub fn driver_label(driver: Driver) -> &'static str {
-    driver.info().label
-}
-
-pub fn driver_key(driver: Driver) -> &'static str {
-    driver.info().key
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -695,7 +684,7 @@ impl ThreadAction {
                     effort: &Option<String>| {
             format!(
                 "{kind}{SEP}{thread}{SEP}{}{SEP}{}{SEP}{}",
-                driver_key(driver),
+                driver.info().key,
                 model.as_deref().unwrap_or(""),
                 effort.as_deref().unwrap_or("")
             )
@@ -899,7 +888,7 @@ pub fn thread_menu(input: &ThreadMenuInput) -> Vec<MenuEntry> {
                     .agents
                     .iter()
                     .map(|agent| MenuEntry::Submenu {
-                        label: driver_label(agent.driver).to_owned(),
+                        label: agent.driver.info().label.to_owned(),
                         enabled,
                         entries: agent_entries(agent, enabled, action),
                     })
@@ -1070,7 +1059,7 @@ mod tests {
     #[test]
     fn the_import_toast_counts_sessions_and_names_each_agent_once() {
         let (c, a, x) = (Driver::Claude, Driver::Agy, Driver::Codex);
-        let name = driver_label;
+        let name = |d: Driver| d.info().label;
         assert_eq!(sessions_added_toast(&[]), None);
         assert_eq!(
             sessions_added_toast(&[c]).as_deref(),
@@ -1858,14 +1847,14 @@ mod tests {
         assert_eq!(stored_model(Some("default")), None);
         assert_eq!(stored_model(Some("opus")).as_deref(), Some("opus"));
         for d in Driver::ALL {
-            assert_eq!(parse_driver(driver_key(d)), Some(d));
+            assert_eq!(parse_driver(d.info().key), Some(d));
             // Exhaustive: a new driver fails to compile until it is in Driver::ALL.
             match d {
                 Driver::Claude | Driver::Agy | Driver::Codex => {}
             }
             assert_ne!(handoff_target(d, |_| true), Some(d));
         }
-        assert_eq!(driver_label(Driver::Codex), "Codex");
+        assert_eq!(Driver::Codex.info().label, "Codex");
     }
 
     /// The 2026-10-11 sequence: the limit, then a turn Claude started itself (no output), then a
@@ -1958,7 +1947,7 @@ mod tests {
         assert!(!forbids_unasked_edits(Some(Mode::AcceptEdits)));
         assert_eq!(
             continue_label(Agy, true),
-            format!("Continue in {} (edits without asking)", driver_label(Agy))
+            format!("Continue in {} (edits without asking)", Agy.info().label)
         );
     }
 }

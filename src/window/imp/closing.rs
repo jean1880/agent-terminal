@@ -447,12 +447,7 @@ impl AgentTerminalWindow {
             .iter()
             .filter_map(|t| t.chat.as_ref())
             .take(2)
-            .map(|c| {
-                (
-                    crate::window::sidebar_model::driver_label(c.slot.driver()).to_owned(),
-                    c.title.clone(),
-                )
-            })
+            .map(|c| (c.slot.driver().info().label.to_owned(), c.title.clone()))
             .collect();
         labels
             .into_iter()

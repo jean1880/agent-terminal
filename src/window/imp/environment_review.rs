@@ -4,7 +4,6 @@ use agent_core::adapter::Driver;
 
 use super::threads::NewThread;
 use super::*;
-use crate::window::sidebar_model::driver_label;
 
 impl AgentTerminalWindow {
     pub(super) fn review_current_environment(&self) {
@@ -38,7 +37,7 @@ impl AgentTerminalWindow {
                  then produce a scored report with skill and MCP recommendations. Review \
                  instructions prohibit changes. Inspected content is sent to the selected \
                  agent under its usual permissions and may use its quota.",
-                driver_label(driver),
+                driver.info().label,
                 dir
             ),
             ("cancel", "Cancel"),

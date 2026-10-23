@@ -37,11 +37,11 @@ use crate::chat::{ChatBackend, EnvelopeSink, SessionStatus};
 use crate::config::{profile_driver, Profile};
 use crate::model_catalog::{retirement_banner, ModelCatalog};
 use crate::window::sidebar_model::{
-    badge_for, busy_reason, continue_label, driver_key, driver_label, fold_groups,
-    forbids_unasked_edits, held_finish_due, is_busy, limit_over, needs_attention, parse_driver,
-    react, redraw_for, relative_time, resume_as, row_tooltip, safe_handoff_target,
-    sidebar_sections, stop_heading, stored_model, thread_title, turn_finishes_thread, Attention,
-    Badge, ChildAsks, FolderGroup, OpenState, Redraw, ResumeAs, RowKey, SidebarModel, SidebarRow,
+    badge_for, busy_reason, continue_label, fold_groups, forbids_unasked_edits, held_finish_due,
+    is_busy, limit_over, needs_attention, parse_driver, react, redraw_for, relative_time,
+    resume_as, row_tooltip, safe_handoff_target, sidebar_sections, stop_heading, stored_model,
+    thread_title, turn_finishes_thread, Attention, Badge, ChildAsks, FolderGroup, OpenState,
+    Redraw, ResumeAs, RowKey, SidebarModel, SidebarRow,
 };
 use crate::window::sidebar_model::{
     reopen_offer, sessions_added_toast, thread_activity, ThreadActivity,
@@ -101,12 +101,9 @@ fn rebind_thread(
     model: Option<&str>,
 ) -> agent_kit::store::Result<crate::chat::session::Handoff> {
     let messages = store.transcript_messages(thread)?;
-    let handoff = build_handoff(
-        &messages,
-        &format!("{} thread {thread}", driver_label(from)),
-    );
+    let handoff = build_handoff(&messages, &format!("{} thread {thread}", from.info().label));
     store.atomically(|s| {
-        let pt = s.add_provider_thread(thread, driver_key(target), model.unwrap_or("default"))?;
+        let pt = s.add_provider_thread(thread, target.info().key, model.unwrap_or("default"))?;
         s.set_active_provider_thread(thread, &pt)?;
         s.set_thread_profile(thread, None)?;
         for env in crate::chat::session::switched_handoff_events(&handoff, target) {
@@ -353,7 +350,7 @@ pub(super) const SIDEBAR_COLLAPSE_SP: f64 = 720.0;
 /// The "stop and switch?" question: its heading and body, for a thread titled `title` moving to
 /// `driver` while work would be cut short.
 pub(super) fn switch_warning(title: &str, driver: Driver) -> (String, String) {
-    let agent = driver_label(driver);
+    let agent = driver.info().label;
     let subject = if title.is_empty() {
         "This thread".to_owned()
     } else {
@@ -898,7 +895,7 @@ impl ChatBackend for SessionSlot {
                     view.apply(&Envelope::new(Event::Error {
                         message: format!(
                             "{} is not running for this thread yet, so the message was not sent.",
-                            driver_label(self.driver.get())
+                            self.driver.get().info().label
                         ),
                     }));
                 }
@@ -1495,7 +1492,7 @@ fn record_new_thread_as(
         title: spec.title.as_deref(),
         provider: Some(agent_kit::store::ProviderRecord {
             id: Some(&ids.provider),
-            driver: driver_key(spec.driver),
+            driver: spec.driver.info().key,
             model: spec.model.as_deref(),
             native_id: None,
         }),
@@ -1768,7 +1765,7 @@ fn link_recent_sessions(
 ) -> Vec<Driver> {
     let mut added = Vec::new();
     for s in sessions {
-        let key = driver_key(s.driver);
+        let key = s.driver.info().key;
         let known = store
             .thread_with_native_id(key, &s.native_id)
             .map(|t| t.is_some())
@@ -1787,7 +1784,7 @@ fn link_recent_sessions(
         );
         match made {
             Ok(_) => added.push(s.driver),
-            Err(e) => warn!("Cannot list a {} session: {e}", driver_label(s.driver)),
+            Err(e) => warn!("Cannot list a {} session: {e}", s.driver.info().label),
         }
     }
     added
@@ -1825,10 +1822,7 @@ fn native_history_of(
     let envs = match agent_kit::native::read_native_history(home, &session) {
         Ok(envs) => envs,
         Err(e) => {
-            warn!(
-                "Cannot import {} session history: {e}",
-                driver_label(driver)
-            );
+            warn!("Cannot import {} session history: {e}", driver.info().label);
             vec![Envelope::new(Event::Notice {
                 text: format!("The earlier conversation could not be loaded: {e}"),
             })]
@@ -1847,7 +1841,7 @@ fn store_imported(
 ) -> bool {
     match store.import_events(thread, Some(provider_thread), envs) {
         Ok(n) => {
-            info!("Imported {n} events of a {} session", driver_label(driver));
+            info!("Imported {n} events of a {} session", driver.info().label);
             true
         }
         Err(e) => {
@@ -1897,7 +1891,7 @@ async fn wait_for_fresh_catalog(driver: Driver) {
     if !catalog.is_fresh(driver) {
         info!(
             "{} model list not fresh after {:?}; starting on the stored model",
-            driver_label(driver),
+            driver.info().label,
             CATALOG_WAIT
         );
     }
@@ -2260,7 +2254,7 @@ fn not_ready_reason(driver: Driver, state: &Availability) -> String {
         Availability::Detecting => "is still being detected",
         Availability::Missing | Availability::Ready(_) => "is not available",
     };
-    format!("{} {why}.", driver_label(driver))
+    format!("{} {why}.", driver.info().label)
 }
 
 /// The adapter for `driver`. Codex reports this app's version in `initialize`'s `clientInfo`.
@@ -3593,8 +3587,8 @@ impl AgentTerminalWindow {
                 let dot = Image::from_gicon(&crate::icons::driver_icon(driver));
                 dot.set_pixel_size(14);
                 dot.add_css_class("thread-dot");
-                dot.add_css_class(&format!("dot-{}", driver_key(driver)));
-                dot.set_tooltip_text(Some(driver_label(driver)));
+                dot.add_css_class(&format!("dot-{}", driver.info().key));
+                dot.set_tooltip_text(Some(driver.info().label));
                 line.append(&dot);
             }
             None => {
@@ -4634,7 +4628,7 @@ impl AgentTerminalWindow {
             ThreadDiffs::new(
                 &summary.cwd,
                 key,
-                driver_label(driver),
+                driver.info().label,
                 Rc::new(move |text: &str| {
                     if let Some(window) = holder.upgrade().as_ref().and_then(window_of) {
                         window.imp().show_toast(text);
@@ -4965,7 +4959,7 @@ impl AgentTerminalWindow {
         } else {
             info!(
                 "Thread {thread} opened without a session: {} is not ready",
-                driver_label(driver)
+                driver.info().label
             );
             // A switch parked while the thread was being built: its own agent will not start
             // it (still being detected excepted), so the thread moves to the new agent now.
@@ -5171,7 +5165,7 @@ impl AgentTerminalWindow {
         };
         info!(
             "Opening thread {thread} on {} in {dir}",
-            driver_label(driver)
+            driver.info().label
         );
         let session = ChatSession::with_options(
             adapter,
@@ -5570,7 +5564,7 @@ impl AgentTerminalWindow {
                 self.refresh_sidebar();
             }
             After::RateLimited(banner, driver) => {
-                banner.set_title(&format!("{} hit its rate limit", driver_label(driver)));
+                banner.set_title(&format!("{} hit its rate limit", driver.info().label));
                 // With no other usable agent there is nothing to continue in: no button. An agy
                 // that would edit unasked is offered only as a last resort, and says so.
                 let unasked = self.agy_cannot_ask_for(thread);
@@ -5775,7 +5769,7 @@ impl AgentTerminalWindow {
                 c.slot
                     .switch_serial
                     .set(c.slot.switch_serial.get().wrapping_add(1));
-                let label = (driver_label(c.slot.driver()).to_owned(), c.title.clone());
+                let label = (c.slot.driver().info().label.to_owned(), c.title.clone());
                 ((c.slot.get(), !c.unread, label), c.thread.clone())
             })
             .unzip();
@@ -5987,7 +5981,7 @@ impl AgentTerminalWindow {
             None => self.show_toast("This thread is already switching agent"),
             Some(SwitchRoute::Rebind) if target == slot.driver() => self.show_toast(&format!(
                 "{} is not available, so this thread's model cannot be changed",
-                driver_label(target)
+                target.info().label
             )),
             Some(SwitchRoute::Rebind) => self.rebind_unstarted(thread, target, model, effort),
             Some(SwitchRoute::Live | SwitchRoute::Park) => {}
@@ -6015,8 +6009,8 @@ impl AgentTerminalWindow {
         };
         info!(
             "Switching thread {thread} from {} to {} before any session ran it",
-            driver_label(from),
-            driver_label(target)
+            from.info().label,
+            target.info().label
         );
         let id = thread.to_owned();
         let thread = thread.to_owned();
@@ -6037,7 +6031,7 @@ impl AgentTerminalWindow {
         effort: Option<String>,
         outcome: Option<agent_kit::store::Result<crate::chat::session::Handoff>>,
     ) {
-        let label = driver_label(target);
+        let label = target.info().label;
         let landed = {
             let mut tabs = self.tabs.borrow_mut();
             let Some(tab) = tabs
@@ -6146,7 +6140,7 @@ impl AgentTerminalWindow {
             &format!(
                 "{} has unfinished work. {why} Switching continues with the selected agent; \
                  the new turn can ask again.",
-                driver_label(from),
+                from.info().label,
             ),
             ("cancel", "Keep Waiting"),
             ("switch", "Switch and Continue"),
@@ -6167,7 +6161,7 @@ impl AgentTerminalWindow {
         if self.unasked_prompt_open.replace(true) {
             return;
         }
-        let label = driver_label(target);
+        let label = target.info().label;
         let dialog = confirm_dialog(
             &format!("Continue in {label}?"),
             &format!(
@@ -6706,7 +6700,7 @@ impl AgentTerminalWindow {
                 present_message(&self.obj(), "Cannot Create a Thread", &e.to_string());
                 return None;
             }
-            info!("New {} thread in {cwd}", driver_label(driver));
+            info!("New {} thread in {cwd}", driver.info().label);
             return self.open_created(&thread, created);
         }
         // Stored by the writer first, and the page opens only once it is: a thread that could
@@ -6724,7 +6718,7 @@ impl AgentTerminalWindow {
             let Some(obj) = obj.upgrade() else { return };
             match stored {
                 Some(Ok(())) => {
-                    info!("New {} thread in {cwd}", driver_label(driver));
+                    info!("New {} thread in {cwd}", driver.info().label);
                     obj.imp().open_created(&thread, created);
                 }
                 Some(Err(e)) => present_message(&obj, "Cannot Create a Thread", &e.to_string()),
@@ -6830,7 +6824,7 @@ impl AgentTerminalWindow {
         let record = {
             let (thread, native) = (thread.clone(), native.clone());
             move |s: &Store| {
-                let key = driver_key(driver);
+                let key = driver.info().key;
                 let record = agent_kit::store::ThreadRecord {
                     provider: Some(agent_kit::store::ProviderRecord {
                         id: None,
@@ -6847,21 +6841,21 @@ impl AgentTerminalWindow {
             agent_kit::store::NativeThread::Created => {
                 info!(
                     "Resuming {} session {native} as a thread",
-                    driver_label(driver)
+                    driver.info().label
                 );
                 imp.open_thread(&thread, true);
             }
             agent_kit::store::NativeThread::Existing(existing) => {
                 info!(
                     "{} session {native} is already thread {existing}: opening it",
-                    driver_label(driver)
+                    driver.info().label
                 );
                 imp.open_thread(&existing, true);
             }
             agent_kit::store::NativeThread::Supervised => {
                 warn!(
                     "{} session {native} belongs to a delegated worker: not resumed",
-                    driver_label(driver)
+                    driver.info().label
                 );
                 present_message(
                     &imp.obj(),
@@ -7256,7 +7250,7 @@ impl AgentTerminalWindow {
             } else {
                 ModelNotice::None
             };
-            match retirement_banner(driver_label(driver), &notice) {
+            match retirement_banner(driver.info().label, &notice) {
                 Some(text) => {
                     banner.set_title(&text);
                     banner.set_revealed(true);
@@ -9776,7 +9770,7 @@ pub(super) mod tests {
             let store = Store::open_in_memory().expect("store");
             let source = store.create_thread("/w", Some("source")).expect("thread");
             let pt = store
-                .add_provider_thread(&source, driver_key(driver), "m1")
+                .add_provider_thread(&source, driver.info().key, "m1")
                 .expect("pt");
             store.set_active_provider_thread(&source, &pt).expect("set");
             let say = |text: &str| Envelope::new(Event::Notice { text: text.into() });
@@ -10271,7 +10265,7 @@ pub(super) mod tests {
             );
             assert_eq!(
                 load_provider(&store, &ids.thread).unwrap().unwrap().driver,
-                driver_key(target)
+                target.info().key
             );
         }
         assert_eq!(

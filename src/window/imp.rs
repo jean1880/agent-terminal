@@ -2762,13 +2762,10 @@ impl AgentTerminalWindow {
             with.append_item(&gtk4::gio::MenuItem::new(Some(label), Some("win.no-agent")));
         }
         for driver in ready {
-            let item = gtk4::gio::MenuItem::new(
-                Some(crate::window::sidebar_model::driver_label(driver)),
-                None,
-            );
+            let item = gtk4::gio::MenuItem::new(Some(driver.info().label), None);
             item.set_action_and_target_value(
                 Some("win.new-thread-agent"),
-                Some(&crate::window::sidebar_model::driver_key(driver).to_variant()),
+                Some(&driver.info().key.to_variant()),
             );
             with.append_item(&item);
         }
