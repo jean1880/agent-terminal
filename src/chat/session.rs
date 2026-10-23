@@ -1372,21 +1372,29 @@ impl Inner {
         if self.pending_handoff.borrow().is_some() {
             return;
         }
-        let messages = match self
-            .store
-            .read(|s| s.transcript_messages(&self.thread))
-            .and_then(|r| r)
-        {
-            Ok(m) => m,
+        let handoff = match self.thread_handoff(Driver::Codex) {
+            Ok(handoff) => handoff,
             Err(e) => {
                 warn!(error = %e, "could not read the thread to carry it into a new Codex thread");
                 return;
             }
         };
-        let handoff = build_handoff(&messages, &format!("Codex thread {}", self.thread));
         if handoff.carried > 0 {
             self.arm_handoff(handoff);
         }
+    }
+
+    /// The thread's history, read from the store, as a handoff from `from`'s thread
+    /// ([`build_handoff`] redacts and budgets it).
+    fn thread_handoff(&self, from: Driver) -> agent_kit::store::Result<Handoff> {
+        let messages = self
+            .store
+            .read(|s| s.transcript_messages(&self.thread))
+            .and_then(|r| r)?;
+        Ok(build_handoff(
+            &messages,
+            &format!("{} thread {}", from.info().long_label, self.thread),
+        ))
     }
 
     fn prepare_model_change(&self, model: String, effort: Option<String>, restarting: bool) {
@@ -3852,15 +3860,8 @@ impl Inner {
         let handoff =
             if restarts && running && self.approval().is_none() && mode != self.state.borrow().mode
             {
-                match self
-                    .store
-                    .read(|s| s.transcript_messages(&self.thread))
-                    .and_then(|r| r)
-                {
-                    Ok(messages) => Some(build_handoff(
-                        &messages,
-                        &format!("Antigravity thread {}", self.thread),
-                    )),
+                match self.thread_handoff(Driver::Agy) {
+                    Ok(handoff) => Some(handoff),
                     Err(e) => {
                         self.error(format!(
                             "Could not read the unfinished task to continue: {e}"
@@ -4045,15 +4046,8 @@ impl Inner {
             let native = self.state.borrow().native_id.clone();
             // Transport writes are asynchronous: even a known native session might never
             // have received the latest task. Carry bounded context as well as native history.
-            let handoff = match self
-                .store
-                .read(|s| s.transcript_messages(&self.thread))
-                .and_then(|r| r)
-            {
-                Ok(messages) => build_handoff(
-                    &messages,
-                    &format!("{} thread {}", driver_label(driver), self.thread),
-                ),
+            let handoff = match self.thread_handoff(driver) {
+                Ok(handoff) => handoff,
                 Err(e) => {
                     self.error(format!(
                         "Could not read the unfinished task to continue: {e}"
@@ -4209,22 +4203,14 @@ impl Inner {
             return;
         };
         // Built from the store before anything is stopped, so a failure leaves the thread as it was.
-        let messages = match self
-            .store
-            .read(|s| s.transcript_messages(&self.thread))
-            .and_then(|r| r)
-        {
-            Ok(m) => m,
+        let from = self.adapter.borrow().driver();
+        let handoff = match self.thread_handoff(from) {
+            Ok(handoff) => handoff,
             Err(e) => {
                 self.error(format!("Could not read the thread to hand it off: {e}"));
                 return;
             }
         };
-        let from = self.adapter.borrow().driver();
-        let handoff = build_handoff(
-            &messages,
-            &format!("{} thread {}", driver_label(from), self.thread),
-        );
         let carried = handoff.carried;
 
         let launch = match factory(driver) {
