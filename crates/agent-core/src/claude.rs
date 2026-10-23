@@ -22,6 +22,10 @@
 //!   and completes on `task_notification`. The per-turn snapshot numbering is reset by the
 //!   parent's `result`; a sub-agent message split across frames on either side of it would
 //!   reuse a block index. Upgrade path: key `snap_counts` cleanup by parent.
+//! - A sub-agent continued with `SendMessage` runs again on its first `Agent` card, but only
+//!   when this process saw that call (`agent_items`). Continued from a new process, the task
+//!   is started under the `SendMessage` call, which then stands in for it as before. Upgrade
+//!   path: read the first call from the transcript the session resumed.
 
 use std::collections::{HashMap, HashSet};
 
@@ -96,6 +100,11 @@ pub struct ClaudeAdapter {
     tasks: Vec<BackgroundTask>,
     /// Background task id → the tool call that started it (`task_started`).
     task_tools: HashMap<String, String>,
+    /// Sub-agent task id (its `agentId`) → the `Agent` call that first ran it. A continuation
+    /// (`SendMessage` to that id) restarts the same task under the `SendMessage` call's id, but
+    /// its steps nest under the original call, so the original card is the one that runs again.
+    /// Kept past the task list (a continuation comes after the task ended); cleared on exit.
+    agent_items: HashMap<String, String>,
     /// Sub-agent tool-use id → the model last reported for it ([`Event::SubagentModel`]).
     subagent_models: HashMap<String, String>,
     seen: HashSet<String>,
@@ -155,6 +164,7 @@ impl ClaudeAdapter {
             background_children: HashMap::new(),
             tasks: Vec::new(),
             task_tools: HashMap::new(),
+            agent_items: HashMap::new(),
             subagent_models: HashMap::new(),
             seen: HashSet::new(),
             pending: HashMap::new(),
@@ -250,28 +260,75 @@ impl ClaudeAdapter {
     /// backgrounded shell command (its "running in background" result is its answer; the
     /// task list says it is still running). The tool-use id also fills in the task list,
     /// which may have shown the task first.
+    ///
+    /// A sub-agent task this process already ran (continued with `SendMessage`, or started
+    /// again after its notification) belongs to its first `Agent` call: that card runs again,
+    /// and the `SendMessage` call completes on its own result like any tool.
     fn task_started(&mut self, v: &Value) -> Vec<Envelope> {
         let Some(tool) = str_of(v, "tool_use_id") else {
             return Vec::new();
         };
         let agent =
             str_of(v, "task_type").is_none_or(|t| task_kind(t) == BackgroundTaskKind::Agent);
-        if agent && v.get("is_backgrounded").and_then(Value::as_bool) == Some(true) {
-            self.background.insert(tool.to_owned());
-        }
-        let Some(task) = str_of(v, "task_id") else {
-            return Vec::new();
-        };
-        self.task_tools.insert(task.to_owned(), tool.to_owned());
-        match self.tasks.iter_mut().find(|t| t.id == task) {
-            Some(t) if t.tool_use_id.is_none() => {
-                t.tool_use_id = Some(tool.to_owned());
-                vec![Envelope::new(Event::BackgroundTasks {
-                    tasks: self.tasks.clone(),
-                })]
+        let task = str_of(v, "task_id");
+        let known = task
+            .filter(|_| agent)
+            .and_then(|t| self.agent_items.get(t))
+            .cloned();
+        let mut out = Vec::new();
+        match &known {
+            // Its card was closed by its notification: it runs again until the next one, which
+            // is the only thing left that can close it.
+            Some(item) if !self.open_items.contains(item) => {
+                self.open_item(item);
+                self.background.insert(item.clone());
+                out.push(
+                    Envelope::new(Event::ItemStarted {
+                        kind: ItemKind::Subagent,
+                        title: "Agent".to_owned(),
+                        input: None,
+                        parent: None,
+                    })
+                    .item(item.clone()),
+                );
             }
-            _ => Vec::new(),
+            Some(_) => {}
+            // The first start of a sub-agent whose call is on screen names its card.
+            None if agent && self.open_items.iter().any(|i| i == tool) => {
+                if let Some(task) = task {
+                    self.remember_agent(task, tool);
+                }
+            }
+            None => {}
         }
+        let item = known.unwrap_or_else(|| tool.to_owned());
+        if agent && v.get("is_backgrounded").and_then(Value::as_bool) == Some(true) {
+            self.background.insert(item.clone());
+        }
+        let Some(task) = task else {
+            return out;
+        };
+        self.task_tools.insert(task.to_owned(), item.clone());
+        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task) {
+            if t.tool_use_id.is_none() {
+                t.tool_use_id = Some(item);
+                out.push(Envelope::new(Event::BackgroundTasks {
+                    tasks: self.tasks.clone(),
+                }));
+            }
+        }
+        out
+    }
+
+    /// Remember `item` as the card of sub-agent task `task`, unless one already is.
+    fn remember_agent(&mut self, task: &str, item: &str) {
+        if self.agent_items.contains_key(task) {
+            return;
+        }
+        if self.agent_items.len() >= SEEN_CAP {
+            self.agent_items.clear();
+        }
+        self.agent_items.insert(task.to_owned(), item.to_owned());
     }
 
     /// `background_tasks_changed`: the full list of running background tasks.
@@ -300,20 +357,29 @@ impl ClaudeAdapter {
     }
 
     /// `task_notification`: a backgrounded sub-agent finished. Its item completes with the
-    /// notification's summary; anything still open inside it never got a result.
+    /// notification's summary; anything still open inside it never got a result. A continued
+    /// sub-agent's notification names the `SendMessage` call; its card is the first `Agent` call.
     fn task_notification(&mut self, v: &Value) -> Vec<Envelope> {
-        if let Some(task) = str_of(v, "task_id") {
+        let task = str_of(v, "task_id");
+        if let Some(task) = task {
             if !self.tasks.iter().any(|t| t.id == task) {
                 self.task_tools.remove(task);
             }
         }
-        let Some(id) = str_of(v, "tool_use_id") else {
+        let candidates = [
+            task.and_then(|t| self.agent_items.get(t)).cloned(),
+            str_of(v, "tool_use_id").map(str::to_owned),
+        ];
+        // A foreground sub-agent's own tool result follows and completes it.
+        let Some(id) = candidates
+            .into_iter()
+            .flatten()
+            .find(|id| self.background.contains(id))
+        else {
             return Vec::new();
         };
-        // A foreground sub-agent's own tool result follows and completes it.
-        if !self.background.remove(id) {
-            return Vec::new();
-        }
+        self.background.remove(&id);
+        let id = id.as_str();
         let mut out = Vec::new();
         let children: Vec<String> = self
             .open_items
@@ -807,6 +873,12 @@ impl ClaudeAdapter {
                 // "launched" metadata; the item stays open until its `task_notification`.
                 // `task_started` says so first; the structured result is the fallback.
                 if self.background.contains(id) || async_launch {
+                    if async_launch && self.open_items.iter().any(|i| i == id) {
+                        // The launch names the sub-agent a continuation addresses.
+                        if let Some(agent) = launched_agent_id(v) {
+                            self.remember_agent(agent, id);
+                        }
+                    }
                     self.background.insert(id.to_owned());
                     continue;
                 }
@@ -1372,6 +1444,7 @@ impl Adapter for ClaudeAdapter {
         self.background.clear();
         self.background_children.clear();
         self.task_tools.clear();
+        self.agent_items.clear();
         if !std::mem::take(&mut self.tasks).is_empty() {
             out.push(Envelope::new(Event::BackgroundTasks { tasks: Vec::new() }));
         }
@@ -1620,6 +1693,16 @@ pub(crate) fn is_async_launch(record: &Value) -> bool {
             r.get("isAsync").and_then(Value::as_bool) == Some(true)
                 || str_of(r, "status") == Some("async_launched")
         })
+}
+
+/// The sub-agent id an async launch result names (`toolUseResult.agentId`): the task id its
+/// `task_started` carries and a `SendMessage` continuation addresses.
+fn launched_agent_id(record: &Value) -> Option<&str> {
+    ["tool_use_result", "toolUseResult"]
+        .iter()
+        .filter_map(|k| record.get(*k))
+        .find_map(|r| str_of(r, "agentId"))
+        .filter(|a| !a.is_empty())
 }
 
 /// The model a sub-agent's result says it ran on (`toolUseResult.resolvedModel`).
@@ -3388,6 +3471,161 @@ mod tests {
             }]
         ));
         assert_eq!(task_lists(&out), vec![Vec::new()]);
+    }
+
+    fn send_message(id: &str, to: &str) -> String {
+        json!({"type": "assistant", "uuid": format!("u-{id}"), "parent_tool_use_id": null,
+            "message": {"id": format!("m-{id}"), "role": "assistant", "content": [
+                {"type": "tool_use", "id": id, "name": "SendMessage",
+                 "input": {"to": to, "message": "Go on."}}]}})
+        .to_string()
+    }
+
+    fn send_message_result(id: &str, agent: &str) -> String {
+        json!({"type": "user", "uuid": format!("r-{id}"), "parent_tool_use_id": null,
+            "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": id,
+                "content": [{"type": "text", "text": "Message sent."}]}]},
+            "tool_use_result": {"success": true, "message": "Message sent.",
+                "resumedAgentId": agent, "revivedAgentId": agent, "pin": false}})
+        .to_string()
+    }
+
+    /// The `ItemStarted` envelopes for `id`, as their kinds.
+    fn starts(out: &[Envelope], id: &str) -> Vec<ItemKind> {
+        out.iter()
+            .filter(|e| e.item.as_deref() == Some(id))
+            .filter_map(|e| match &e.event {
+                Event::ItemStarted { kind, .. } => Some(*kind),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_continued_sub_agent_runs_again_on_its_first_card() {
+        let mut a = ClaudeAdapter::new();
+        a.feed(&init_frame());
+        a.feed(&agent_call("toolu_a", true));
+        a.feed(&task_started("ag1", "toolu_a", true));
+        a.feed(&async_launched("toolu_a"));
+        a.feed(&json!({"type": "result", "subtype": "success"}).to_string());
+        let out = a.feed(&task_notification("ag1", "toolu_a", "completed", "first"));
+        assert_eq!(completions(&out, "toolu_a").len(), 1, "{out:?}");
+        a.feed(&tasks_changed(&[]));
+
+        // The root continues it in a turn of its own.
+        a.feed(&init_frame());
+        a.feed(&send_message("toolu_s", "ag1"));
+        let out = a.feed(&task_started("ag1", "toolu_s", true));
+        assert_eq!(starts(&out, "toolu_a"), [ItemKind::Subagent], "{out:?}");
+        assert!(starts(&out, "toolu_s").is_empty(), "{out:?}");
+        let out = a.feed(&tasks_changed(&["ag1"]));
+        assert_eq!(
+            listed_tools(&out),
+            [("ag1".to_owned(), Some("toolu_a".to_owned()))]
+        );
+        // The SendMessage call completes on its own result, as a plain tool.
+        let out = a.feed(&send_message_result("toolu_s", "ag1"));
+        assert_eq!(completions(&out, "toolu_s").len(), 1, "{out:?}");
+        // The resumed run's steps nest under the original call and outlive the root's turn.
+        a.feed(&child_call("toolu_a", "child_1"));
+        let out = a.feed(&model_frame("c-1", Some("toolu_a"), "claude-haiku-5-5"));
+        assert_eq!(
+            reported_models(&out),
+            [("toolu_a".to_owned(), "claude-haiku-5-5".to_owned())]
+        );
+        let out = a.feed(&json!({"type": "result", "subtype": "success"}).to_string());
+        assert!(completions(&out, "toolu_a").is_empty(), "{out:?}");
+        assert!(completions(&out, "child_1").is_empty(), "{out:?}");
+        // The notification names the SendMessage call; the original card finishes.
+        let out = a.feed(&task_notification("ag1", "toolu_s", "completed", "second"));
+        assert!(
+            matches!(
+                completions(&out, "toolu_a").as_slice(),
+                [Event::ItemCompleted { status: ItemStatus::Completed, output: Some(o), .. }]
+                    if o == "second"
+            ),
+            "{out:?}"
+        );
+        assert_eq!(completions(&out, "child_1").len(), 1, "{out:?}");
+        assert!(completions(&out, "toolu_s").is_empty(), "{out:?}");
+        // A repeated notification is a no-op.
+        assert!(a
+            .feed(&task_notification("ag1", "toolu_s", "completed", "second"))
+            .is_empty());
+        // A start sent again after the notification runs it again, until its notification.
+        let out = a.feed(&task_started("ag1", "toolu_s", true));
+        assert_eq!(starts(&out, "toolu_a"), [ItemKind::Subagent], "{out:?}");
+        let out = a.feed(&task_notification("ag1", "toolu_s", "completed", "third"));
+        assert_eq!(completions(&out, "toolu_a").len(), 1, "{out:?}");
+        assert!(completions(&out, "toolu_s").is_empty(), "{out:?}");
+        assert_eq!(count(&out, |e| *e == Event::Unknown), 0);
+    }
+
+    #[test]
+    fn a_sub_agent_restarted_under_its_own_call_reopens_it() {
+        let mut a = ClaudeAdapter::new();
+        a.feed(&init_frame());
+        a.feed(&agent_call("toolu_a", true));
+        // Only the launch result names it: that is enough to know its card.
+        a.feed(&async_launched("toolu_a"));
+        a.feed(&task_notification("ag1", "toolu_a", "completed", "first"));
+        let out = a.feed(&task_started("ag1", "toolu_a", true));
+        assert_eq!(starts(&out, "toolu_a"), [ItemKind::Subagent], "{out:?}");
+        let out = a.feed(&task_notification("ag1", "toolu_a", "completed", "again"));
+        assert_eq!(completions(&out, "toolu_a").len(), 1, "{out:?}");
+    }
+
+    #[test]
+    fn a_task_whose_call_was_never_seen_starts_nothing() {
+        // A continuation from a new process: the SendMessage call stands in for the sub-agent.
+        let mut a = ClaudeAdapter::new();
+        a.feed(&init_frame());
+        a.feed(&send_message("toolu_s", "ag1"));
+        let out = a.feed(&task_started("ag1", "toolu_s", true));
+        assert!(
+            !out.iter()
+                .any(|e| matches!(e.event, Event::ItemStarted { .. })),
+            "{out:?}"
+        );
+        assert!(a.feed(&send_message_result("toolu_s", "ag1")).is_empty());
+        let out = a.feed(&task_notification("ag1", "toolu_s", "completed", "OK"));
+        assert_eq!(completions(&out, "toolu_s").len(), 1, "{out:?}");
+        // A task first started under a call that is not open is not remembered either.
+        let mut a = ClaudeAdapter::new();
+        a.feed(&init_frame());
+        a.feed(&task_started("t1", "toolu_x", true));
+        let out = a.feed(&task_started("t1", "toolu_y", true));
+        assert!(
+            !out.iter()
+                .any(|e| matches!(e.event, Event::ItemStarted { .. })),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn a_background_shell_task_is_not_taken_for_a_sub_agent() {
+        let mut a = ClaudeAdapter::new();
+        a.feed(&init_frame());
+        let call = json!({"type": "assistant", "uuid": "u-sh", "parent_tool_use_id": null,
+            "message": {"id": "m-sh", "role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_sh", "name": "Bash",
+                 "input": {"command": "sleep 9", "run_in_background": true}}]}});
+        a.feed(&call.to_string());
+        a.feed(&task_started_of("sh1", "toolu_sh", "local_bash"));
+        let result = json!({"type": "user", "uuid": "r-sh", "parent_tool_use_id": null,
+            "message": {"role": "user", "content": [{"type": "tool_result",
+                "tool_use_id": "toolu_sh", "content": "Command running in background"}]}});
+        assert_eq!(
+            completions(&a.feed(&result.to_string()), "toolu_sh").len(),
+            1
+        );
+        // Started again: still not a sub-agent card, and its notification completes nothing.
+        let out = a.feed(&task_started_of("sh1", "toolu_sh", "local_bash"));
+        assert!(starts(&out, "toolu_sh").is_empty(), "{out:?}");
+        assert!(a
+            .feed(&task_notification("sh1", "toolu_sh", "completed", "done"))
+            .is_empty());
     }
 
     #[test]
