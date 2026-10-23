@@ -109,11 +109,7 @@ pub fn codex_transcript<'a>(lines: impl IntoIterator<Item = &'a str>) -> Vec<Env
 /// Streaming form of [`codex_transcript`]: push lines one at a time, then [`finish`](Self::finish).
 pub struct CodexImporter {
     adapter: CodexAdapter,
-    out: Vec<Envelope>,
-    items: usize,
-    dropped: usize,
-    known: HashSet<String>,
-    open_tools: Vec<String>,
+    sink: ImportSink,
     pending_user_prompt: Option<(String, String)>,
     thread_id: Option<String>,
     turn_open: bool,
@@ -130,11 +126,7 @@ impl CodexImporter {
     pub fn new() -> Self {
         Self {
             adapter: CodexAdapter::new(),
-            out: Vec::new(),
-            items: 0,
-            dropped: 0,
-            known: HashSet::new(),
-            open_tools: Vec::new(),
+            sink: ImportSink::default(),
             pending_user_prompt: None,
             thread_id: None,
             turn_open: false,
@@ -198,11 +190,7 @@ impl CodexImporter {
         } else if record.get("items").and_then(Value::as_array).is_some() {
             self.direct_turn(&record);
         }
-
-        if self.items > 2 * MAX_IMPORTED_ITEMS {
-            self.dropped += cap(&mut self.out, MAX_IMPORTED_ITEMS);
-            self.items = count_items(&self.out);
-        }
+        self.sink.cap_if_needed();
     }
 
     /// Settles open turns and tools, and returns the capped envelopes.
@@ -211,10 +199,8 @@ impl CodexImporter {
         if self.turn_open {
             self.close_turn();
         }
-        self.settle_open_tools();
-        let dropped = self.dropped + cap(&mut self.out, MAX_IMPORTED_ITEMS);
-        finish_cap(&mut self.out, dropped);
-        self.out
+        self.sink.settle_tools();
+        self.sink.finish()
     }
 
     fn json_rpc_method(&mut self, method: &str, record: &Value) {
@@ -237,7 +223,7 @@ impl CodexImporter {
             "turn/completed" => {
                 let envs = self.adapter.feed(&record.to_string());
                 self.absorb(envs);
-                self.settle_open_tools();
+                self.sink.settle_tools();
                 self.turn_open = false;
             }
             "item/started" => {
@@ -310,10 +296,9 @@ impl CodexImporter {
     fn flush_pending_prompt(&mut self) {
         if let Some((id, text)) = self.pending_user_prompt.take() {
             let text = clean_user_text(&text);
-            if !text.is_empty() && self.known.insert(id.clone()) {
+            if !text.is_empty() && self.sink.known.insert(id.clone()) {
                 self.ensure_turn();
-                push_user_message(&mut self.out, id, &text);
-                self.items += 1;
+                self.sink.push_user_message(id, &text);
             }
         }
     }
@@ -331,10 +316,9 @@ impl CodexImporter {
             text
         };
         let text = clean_user_text(&text);
-        if !text.is_empty() && self.known.insert(id.clone()) {
+        if !text.is_empty() && self.sink.known.insert(id.clone()) {
             self.ensure_turn();
-            push_user_message(&mut self.out, id, &text);
-            self.items += 1;
+            self.sink.push_user_message(id, &text);
         }
     }
 
@@ -346,30 +330,138 @@ impl CodexImporter {
 
     fn open_turn(&mut self) {
         self.turn_open = true;
-        if !self
-            .out
-            .last()
-            .is_some_and(|e| matches!(e.event, Event::TurnStarted { .. }))
-        {
-            self.out
+        if !self.sink.last_is_turn_start() {
+            self.sink
+                .out
                 .push(Envelope::new(Event::TurnStarted { model: None }));
         }
     }
 
     fn close_turn(&mut self) {
-        self.settle_open_tools();
-        if !self
-            .out
-            .last()
-            .is_some_and(|e| matches!(e.event, Event::TurnCompleted { .. }))
-        {
-            self.out.push(turn_completed(TurnState::Completed));
+        self.sink.settle_tools();
+        if !self.sink.last_is_turn_end() {
+            self.sink.out.push(turn_completed(TurnState::Completed));
         }
         self.turn_open = false;
     }
 
-    fn settle_open_tools(&mut self) {
-        for id in std::mem::take(&mut self.open_tools) {
+    fn absorb(&mut self, envs: Vec<Envelope>) {
+        for mut env in envs {
+            env.raw = None;
+            let keep = match &env.event {
+                Event::TurnStarted { .. } => {
+                    let fresh = !self.sink.last_is_turn_start();
+                    if fresh {
+                        self.turn_open = true;
+                    }
+                    fresh
+                }
+                Event::TurnCompleted { .. } => {
+                    let fresh = !self.sink.last_is_turn_end();
+                    if fresh {
+                        self.sink.settle_tools();
+                        self.turn_open = false;
+                    }
+                    fresh
+                }
+                Event::Notice { .. }
+                | Event::Compacted { .. }
+                | Event::PlanUpdated { .. }
+                | Event::WorkersUpdated { .. } => true,
+                _ => self.sink.absorb_item(&mut env),
+            };
+            if keep {
+                self.sink.out.push(env);
+            }
+        }
+    }
+}
+
+/// What both transcript importers keep: the envelopes so far, the item ids seen (a repeated
+/// start is dropped, and so is content or a completion for an item never started), the tool
+/// items still waiting for a result, and the item cap. Turn handling stays with each importer.
+#[derive(Default)]
+struct ImportSink {
+    out: Vec<Envelope>,
+    /// Item starts currently in `out`.
+    items: usize,
+    /// Item starts trimmed away so far.
+    dropped: usize,
+    /// Every item id started, so a stray completion for an unknown item is dropped.
+    known: HashSet<String>,
+    /// Tool items waiting for a result, in start order.
+    open_tools: Vec<String>,
+}
+
+impl ImportSink {
+    fn last_is_turn_start(&self) -> bool {
+        self.out
+            .last()
+            .is_some_and(|e| matches!(e.event, Event::TurnStarted { .. }))
+    }
+
+    fn last_is_turn_end(&self) -> bool {
+        self.out
+            .last()
+            .is_some_and(|e| matches!(e.event, Event::TurnCompleted { .. }))
+    }
+
+    /// Records an item start, content or completion and says whether to keep it: a repeated
+    /// start (a resumed transcript replays frames) and content or a completion for an item never
+    /// started are not kept, and a completion's output is cut. Any other event is not kept.
+    fn absorb_item(&mut self, env: &mut Envelope) -> bool {
+        match &mut env.event {
+            Event::ItemStarted { kind, .. } => {
+                let Some(id) = env.item.clone() else {
+                    return false;
+                };
+                if !self.known.insert(id.clone()) {
+                    return false;
+                }
+                if !matches!(
+                    kind,
+                    ItemKind::AssistantMessage | ItemKind::Reasoning | ItemKind::UserMessage
+                ) {
+                    self.open_tools.push(id);
+                }
+                self.items += 1;
+                true
+            }
+            Event::ContentSnapshot { .. } | Event::ContentDelta { .. } => {
+                env.item.as_ref().is_some_and(|i| self.known.contains(i))
+            }
+            Event::ItemCompleted { output, error, .. } => {
+                let Some(id) = env.item.as_ref() else {
+                    return false;
+                };
+                if !self.known.contains(id) {
+                    return false;
+                }
+                self.open_tools.retain(|t| t != id);
+                for field in [output, error].into_iter().flatten() {
+                    truncate_chars(field, MAX_TOOL_OUTPUT_CHARS);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// A user prompt, counted as an item.
+    fn push_user_message(&mut self, id: String, text: &str) {
+        push_user_message(&mut self.out, id, text);
+        self.items += 1;
+    }
+
+    /// Settles every open tool item as `Interrupted`.
+    fn settle_tools(&mut self) {
+        let open = std::mem::take(&mut self.open_tools);
+        self.settle(open);
+    }
+
+    /// Settles `ids` as `Interrupted`.
+    fn settle(&mut self, ids: Vec<String>) {
+        for id in ids {
             self.out.push(
                 Envelope::new(Event::ItemCompleted {
                     status: ItemStatus::Interrupted,
@@ -381,86 +473,27 @@ impl CodexImporter {
         }
     }
 
-    fn absorb(&mut self, envs: Vec<Envelope>) {
-        for mut env in envs {
-            env.raw = None;
-            match &mut env.event {
-                Event::TurnStarted { .. } => {
-                    if self
-                        .out
-                        .last()
-                        .is_some_and(|e| matches!(e.event, Event::TurnStarted { .. }))
-                    {
-                        continue;
-                    }
-                    self.turn_open = true;
-                }
-                Event::TurnCompleted { .. } => {
-                    if self
-                        .out
-                        .last()
-                        .is_some_and(|e| matches!(e.event, Event::TurnCompleted { .. }))
-                    {
-                        continue;
-                    }
-                    self.settle_open_tools();
-                    self.turn_open = false;
-                }
-                Event::ItemStarted { kind, .. } => {
-                    let Some(id) = env.item.clone() else {
-                        continue;
-                    };
-                    if !self.known.insert(id.clone()) {
-                        continue;
-                    }
-                    if !matches!(
-                        kind,
-                        ItemKind::AssistantMessage | ItemKind::Reasoning | ItemKind::UserMessage
-                    ) {
-                        self.open_tools.push(id);
-                    }
-                    self.items += 1;
-                }
-                Event::ContentSnapshot { .. } | Event::ContentDelta { .. } => {
-                    if !env.item.as_ref().is_some_and(|i| self.known.contains(i)) {
-                        continue;
-                    }
-                }
-                Event::ItemCompleted { output, error, .. } => {
-                    let Some(id) = env.item.clone() else {
-                        continue;
-                    };
-                    if !self.known.contains(&id) {
-                        continue;
-                    }
-                    self.open_tools.retain(|t| *t != id);
-                    for field in [output, error].into_iter().flatten() {
-                        truncate_chars(field, MAX_TOOL_OUTPUT_CHARS);
-                    }
-                }
-                Event::Notice { .. }
-                | Event::Compacted { .. }
-                | Event::PlanUpdated { .. }
-                | Event::WorkersUpdated { .. } => {}
-                _ => continue,
-            }
-            self.out.push(env);
+    /// Trims to [`MAX_IMPORTED_ITEMS`] once twice that many items are held, so memory stays
+    /// bounded for a huge transcript.
+    fn cap_if_needed(&mut self) {
+        if self.items > 2 * MAX_IMPORTED_ITEMS {
+            self.dropped += cap(&mut self.out, MAX_IMPORTED_ITEMS);
+            self.items = count_items(&self.out);
         }
+    }
+
+    /// The capped envelopes, led by a notice for what was left out.
+    fn finish(mut self) -> Vec<Envelope> {
+        let dropped = self.dropped + cap(&mut self.out, MAX_IMPORTED_ITEMS);
+        finish_cap(&mut self.out, dropped);
+        self.out
     }
 }
 
 /// Streaming form of [`claude_transcript`]: push lines one at a time, then [`finish`](Self::finish).
 pub struct ClaudeImporter {
     adapter: ClaudeAdapter,
-    out: Vec<Envelope>,
-    /// Item starts currently in `out`.
-    items: usize,
-    /// Item starts trimmed away so far.
-    dropped: usize,
-    /// Every item id started, so a stray completion for an unknown item is dropped.
-    known: HashSet<String>,
-    /// Tool items waiting for a result, in start order.
-    open_tools: Vec<String>,
+    sink: ImportSink,
     /// Backgrounded sub-agents (their tool result was the "launched" metadata): they stay open
     /// across turns until their `<task-notification>`.
     background: HashSet<String>,
@@ -479,11 +512,7 @@ impl ClaudeImporter {
     pub fn new() -> Self {
         Self {
             adapter: ClaudeAdapter::new(),
-            out: Vec::new(),
-            items: 0,
-            dropped: 0,
-            known: HashSet::new(),
-            open_tools: Vec::new(),
+            sink: ImportSink::default(),
             background: HashSet::new(),
             turn_open: false,
             turn_interrupted: false,
@@ -516,10 +545,7 @@ impl ClaudeImporter {
             Some("user") => self.user(&record, line),
             _ => {}
         }
-        if self.items > 2 * MAX_IMPORTED_ITEMS {
-            self.dropped += cap(&mut self.out, MAX_IMPORTED_ITEMS);
-            self.items = count_items(&self.out);
-        }
+        self.sink.cap_if_needed();
     }
 
     /// Settles the last turn and returns the capped envelopes.
@@ -529,9 +555,7 @@ impl ClaudeImporter {
         }
         // A background sub-agent whose notification never came is not running any more.
         self.settle_open_tools();
-        let dropped = self.dropped + cap(&mut self.out, MAX_IMPORTED_ITEMS);
-        finish_cap(&mut self.out, dropped);
-        self.out
+        self.sink.finish()
     }
 
     fn user(&mut self, record: &Value, line: &str) {
@@ -541,7 +565,7 @@ impl ClaudeImporter {
             .unwrap_or(&Value::Null);
 
         if flag(record, "isCompactSummary") {
-            self.out.push(Envelope::new(Event::Notice {
+            self.sink.out.push(Envelope::new(Event::Notice {
                 text: "The earlier conversation was compacted here.".to_owned(),
             }));
             return;
@@ -590,7 +614,7 @@ impl ClaudeImporter {
         {
             let inner = inner.trim();
             if !inner.is_empty() {
-                self.out.push(Envelope::new(Event::Notice {
+                self.sink.out.push(Envelope::new(Event::Notice {
                     text: inner.to_owned(),
                 }));
             }
@@ -601,7 +625,7 @@ impl ClaudeImporter {
         }
         if text.starts_with("[Request interrupted") {
             self.turn_interrupted = true;
-            self.out.push(Envelope::new(Event::Notice { text }));
+            self.sink.out.push(Envelope::new(Event::Notice { text }));
             return;
         }
 
@@ -614,9 +638,8 @@ impl ClaudeImporter {
             self.close_turn();
         }
         self.open_turn();
-        self.known.insert(id.clone());
-        push_user_message(&mut self.out, id, &text);
-        self.items += 1;
+        self.sink.known.insert(id.clone());
+        self.sink.push_user_message(id, &text);
     }
 
     fn ensure_turn(&mut self) {
@@ -628,42 +651,37 @@ impl ClaudeImporter {
     fn open_turn(&mut self) {
         self.turn_open = true;
         self.turn_interrupted = false;
-        self.out
+        self.sink
+            .out
             .push(Envelope::new(Event::TurnStarted { model: None }));
     }
 
     /// Settles tool calls that never got a result, then ends the turn. Background sub-agents
     /// outlive their turn.
     fn close_turn(&mut self) {
-        let (keep, settle): (Vec<String>, Vec<String>) = std::mem::take(&mut self.open_tools)
+        let (keep, settle): (Vec<String>, Vec<String>) = std::mem::take(&mut self.sink.open_tools)
             .into_iter()
             .partition(|id| self.background.contains(id));
-        self.open_tools = settle;
+        self.sink.open_tools = settle;
         self.settle_open_tools();
-        self.open_tools = keep;
+        self.sink.open_tools = keep;
         let state = if self.turn_interrupted {
             TurnState::Interrupted
         } else {
             TurnState::Completed
         };
-        self.out.push(turn_completed(state));
+        self.sink.out.push(turn_completed(state));
         self.turn_open = false;
         self.turn_interrupted = false;
     }
 
     /// Settles every open tool item as `Interrupted`.
     fn settle_open_tools(&mut self) {
-        for id in std::mem::take(&mut self.open_tools) {
-            self.background.remove(&id);
-            self.out.push(
-                Envelope::new(Event::ItemCompleted {
-                    status: ItemStatus::Interrupted,
-                    output: None,
-                    error: None,
-                })
-                .item(id),
-            );
+        let open = std::mem::take(&mut self.sink.open_tools);
+        for id in &open {
+            self.background.remove(id);
         }
+        self.sink.settle(open);
     }
 
     /// `<task-notification>…<tool-use-id>T</tool-use-id>…<status>S</status>…</task-notification>`:
@@ -673,7 +691,7 @@ impl ClaudeImporter {
         let Some(id) = between(text, "<tool-use-id>", "</tool-use-id>").map(str::trim) else {
             return;
         };
-        if !self.known.contains(id) {
+        if !self.sink.known.contains(id) {
             return;
         }
         let id = id.to_owned();
@@ -695,9 +713,9 @@ impl ClaudeImporter {
         if let Some(o) = output.as_mut() {
             truncate_chars(o, MAX_TOOL_OUTPUT_CHARS);
         }
-        self.open_tools.retain(|t| *t != id);
+        self.sink.open_tools.retain(|t| *t != id);
         self.background.remove(&id);
-        self.out.push(
+        self.sink.out.push(
             Envelope::new(Event::ItemCompleted {
                 status,
                 error: (status == ItemStatus::Failed).then(|| {
@@ -715,44 +733,14 @@ impl ClaudeImporter {
     fn absorb(&mut self, envs: Vec<Envelope>) {
         for mut env in envs {
             env.raw = None;
-            match &mut env.event {
-                Event::ItemStarted { kind, .. } => {
-                    let Some(id) = env.item.clone() else {
-                        continue;
-                    };
-                    if !self.known.insert(id.clone()) {
-                        continue; // a repeated start (a resumed transcript replays frames)
-                    }
-                    if !matches!(
-                        kind,
-                        ItemKind::AssistantMessage | ItemKind::Reasoning | ItemKind::UserMessage
-                    ) {
-                        self.open_tools.push(id);
-                    }
-                    self.items += 1;
-                }
-                Event::ContentSnapshot { .. } | Event::ContentDelta { .. } => {
-                    if !env.item.as_ref().is_some_and(|i| self.known.contains(i)) {
-                        continue;
-                    }
-                }
-                Event::ItemCompleted { output, error, .. } => {
-                    let Some(id) = env.item.clone() else {
-                        continue;
-                    };
-                    if !self.known.contains(&id) {
-                        continue;
-                    }
-                    self.open_tools.retain(|t| *t != id);
-                    for field in [output, error].into_iter().flatten() {
-                        truncate_chars(field, MAX_TOOL_OUTPUT_CHARS);
-                    }
-                }
-                Event::Notice { .. } => {}
+            let keep = match &env.event {
+                Event::Notice { .. } => true,
                 // Session, quota, command and control events are not conversation.
-                _ => continue,
+                _ => self.sink.absorb_item(&mut env),
+            };
+            if keep {
+                self.sink.out.push(env);
             }
-            self.out.push(env);
         }
     }
 }
