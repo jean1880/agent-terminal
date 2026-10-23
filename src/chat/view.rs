@@ -3279,8 +3279,144 @@ pub(crate) mod tests {
         window.destroy();
     }
 
+    /// A jump to a built row, and the shelf's jump-and-focus to a built question, each move the
+    /// view once, onto the row, from bounds read after a layout.
+    pub(crate) fn a_jump_to_a_built_row_moves_once_onto_it() {
+        use agent_core::event::{Question, QuestionOption, QuestionSource};
+        let ctx = glib::MainContext::default();
+        let (view, window, inner) = live_window();
+        let t = &inner.transcript;
+        for i in 0..40 {
+            live_step(&view, &format!("s{i}"), None);
+        }
+        view.apply(
+            &Envelope::new(Event::QuestionRequested {
+                questions: vec![Question {
+                    id: "q".into(),
+                    header: "Pick".into(),
+                    question: "Which one?".into(),
+                    options: ["one", "two"]
+                        .iter()
+                        .map(|o| QuestionOption {
+                            label: (*o).into(),
+                            description: None,
+                        })
+                        .collect(),
+                    multi_select: false,
+                }],
+                source: QuestionSource::Agent,
+            })
+            .request("q1"),
+        );
+        for i in 40..80 {
+            live_step(&view, &format!("s{i}"), None);
+        }
+        let (_, adj) = t.scroll_parts();
+        assert!(crate::testutil::pump_until(&ctx, 10, || {
+            adj.upper() > adj.page_size() + 1000.0
+                && adj.value() + adj.page_size() >= adj.upper() - 1.0
+        }));
+        let settle = || {
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(1000);
+            let _ = crate::testutil::pump_until(&ctx, 3, || std::time::Instant::now() > until);
+        };
+        settle();
+        let near_top = |id: &str| {
+            t.row_bounds_in_viewport(id)
+                .is_some_and(|(b, _)| (30.0..=50.0).contains(&b.y()))
+        };
+        let moves = || t.settle_counts().1;
+        let before = moves();
+        t.scroll_to_card("s20");
+        settle();
+        assert!(near_top("s20"), "landed on the row: {}", t.scroll_debug());
+        assert_eq!(moves() - before, 1, "one move for one jump");
+
+        let question = inner
+            .model
+            .borrow()
+            .item_for_request("q1")
+            .cloned()
+            .expect("the question");
+        let before = moves();
+        assert!(t.focus_pending_card(&question));
+        settle();
+        assert!(
+            near_top(&question),
+            "landed on the card: {}",
+            t.scroll_debug()
+        );
+        assert_eq!(moves() - before, 1, "one move for the jump and its focus");
+        let focus = gtk4::prelude::RootExt::focus(&window).expect("focused");
+        let card = t.with_row(&question, |r| r.widget()).expect("built");
+        assert!(focus.is_ancestor(&card), "the first answer has focus");
+        window.destroy();
+    }
+
+    /// Back at the end, a focused "later steps" button is not compacted away: the steps it stood
+    /// for are built in place and focus moves to the first of them.
+    pub(crate) fn a_focused_later_steps_button_hands_focus_on_back_at_the_end() {
+        use agent_core::event::ItemKind;
+        let ctx = glib::MainContext::default();
+        let (view, window, inner) = live_window();
+        let t = &inner.transcript;
+        for i in 0..620 {
+            live_step(&view, &format!("s{i}"), None);
+        }
+        view.apply(&Envelope::item_started(
+            "agent",
+            ItemKind::Subagent,
+            "Agent",
+            None,
+            None,
+        ));
+        for c in 0..50 {
+            live_step(&view, &format!("agent-c{c}"), Some("agent"));
+        }
+        for i in 0..20 {
+            live_step(&view, &format!("after-{i}"), None);
+        }
+        let (_, adj) = t.scroll_parts();
+        assert!(crate::testutil::pump_until(&ctx, 10, || {
+            adj.upper() > adj.page_size() + 1000.0
+                && adj.value() + adj.page_size() >= adj.upper() - 1.0
+        }));
+        t.scroll_to_card("agent-c45");
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(1000);
+        let _ = crate::testutil::pump_until(&ctx, 3, || std::time::Instant::now() > until);
+        assert!(
+            t.row_bounds_in_viewport("agent-c45")
+                .is_some_and(|(b, _)| (0.0..=160.0).contains(&b.y())),
+            "the jump did not land: {:?} {}",
+            t.row_bounds_in_viewport("agent-c45").map(|(b, _)| b.y()),
+            t.scroll_debug()
+        );
+        // Built until the window reaches its budget, then they wait.
+        for c in 50..700 {
+            live_step(&view, &format!("agent-c{c}"), Some("agent"));
+        }
+        let (waiting, button) = t
+            .later_of("agent")
+            .unwrap_or_else(|| panic!("steps wait: {} rows", t.row_count()));
+        assert!(waiting >= transcript::CHILD_CAP, "{waiting} waiting");
+        let first = format!("agent-c{}", 700 - waiting);
+        assert!(button.grab_focus());
+        view.scroll_to_end();
+        while ctx.iteration(false) {}
+        assert!(t.later_of("agent").is_none(), "the steps are built");
+        let focus = gtk4::prelude::RootExt::focus(&window).expect("focus stays in the window");
+        let row = t.with_row(&first, |r| r.widget()).expect("built in place");
+        assert!(
+            focus == row || focus.is_ancestor(&row),
+            "focus moved to the first step the button stood for"
+        );
+        window.destroy();
+    }
+
     pub(crate) fn ui_checks() {
         replay_fills_the_window_in_steps();
+        a_jump_to_a_built_row_moves_once_onto_it();
+        a_focused_later_steps_button_hands_focus_on_back_at_the_end();
         live_append_keeps_the_window_bounded();
         a_pending_answer_survives_returning_to_the_end_and_a_far_jump();
         nested_steps_arriving_while_reading_a_card_stay_within_the_budget();

@@ -478,6 +478,11 @@ impl TranscriptView {
             if row.as_ref().is_some_and(|w| self.opening(w)) {
                 return;
             }
+            // The value moved since the content was last allocated: its bounds would mix the old
+            // layout with the new value. The layout after it places the row.
+            if !self.laid_out_at_value(&adj) {
+                return;
+            }
             // Gone meanwhile, or hidden (never allocated): nothing to jump to.
             let row = row.filter(WidgetExt::is_mapped);
             match row {
@@ -856,15 +861,19 @@ impl TranscriptView {
                 return;
             }
         }
-        if let Some(row) = self.rows.borrow().get(id) {
-            if let Some(bounds) = row.widget().compute_bounds(&self.scroller) {
-                let adj = self.scroller.vadjustment();
-                self.stick.set(false);
-                self.move_to(Self::card_target(&adj, bounds.y()));
-                // Placed again after the next layout, which the move itself may change.
-                *self.jump_to.borrow_mut() = Some(id.to_owned());
-                return;
-            }
+        // Built already: placed by `settle`, once, from bounds read after a layout (bounds read
+        // now can predate the layout the last change of content or scroll position queued).
+        let placed = self
+            .rows
+            .borrow()
+            .get(id)
+            .is_some_and(|row| row.widget().compute_bounds(&self.scroller).is_some());
+        if placed {
+            self.stick.set(false);
+            self.anchor.set(None);
+            self.restore_to.set(None);
+            *self.jump_to.borrow_mut() = Some(id.to_owned());
+            return;
         }
         self.scroll_to_end();
     }
@@ -908,6 +917,20 @@ impl TranscriptView {
             }
         }
         true
+    }
+
+    /// Whether the content is allocated at the scroll position the adjustment holds: the
+    /// viewport has laid its child out since the value last changed.
+    fn laid_out_at_value(&self, adj: &gtk4::Adjustment) -> bool {
+        let Some(viewport) = self.scroller.child() else {
+            return true;
+        };
+        let Some(content) = viewport.first_child() else {
+            return true;
+        };
+        content
+            .compute_bounds(&viewport)
+            .is_none_or(|b| (f64::from(b.y()) + adj.value()).abs() < 0.5)
     }
 
     /// Whether a card `widget` sits in is still opening: it is laid out where it ends up only
@@ -1296,11 +1319,14 @@ impl TranscriptView {
         let start = n.saturating_sub(count);
         let from = self.earlier.borrow().get(id).map_or(0, |(from, _)| *from);
         let built = &item.children[from.min(start)..start];
+        let had_focus = button.is_focus();
+        // The button holding focus is protected as a focused row is: built in place below, it
+        // hands focus to the first of the steps it stood for.
         let start_over = compact
+            && !had_focus
             && !self.uncapped.borrow().contains(id)
             && count >= CHILD_CAP
             && !built.iter().any(|c| self.protected(model, c));
-        let had_focus = button.is_focus();
         if start_over {
             for child in built {
                 let widget = self.rows.borrow().get(child).map(Row::widget);
@@ -1926,6 +1952,12 @@ impl TranscriptView {
     #[cfg(test)]
     pub fn earlier_of(&self, id: &str) -> Option<(usize, gtk4::Button)> {
         self.earlier.borrow().get(id).cloned()
+    }
+
+    /// A card's "later steps" button and how many children wait under it (tests).
+    #[cfg(test)]
+    pub fn later_of(&self, id: &str) -> Option<(usize, gtk4::Button)> {
+        self.later.borrow().get(id).cloned()
     }
 
     /// Whether the jump-to-latest button shows (tests).
