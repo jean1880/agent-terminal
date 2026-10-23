@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::caps::Capabilities;
-use crate::event::{Decision, Envelope};
+use crate::event::{Decision, Envelope, Event, ItemKind};
 
 /// Which agent CLI an adapter drives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -151,6 +151,16 @@ impl Mode {
             other => other,
         }
     }
+
+    /// The mode's name as the user reads it in a picker or a notice.
+    pub fn label(self) -> &'static str {
+        match self {
+            Mode::Ask => "Ask before edits",
+            Mode::AcceptEdits => "Accept edits",
+            Mode::Plan => "Plan",
+            Mode::Bypass => "Dangerous permissive",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -163,6 +173,14 @@ mod mode_tests {
         for m in [Mode::Ask, Mode::AcceptEdits, Mode::Plan] {
             assert_eq!(m.session_safe(), m);
         }
+    }
+
+    #[test]
+    fn labels_are_the_pickers_wording() {
+        assert_eq!(Mode::Ask.label(), "Ask before edits");
+        assert_eq!(Mode::AcceptEdits.label(), "Accept edits");
+        assert_eq!(Mode::Plan.label(), "Plan");
+        assert_eq!(Mode::Bypass.label(), "Dangerous permissive");
     }
 }
 
@@ -463,9 +481,104 @@ pub trait Adapter {
     }
 }
 
+/// One stdout line of a JSON-lines protocol as events: a blank line gives none, a line that is
+/// not JSON gives `Unknown` carrying the line as given, and a frame gives what `map` makes of it,
+/// with the parsed frame as `raw` on the first envelope only (one copy per line). A caller that
+/// trims its lines passes the trimmed line.
+pub(crate) fn map_json_frame(
+    line: &str,
+    map: impl FnOnce(&Value) -> Vec<Envelope>,
+) -> Vec<Envelope> {
+    if line.trim().is_empty() {
+        return Vec::new();
+    }
+    let Ok(frame) = serde_json::from_str::<Value>(line) else {
+        return vec![Envelope::new(Event::Unknown).raw(Value::String(line.to_owned()))];
+    };
+    let mut out = map(&frame);
+    if let Some(first) = out.first_mut() {
+        first.raw = Some(frame);
+    }
+    out
+}
+
+/// `v` and the `response` objects nested in it, outermost first, at most four levels: a control
+/// response given as the bare payload, the `{response: ..}` envelope or a whole recorded frame.
+pub(crate) fn response_chain(v: &Value) -> impl Iterator<Item = &Value> {
+    std::iter::successors(Some(v), |cur| cur.get("response")).take(4)
+}
+
+/// Opens item `id` unless it is already in `open_items`: records it there and emits its
+/// `ItemStarted` (no parent). For adapters whose items never nest.
+pub(crate) fn start_open_item(
+    open_items: &mut Vec<String>,
+    out: &mut Vec<Envelope>,
+    id: &str,
+    kind: ItemKind,
+    title: String,
+    input: Option<Value>,
+) {
+    if open_items.iter().any(|i| i == id) {
+        return;
+    }
+    open_items.push(id.to_owned());
+    out.push(
+        Envelope::new(Event::ItemStarted {
+            kind,
+            title,
+            input,
+            parent: None,
+        })
+        .item(id),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_frames_attach_raw_once_and_bad_lines_are_unknown() {
+        assert!(map_json_frame("  ", |_| unreachable!()).is_empty());
+        let bad = map_json_frame(" {nope", |_| unreachable!());
+        assert_eq!(bad.len(), 1);
+        assert_eq!(bad[0].event, Event::Unknown);
+        assert_eq!(bad[0].raw, Some(Value::String(" {nope".into())));
+        let two = map_json_frame(r#"{"a":1}"#, |_| {
+            vec![Envelope::new(Event::Unknown), Envelope::new(Event::Unknown)]
+        });
+        assert_eq!(two[0].raw, Some(serde_json::json!({"a": 1})));
+        assert_eq!(two[1].raw, None);
+    }
+
+    #[test]
+    fn the_response_chain_stops_at_four_levels() {
+        let v = serde_json::json!({"a": 0, "response": {"a": 1, "response": {"response": {
+            "a": 3, "response": {"a": 4}
+        }}}});
+        let found: Vec<_> = response_chain(&v).filter_map(|c| c.get("a")).collect();
+        assert_eq!(
+            found,
+            vec![
+                &serde_json::json!(0),
+                &serde_json::json!(1),
+                &serde_json::json!(3)
+            ]
+        );
+        assert_eq!(response_chain(&serde_json::json!(1)).count(), 1);
+    }
+
+    #[test]
+    fn an_open_item_starts_once() {
+        let (mut open, mut out) = (Vec::new(), Vec::new());
+        start_open_item(&mut open, &mut out, "i", ItemKind::Tool, "t".into(), None);
+        start_open_item(&mut open, &mut out, "i", ItemKind::Tool, "t".into(), None);
+        assert_eq!(open, vec!["i".to_owned()]);
+        assert_eq!(
+            out,
+            vec![Envelope::item_started("i", ItemKind::Tool, "t", None, None)]
+        );
+    }
 
     #[test]
     fn every_driver_is_listed_and_described_once() {

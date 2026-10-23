@@ -20,6 +20,7 @@ use super::route::{ChildBridge, RouteStatus};
 use super::tools::ToolName;
 use crate::adapter::Driver;
 use crate::event::{WorkerOrigin, WorkerState};
+use crate::text::json_len;
 
 /// "Output budget": `structuredContent` plus the same JSON as an escaped text
 /// block, measured on the real serialisation.
@@ -1398,10 +1399,6 @@ fn fit_value(v: &mut super::identity::ValueProvenance, max: usize) {
     if let Some(s) = &mut v.effective {
         cut(s, max);
     }
-}
-
-fn json_len<T: Serialize>(v: &T) -> usize {
-    serde_json::to_string(v).map_or(usize::MAX, |s| s.len())
 }
 
 /// Brings a summary within its field bounds, shortening `workspace.path` in the middle; then,

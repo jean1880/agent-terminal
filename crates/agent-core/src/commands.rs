@@ -818,37 +818,24 @@ mod tests {
         assert_eq!(names(&items).first(), Some(&"model"));
     }
 
+    /// An item with only a kind and a name.
+    fn completion(kind: CompletionKind, name: &str) -> CompletionItem {
+        CompletionItem {
+            kind,
+            name: name.into(),
+            description: String::new(),
+            hint: None,
+            insert_text: String::new(),
+        }
+    }
+
     #[test]
     fn ties_sort_by_kind_then_name() {
         let items = vec![
-            CompletionItem {
-                kind: CompletionKind::Skill,
-                name: "aaa".into(),
-                description: String::new(),
-                hint: None,
-                insert_text: String::new(),
-            },
-            CompletionItem {
-                kind: CompletionKind::Agent,
-                name: "aaa".into(),
-                description: String::new(),
-                hint: None,
-                insert_text: String::new(),
-            },
-            CompletionItem {
-                kind: CompletionKind::Builtin,
-                name: "aaa".into(),
-                description: String::new(),
-                hint: None,
-                insert_text: String::new(),
-            },
-            CompletionItem {
-                kind: CompletionKind::Agent,
-                name: "aab".into(),
-                description: String::new(),
-                hint: None,
-                insert_text: String::new(),
-            },
+            completion(CompletionKind::Skill, "aaa"),
+            completion(CompletionKind::Agent, "aaa"),
+            completion(CompletionKind::Builtin, "aaa"),
+            completion(CompletionKind::Agent, "aab"),
         ];
         // "aa" is a prefix of "aaa" (penalty 1) and of "aab" (penalty 1): all tie.
         let ranked = rank(items, "aa", &[]);

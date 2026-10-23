@@ -154,17 +154,7 @@ pub struct ToolError {
     pub details: Option<Value>,
 }
 
-/// `s` cut to at most `max` bytes at a character boundary.
-pub fn truncate_bytes(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
-    }
-    let mut end = max;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
+pub use crate::text::truncate_bytes;
 
 /// `details` within the contract bound: an object or null of at most
 /// `MAX_ERROR_DETAILS_BYTES` serialised.

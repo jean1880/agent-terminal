@@ -202,6 +202,21 @@ pub enum RevocationEvent {
     AppShutdown,
 }
 
+impl RevocationEvent {
+    /// Whether the event covers the whole tree: exactly the events whose [`revocation`] scope
+    /// is [`RevocationScope::Root`].
+    pub fn is_root_wide(&self) -> bool {
+        match self {
+            RevocationEvent::RootStop
+            | RevocationEvent::RootRestriction { .. }
+            | RevocationEvent::AppShutdown => true,
+            RevocationEvent::RootWidening
+            | RevocationEvent::Close(_)
+            | RevocationEvent::GenerationExited(_) => false,
+        }
+    }
+}
+
 /// Which part of the tree a bump covers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RevocationScope {
@@ -340,6 +355,30 @@ mod tests {
 
     fn w(s: &str) -> WorkerId {
         WorkerId::parse(&format!("w_{s}")).expect("valid id")
+    }
+
+    #[test]
+    fn root_wide_events_are_those_scoped_to_the_root() {
+        let tree = vec![
+            (w("root0000"), None, None),
+            (w("child000"), Some(w("root0000")), None),
+        ];
+        let mut events = vec![
+            RevocationEvent::RootStop,
+            RevocationEvent::RootWidening,
+            RevocationEvent::Close(w("child000")),
+            RevocationEvent::Close(w("root0000")),
+            RevocationEvent::GenerationExited(w("child000")),
+            RevocationEvent::AppShutdown,
+        ];
+        events.extend(MODES.map(|new_mode| RevocationEvent::RootRestriction { new_mode }));
+        for event in events {
+            assert_eq!(
+                event.is_root_wide(),
+                revocation(&event, &tree).scope == RevocationScope::Root,
+                "{event:?}"
+            );
+        }
     }
 
     fn root_authority(mode: Mode) -> InheritedAuthority {

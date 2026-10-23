@@ -633,30 +633,7 @@ fn redact_flag_values(line: &str) -> (String, bool) {
             i = name_end.max(i + 1);
             continue;
         }
-        let mut value_start = name_end;
-        while value_start < bytes.len() && blank(bytes[value_start]) {
-            value_start += 1;
-        }
-        // A quoted value runs to its closing quote, spaces and all.
-        let quote = match bytes.get(value_start) {
-            Some(q @ (b'"' | b'\'')) => {
-                value_start += 1;
-                Some(*q)
-            }
-            _ => None,
-        };
-        let mut value_end = value_start;
-        while value_end < bytes.len() {
-            let b = bytes[value_end];
-            let stop = match quote {
-                Some(q) => b == q,
-                None => blank(b),
-            };
-            if stop {
-                break;
-            }
-            value_end += 1;
-        }
+        let (value_start, value_end) = value_span(bytes, name_end, blank);
         open |= value_end == bytes.len();
         let value = &line[value_start..value_end];
         // A value starting with '-' is the next flag, not this one's argument.
@@ -672,6 +649,37 @@ fn redact_flag_values(line: &str) -> (String, bool) {
     }
     out.push_str(&line[copied..]);
     (out, open)
+}
+
+/// Where the value that follows `start` in `bytes` lies, as `(start, end)`: past any spaces and
+/// tabs, a quoted value runs to its closing quote (spaces and all, the quotes left out), an
+/// unquoted one to the first byte `stop_unquoted` accepts. `end` is the line's length when the
+/// value runs to the end.
+fn value_span(bytes: &[u8], start: usize, stop_unquoted: impl Fn(u8) -> bool) -> (usize, usize) {
+    let mut value_start = start;
+    while value_start < bytes.len() && matches!(bytes[value_start], b' ' | b'\t') {
+        value_start += 1;
+    }
+    let quote = match bytes.get(value_start) {
+        Some(q @ (b'"' | b'\'')) => {
+            value_start += 1;
+            Some(*q)
+        }
+        _ => None,
+    };
+    let mut value_end = value_start;
+    while value_end < bytes.len() {
+        let b = bytes[value_end];
+        let stop = match quote {
+            Some(q) => b == q,
+            None => stop_unquoted(b),
+        };
+        if stop {
+            break;
+        }
+        value_end += 1;
+    }
+    (value_start, value_end)
 }
 
 fn is_sensitive_name(name: &str) -> bool {
@@ -721,28 +729,9 @@ fn redact_assignments(line: &str) -> (String, bool) {
         ) {
             value_start += 1;
         }
-        while value_start < len && matches!(bytes[value_start], b' ' | b'\t') {
-            value_start += 1;
-        }
-        let quote = match bytes.get(value_start) {
-            Some(q @ (b'"' | b'\'')) => {
-                value_start += 1;
-                Some(*q)
-            }
-            _ => None,
-        };
-        let mut value_end = value_start;
-        while value_end < len {
-            let b = bytes[value_end];
-            let stop = match quote {
-                Some(q) => b == q,
-                None => matches!(b, b' ' | b'\t' | b',' | b';' | b'&' | b'"' | b'\''),
-            };
-            if stop {
-                break;
-            }
-            value_end += 1;
-        }
+        let (value_start, value_end) = value_span(bytes, value_start, |b| {
+            matches!(b, b' ' | b'\t' | b',' | b';' | b'&' | b'"' | b'\'')
+        });
         open |= value_end == len;
         let value = &line[value_start..value_end];
         if value.chars().count() >= MIN_SECRET_CHARS && !value.starts_with("****") {

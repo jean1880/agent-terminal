@@ -1293,18 +1293,8 @@ impl Adapter for ClaudeAdapter {
     }
 
     fn feed(&mut self, line: &str) -> Vec<Envelope> {
-        if line.trim().is_empty() {
-            return Vec::new();
-        }
-        let Ok(frame) = serde_json::from_str::<Value>(line) else {
-            return vec![Envelope::new(Event::Unknown).raw(Value::String(line.to_owned()))];
-        };
-        let mut out = self.map_frame(&frame);
-        // One copy of the frame per line, on the first envelope only.
-        if let Some(first) = out.first_mut() {
-            first.raw = Some(frame);
-        }
-        out
+        // The line as given, untrimmed, is what a malformed one keeps.
+        crate::adapter::map_json_frame(line, |frame| self.map_frame(frame))
     }
 
     fn drain_outbox(&mut self) -> Outbox {
@@ -1764,6 +1754,7 @@ fn questions_of(input: &Value) -> Vec<Question> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{stdout_frames, Malformed};
 
     #[test]
     fn only_a_refused_rate_limit_is_reported() {
@@ -1803,11 +1794,8 @@ mod tests {
     fn replay(fixture: &str) -> (ClaudeAdapter, Vec<Envelope>) {
         let mut a = ClaudeAdapter::new();
         let mut out = Vec::new();
-        for line in fixture.lines().filter(|l| !l.trim().is_empty()) {
-            let rec: Value = serde_json::from_str(line).expect("fixture line is JSON");
-            if str_of(&rec, "dir") == Some("out") {
-                out.extend(a.feed(&rec["frame"].to_string()));
-            }
+        for frame in stdout_frames(fixture, Malformed::Panic) {
+            out.extend(a.feed(&frame));
         }
         (a, out)
     }
@@ -2578,14 +2566,7 @@ mod tests {
                 decision: Decision::Cancel
             }
         ));
-        assert!(a
-            .encode(Command::Approve {
-                request: "r1".into(),
-                decision: Decision::Allow,
-                updated_input: None,
-                message: None,
-            })
-            .is_err());
+        assert!(a.encode(approve(Decision::Allow, "r1")).is_err());
     }
 
     #[test]
@@ -3428,11 +3409,9 @@ mod tests {
     /// Every frame the CLI sent in a recording, fed in order.
     fn replay_w0(fixture: &str) -> Vec<Envelope> {
         let mut a = ClaudeAdapter::new();
-        fixture
-            .lines()
-            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-            .filter(|rec| rec["dir"] == "out")
-            .flat_map(|rec| a.feed(&rec["frame"].to_string()))
+        stdout_frames(fixture, Malformed::Skip)
+            .iter()
+            .flat_map(|frame| a.feed(frame))
             .collect()
     }
 
@@ -3614,15 +3593,7 @@ mod tests {
         let mut a = ClaudeAdapter::new();
         pending_edit(&mut a);
         assert_eq!(
-            written(
-                &mut a,
-                Command::Approve {
-                    request: "r1".into(),
-                    decision: Decision::Allow,
-                    updated_input: None,
-                    message: None,
-                }
-            ),
+            written(&mut a, approve(Decision::Allow, "r1")),
             json!({"type": "control_response", "response": {"subtype": "success", "request_id": "r1",
                 "response": {"behavior": "allow", "updatedInput": {"file_path": "/x"}, "toolUseID": "tu1"}}})
         );
@@ -3656,27 +3627,14 @@ mod tests {
         );
         pending_edit(&mut a);
         assert_eq!(
-            written(
-                &mut a,
-                Command::Approve {
-                    request: "r1".into(),
-                    decision: Decision::Cancel,
-                    updated_input: None,
-                    message: None,
-                }
-            ),
+            written(&mut a, approve(Decision::Cancel, "r1")),
             json!({"type": "control_response", "response": {"subtype": "success", "request_id": "r1",
                 "response": {"behavior": "deny", "message": "The user denied this request",
                     "interrupt": true, "toolUseID": "tu1"}}})
         );
         // Answered requests are gone.
         assert!(matches!(
-            a.encode(Command::Approve {
-                request: "r1".into(),
-                decision: Decision::Allow,
-                updated_input: None,
-                message: None,
-            }),
+            a.encode(approve(Decision::Allow, "r1")),
             Err(AdapterError::Invalid(_))
         ));
     }

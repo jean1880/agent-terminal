@@ -51,6 +51,66 @@ impl Envelope {
         self.raw = Some(raw);
         self
     }
+
+    /// [`Event::ItemStarted`] for item `id`.
+    pub fn item_started(
+        id: impl Into<String>,
+        kind: ItemKind,
+        title: impl Into<String>,
+        input: Option<Value>,
+        parent: Option<&str>,
+    ) -> Self {
+        Self::new(Event::ItemStarted {
+            kind,
+            title: title.into(),
+            input,
+            parent: parent.map(str::to_owned),
+        })
+        .item(id)
+    }
+
+    /// [`Event::ItemCompleted`] for item `id`.
+    pub fn item_completed(
+        id: impl Into<String>,
+        status: ItemStatus,
+        output: Option<&str>,
+        error: Option<&str>,
+    ) -> Self {
+        Self::new(Event::ItemCompleted {
+            status,
+            output: output.map(str::to_owned),
+            error: error.map(str::to_owned),
+        })
+        .item(id)
+    }
+
+    /// [`Event::ContentDelta`] for item `id`.
+    pub fn delta(id: impl Into<String>, stream: StreamKind, text: impl Into<String>) -> Self {
+        Self::new(Event::ContentDelta {
+            stream,
+            text: text.into(),
+        })
+        .item(id)
+    }
+
+    /// [`Event::ContentSnapshot`] for item `id`.
+    pub fn snapshot(id: impl Into<String>, stream: StreamKind, text: impl Into<String>) -> Self {
+        Self::new(Event::ContentSnapshot {
+            stream,
+            text: text.into(),
+        })
+        .item(id)
+    }
+
+    /// [`Event::TurnCompleted`] with no usage or cost.
+    pub fn turn_completed(state: TurnState, error: Option<&str>) -> Self {
+        Self::new(Event::TurnCompleted {
+            state,
+            usage: None,
+            cost_usd: None,
+            error: error.map(str::to_owned),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -618,14 +678,50 @@ mod tests {
 
     #[test]
     fn envelope_round_trips_through_json() {
-        let env = Envelope::new(Event::ContentDelta {
-            stream: StreamKind::Assistant,
-            text: "hi".into(),
-        })
-        .item("m1");
+        let env = Envelope::delta("m1", StreamKind::Assistant, "hi");
         let json = serde_json::to_string(&env).expect("serialize");
         let back: Envelope = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(env, back);
+    }
+
+    #[test]
+    fn builders_fill_the_event_and_item() {
+        assert_eq!(
+            Envelope::item_started("t1", ItemKind::Command, "ls", None, Some("p")),
+            Envelope::new(Event::ItemStarted {
+                kind: ItemKind::Command,
+                title: "ls".into(),
+                input: None,
+                parent: Some("p".into()),
+            })
+            .item("t1")
+        );
+        assert_eq!(
+            Envelope::item_completed("t1", ItemStatus::Failed, Some("out"), Some("e")),
+            Envelope::new(Event::ItemCompleted {
+                status: ItemStatus::Failed,
+                output: Some("out".into()),
+                error: Some("e".into()),
+            })
+            .item("t1")
+        );
+        assert_eq!(
+            Envelope::snapshot("m", StreamKind::Reasoning, "x"),
+            Envelope::new(Event::ContentSnapshot {
+                stream: StreamKind::Reasoning,
+                text: "x".into(),
+            })
+            .item("m")
+        );
+        assert_eq!(
+            Envelope::turn_completed(TurnState::Interrupted, None),
+            Envelope::new(Event::TurnCompleted {
+                state: TurnState::Interrupted,
+                usage: None,
+                cost_usd: None,
+                error: None,
+            })
+        );
     }
 
     #[test]

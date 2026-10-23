@@ -260,6 +260,15 @@ struct McpCall {
     arguments: Value,
 }
 
+/// What an approval card shows besides its options, which come from its [`PendingApproval`].
+struct ApprovalCard {
+    tool: String,
+    title: Option<String>,
+    input: Value,
+    reason: Option<String>,
+    remembers: Option<String>,
+}
+
 /// An unanswered MCP form (`mcpServer/elicitation/request`).
 #[derive(Debug, Clone)]
 struct PendingForm {
@@ -822,19 +831,7 @@ impl CodexAdapter {
         title: String,
         input: Option<Value>,
     ) {
-        if self.open_items.iter().any(|i| i == id) {
-            return;
-        }
-        self.open_items.push(id.to_owned());
-        out.push(
-            Envelope::new(Event::ItemStarted {
-                kind,
-                title,
-                input,
-                parent: None,
-            })
-            .item(id),
-        );
+        crate::adapter::start_open_item(&mut self.open_items, out, id, kind, title, input);
     }
 
     fn complete_item(
@@ -1328,37 +1325,19 @@ impl CodexAdapter {
             scope.clone(),
             TURN_TOMBSTONE_LIMIT,
         );
-        let mut approvals: Vec<String> = self
-            .approvals
-            .iter()
-            .filter(|(_, p)| p.scope == scope)
-            .map(|(key, _)| key.clone())
-            .collect();
-        approvals.sort();
-        for key in approvals {
-            if let Some(pending) = self.approvals.remove(&key) {
-                out.push(
-                    Envelope::new(Event::ApprovalExpired)
-                        .item(pending.item)
-                        .request(key),
-                );
-            }
+        for (key, pending) in take_sorted_where(&mut self.approvals, |p| p.scope == scope) {
+            out.push(
+                Envelope::new(Event::ApprovalExpired)
+                    .item(pending.item)
+                    .request(key),
+            );
         }
-        let mut questions: Vec<String> = self
-            .questions
-            .iter()
-            .filter(|(_, p)| p.scope == scope)
-            .map(|(key, _)| key.clone())
-            .collect();
-        questions.sort();
-        for key in questions {
-            if let Some(pending) = self.questions.remove(&key) {
-                out.push(
-                    Envelope::new(Event::QuestionResolved { answered: false })
-                        .item(pending.item)
-                        .request(key),
-                );
-            }
+        for (key, pending) in take_sorted_where(&mut self.questions, |p| p.scope == scope) {
+            out.push(
+                Envelope::new(Event::QuestionResolved { answered: false })
+                    .item(pending.item)
+                    .request(key),
+            );
         }
         // A turnless form belongs to no turn, so no turn's end (not even one with no id) takes it.
         if scope.turn.is_some() {
@@ -1370,23 +1349,14 @@ impl CodexAdapter {
     /// Expires the open forms `which` picks, in key order: each card closes as cancelled, and
     /// nothing is sent (the server has resolved it, or the connection is gone).
     fn expire_forms(&mut self, which: impl Fn(&PendingForm) -> bool, out: &mut Vec<Envelope>) {
-        let mut keys: Vec<String> = self
-            .forms
-            .iter()
-            .filter(|(_, p)| which(p))
-            .map(|(key, _)| key.clone())
-            .collect();
-        keys.sort();
-        for key in keys {
-            if let Some(form) = self.forms.remove(&key) {
-                self.remember_settled_request(key.clone(), form.scope);
-                out.push(
-                    Envelope::new(Event::FormResolved {
-                        action: crate::form::FormAction::Cancel,
-                    })
-                    .request(key),
-                );
-            }
+        for (key, form) in take_sorted_where(&mut self.forms, which) {
+            self.remember_settled_request(key.clone(), form.scope);
+            out.push(
+                Envelope::new(Event::FormResolved {
+                    action: crate::form::FormAction::Cancel,
+                })
+                .request(key),
+            );
         }
     }
 
@@ -1698,26 +1668,45 @@ impl CodexAdapter {
                 obj.entry("changes").or_insert_with(|| changes.clone());
             }
         }
-        self.approvals.insert(
-            key.clone(),
-            PendingApproval {
-                rpc_id: id.clone(),
-                item: item.clone(),
-                scope: self.request_scope(params),
-                options: options.clone(),
-                grant: None,
-                form: false,
-            },
-        );
+        let pending = PendingApproval {
+            rpc_id: id.clone(),
+            item,
+            scope: self.request_scope(params),
+            options,
+            grant: None,
+            form: false,
+        };
+        let card = ApprovalCard {
+            tool: tool.to_owned(),
+            title,
+            input,
+            reason: s(params, "reason").map(str::to_owned),
+            remembers,
+        };
+        self.publish_approval(key, pending, card, out);
+    }
+
+    /// Registers `pending` under `key` and shows its card, which offers exactly the options the
+    /// pending request accepts. The caller has worked out the options and validated the request.
+    fn publish_approval(
+        &mut self,
+        key: String,
+        pending: PendingApproval,
+        card: ApprovalCard,
+        out: &mut Vec<Envelope>,
+    ) {
+        let item = pending.item.clone();
+        let options = pending.options.clone();
+        self.approvals.insert(key.clone(), pending);
         out.push(
             Envelope::new(Event::ApprovalRequested {
-                tool: tool.to_owned(),
-                title,
-                input,
-                reason: s(params, "reason").map(str::to_owned),
+                tool: card.tool,
+                title: card.title,
+                input: card.input,
+                reason: card.reason,
                 options,
                 response: ResponseCapability::Live,
-                remembers,
+                remembers: card.remembers,
             })
             .item(item)
             .request(key),
@@ -1749,30 +1738,22 @@ impl CodexAdapter {
         } else {
             vec![Decision::Deny, Decision::Cancel]
         };
-        self.approvals.insert(
-            key.clone(),
-            PendingApproval {
-                rpc_id: id.clone(),
-                item: item.clone(),
-                scope: self.request_scope(params),
-                options: options.clone(),
-                grant: Some(parsed.grant),
-                form: false,
-            },
-        );
-        out.push(
-            Envelope::new(Event::ApprovalRequested {
-                tool: PERMISSIONS_TOOL.to_owned(),
-                title: Some(parsed.title),
-                input: parsed.input,
-                reason: s(params, "reason").map(str::to_owned),
-                options,
-                response: ResponseCapability::Live,
-                remembers: None,
-            })
-            .item(item)
-            .request(key),
-        );
+        let pending = PendingApproval {
+            rpc_id: id.clone(),
+            item,
+            scope: self.request_scope(params),
+            options,
+            grant: Some(parsed.grant),
+            form: false,
+        };
+        let card = ApprovalCard {
+            tool: PERMISSIONS_TOOL.to_owned(),
+            title: Some(parsed.title),
+            input: parsed.input,
+            reason: s(params, "reason").map(str::to_owned),
+            remembers: None,
+        };
+        self.publish_approval(key, pending, card, out);
     }
 
     /// `mcpServer/elicitation/request`: a form card, or a decline with a notice.
@@ -1903,31 +1884,22 @@ impl CodexAdapter {
                     .unwrap_or(Value::Null),
             ),
         };
-        let options = ALL_DECISIONS.to_vec();
-        self.approvals.insert(
-            key.clone(),
-            PendingApproval {
-                rpc_id: id.clone(),
-                item: item.clone(),
-                scope,
-                options: options.clone(),
-                grant: None,
-                form: true,
-            },
-        );
-        out.push(
-            Envelope::new(Event::ApprovalRequested {
-                tool,
-                title: s(params, "message").map(|m| clip(&permissions::visible(m), MCP_TITLE_MAX)),
-                input,
-                reason: None,
-                options,
-                response: ResponseCapability::Live,
-                remembers: None,
-            })
-            .item(item)
-            .request(key),
-        );
+        let pending = PendingApproval {
+            rpc_id: id.clone(),
+            item,
+            scope,
+            options: ALL_DECISIONS.to_vec(),
+            grant: None,
+            form: true,
+        };
+        let card = ApprovalCard {
+            tool,
+            title: s(params, "message").map(|m| clip(&permissions::visible(m), MCP_TITLE_MAX)),
+            input,
+            reason: None,
+            remembers: None,
+        };
+        self.publish_approval(key, pending, card, out);
     }
 
     /// `turn/interrupt` for the active turn, when `scope` is that turn; `None` otherwise (a
@@ -1997,11 +1969,28 @@ impl CodexAdapter {
             )));
         };
         self.remember_settled_request(request, form.scope.clone());
-        let mut lines = vec![json!({"id": form.rpc_id, "result": result}).to_string()];
-        if action == FormAction::Cancel {
-            lines.extend(self.interrupt_scope(&form.scope));
+        Ok(self.scoped_reply(
+            &form.rpc_id,
+            result,
+            &form.scope,
+            action == FormAction::Cancel,
+        ))
+    }
+
+    /// The reply to server request `rpc_id`, followed, when `interrupt` is set, by a
+    /// `turn/interrupt` of `scope`'s turn if that is the active one (never another turn).
+    fn scoped_reply(
+        &mut self,
+        rpc_id: &Value,
+        result: Value,
+        scope: &RequestScope,
+        interrupt: bool,
+    ) -> Vec<Action> {
+        let mut lines = vec![json!({"id": rpc_id, "result": result}).to_string()];
+        if interrupt {
+            lines.extend(self.interrupt_scope(scope));
         }
-        Ok(vec![Action::Write(lines)])
+        vec![Action::Write(lines)]
     }
 
     // ---- responses ----
@@ -2093,16 +2082,7 @@ impl CodexAdapter {
                 }
                 config.insert("features.multi_agent".into(), Value::Bool(false));
                 config.insert("features.multi_agent_v2".into(), Value::Bool(false));
-                if method == "thread/resume" {
-                    let mut fallback = params.clone();
-                    if let Some(map) = fallback.as_object_mut() {
-                        map.remove("threadId");
-                        map.remove("excludeTurns");
-                    }
-                    self.resume_fallback = Some(fallback);
-                }
-                let line = self.request(Pending::ThreadStart, &method, params);
-                self.write(line);
+                self.launch_configured_thread(&method, params);
             }
             // The note is a hint: an unreadable config starts the thread without it, rather than
             // failing (and the user's own instructions are never replaced by it alone).
@@ -2118,16 +2098,7 @@ impl CodexAdapter {
                         );
                     }
                 }
-                if method == "thread/resume" {
-                    let mut fallback = params.clone();
-                    if let Some(map) = fallback.as_object_mut() {
-                        map.remove("threadId");
-                        map.remove("excludeTurns");
-                    }
-                    self.resume_fallback = Some(fallback);
-                }
-                let line = self.request(Pending::ThreadStart, &method, params);
-                self.write(line);
+                self.launch_configured_thread(&method, params);
             }
             (Pending::ChildConfig { .. }, None, _) => {
                 self.fail_startup(
@@ -2261,6 +2232,21 @@ impl CodexAdapter {
             // An interrupt with no turn to stop, or an acknowledged compact: nothing to show.
             (Pending::Interrupt | Pending::Compact, _, _) => {}
         }
+    }
+
+    /// Sends the `thread/start` or `thread/resume` a launch configuration was read for. A
+    /// resume keeps a fresh-start copy of `params`, used if Codex kept nothing to resume.
+    fn launch_configured_thread(&mut self, method: &str, params: Value) {
+        if method == "thread/resume" {
+            let mut fallback = params.clone();
+            if let Some(map) = fallback.as_object_mut() {
+                map.remove("threadId");
+                map.remove("excludeTurns");
+            }
+            self.resume_fallback = Some(fallback);
+        }
+        let line = self.request(Pending::ThreadStart, method, params);
+        self.write(line);
     }
 
     fn on_thread_ready(&mut self, result: &Value, out: &mut Vec<Envelope>) {
@@ -2606,12 +2592,12 @@ impl Adapter for CodexAdapter {
                         Decision::Deny => json!({"action": "decline"}),
                         Decision::Cancel => json!({"action": "cancel"}),
                     };
-                    let mut lines =
-                        vec![json!({"id": approval.rpc_id, "result": result}).to_string()];
-                    if decision == Decision::Cancel {
-                        lines.extend(self.interrupt_scope(&approval.scope));
-                    }
-                    return Ok(vec![Action::Write(lines)]);
+                    return Ok(self.scoped_reply(
+                        &approval.rpc_id,
+                        result,
+                        &approval.scope,
+                        decision == Decision::Cancel,
+                    ));
                 }
                 let Some(grant) = rewritten.or(approval.grant) else {
                     let line = json!({
@@ -2630,13 +2616,14 @@ impl Adapter for CodexAdapter {
                         json!({"permissions": {}})
                     }
                 };
-                let mut lines = vec![json!({"id": approval.rpc_id, "result": result}).to_string()];
                 // No refusal value stops a turn here, so Stop turn interrupts it, as the
                 // command approval's `cancel` does.
-                if decision == Decision::Cancel {
-                    lines.extend(self.interrupt_scope(&approval.scope));
-                }
-                Ok(vec![Action::Write(lines)])
+                Ok(self.scoped_reply(
+                    &approval.rpc_id,
+                    result,
+                    &approval.scope,
+                    decision == Decision::Cancel,
+                ))
             }
             Command::Answer { request, answers } => {
                 let Some(question) = self.questions.get(&request).cloned() else {
@@ -2694,7 +2681,7 @@ impl Adapter for CodexAdapter {
                     });
                     self.emit(Event::Notice { text: format!(
                         "{} applies to the next turn. This turn keeps {}; its pending approvals still need an answer.",
-                        codex_mode_label(mode), codex_mode_label(effective)
+                        mode.label(), effective.label()
                     ) });
                 } else {
                     // Selecting the effective mode cancels any deferred selection.
@@ -2739,29 +2726,22 @@ impl Adapter for CodexAdapter {
 
     fn feed(&mut self, line: &str) -> Vec<Envelope> {
         let line = line.trim();
-        if line.is_empty() {
-            return Vec::new();
-        }
-        let raw: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => return vec![unknown(Value::String(line.to_owned()))],
-        };
-        let id = raw.get("id").filter(|v| !v.is_null()).cloned();
-        let method = raw.get("method").and_then(Value::as_str).map(str::to_owned);
-        let params = raw.get("params").cloned().unwrap_or(Value::Null);
-        let mut out = Vec::new();
-        match (method, id) {
-            (Some(method), Some(id)) => {
-                self.on_server_request(&id, &method, &params, line, &mut out)
+        crate::adapter::map_json_frame(line, |raw| {
+            let id = raw.get("id").filter(|v| !v.is_null()).cloned();
+            let method = raw.get("method").and_then(Value::as_str).map(str::to_owned);
+            let params = raw.get("params").cloned().unwrap_or(Value::Null);
+            let mut out = Vec::new();
+            match (method, id) {
+                // The original frame text: an elicitation's property order is read from it.
+                (Some(method), Some(id)) => {
+                    self.on_server_request(&id, &method, &params, line, &mut out)
+                }
+                (Some(method), None) => self.on_notification(&method, &params, &mut out),
+                (None, Some(id)) => self.on_response(&id, raw, &mut out),
+                (None, None) => out.push(Envelope::new(Event::Unknown)),
             }
-            (Some(method), None) => self.on_notification(&method, &params, &mut out),
-            (None, Some(id)) => self.on_response(&id, &raw, &mut out),
-            (None, None) => out.push(Envelope::new(Event::Unknown)),
-        }
-        if let Some(first) = out.first_mut() {
-            first.raw = Some(raw);
-        }
-        out
+            out
+        })
     }
 
     fn feed_stderr(&mut self, _line: &str) -> Vec<Envelope> {
@@ -2794,18 +2774,14 @@ impl Adapter for CodexAdapter {
             self.emit_workers(&mut out);
         }
         self.close_all(&mut out);
-        let mut approvals: Vec<_> = std::mem::take(&mut self.approvals).into_iter().collect();
-        approvals.sort_by(|a, b| a.0.cmp(&b.0));
-        for (request, approval) in approvals {
+        for (request, approval) in take_sorted_where(&mut self.approvals, |_| true) {
             out.push(
                 Envelope::new(Event::ApprovalExpired)
                     .item(approval.item)
                     .request(request),
             );
         }
-        let mut questions: Vec<_> = std::mem::take(&mut self.questions).into_iter().collect();
-        questions.sort_by(|a, b| a.0.cmp(&b.0));
-        for (request, question) in questions {
+        for (request, question) in take_sorted_where(&mut self.questions, |_| true) {
             out.push(
                 Envelope::new(Event::QuestionResolved { answered: false })
                     .item(question.item)
@@ -2938,6 +2914,24 @@ const ALL_DECISIONS: [Decision; 5] = [
     Decision::Cancel,
 ];
 
+/// Removes the entries of `pending` that `matches` picks and returns them in key order, so what
+/// they emit is deterministic. What the caller then does with them (tombstones, which forms a
+/// scope covers) is its own policy.
+fn take_sorted_where<T>(
+    pending: &mut HashMap<String, T>,
+    matches: impl Fn(&T) -> bool,
+) -> Vec<(String, T)> {
+    let mut keys: Vec<String> = pending
+        .iter()
+        .filter(|(_, p)| matches(p))
+        .map(|(key, _)| key.clone())
+        .collect();
+    keys.sort();
+    keys.into_iter()
+        .filter_map(|key| pending.remove(&key).map(|p| (key, p)))
+        .collect()
+}
+
 fn remember_bounded<T: Clone + Eq + std::hash::Hash>(
     keys: &mut HashSet<T>,
     order: &mut VecDeque<T>,
@@ -2983,15 +2977,6 @@ fn sandbox_mode_name(policy: &Value) -> Option<&'static str> {
         "workspaceWrite" => Some("workspace-write"),
         "dangerFullAccess" => Some("danger-full-access"),
         _ => None,
-    }
-}
-
-fn codex_mode_label(mode: Mode) -> &'static str {
-    match mode {
-        Mode::Ask => "Ask before edits",
-        Mode::AcceptEdits => "Accept edits",
-        Mode::Plan => "Plan",
-        Mode::Bypass => "Dangerous permissive",
     }
 }
 
@@ -3367,13 +3352,10 @@ fn strings(v: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn unknown(raw: Value) -> Envelope {
-    Envelope::new(Event::Unknown).raw(raw)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{records, Malformed};
 
     const TURN: &str = include_str!("../tests/fixtures/codex-synthetic-turn.ndjson");
 
@@ -3419,6 +3401,15 @@ mod tests {
         let mut w = writes(&actions);
         assert_eq!(w.len(), 1, "{w:?}");
         w.remove(0)
+    }
+
+    /// The one line a prompt writes. Encodes only: nothing is fed or drained.
+    fn prompt(adapter: &mut CodexAdapter, text: &str) -> Value {
+        one_write(
+            adapter
+                .encode(Command::Prompt { text: text.into() })
+                .expect("prompt"),
+        )
     }
 
     /// Frames follow the installed app-server JSON schema; no provider prompt is needed.
@@ -3813,13 +3804,7 @@ mod tests {
         assert_eq!(start["params"]["approvalPolicy"], "untrusted");
         assert_eq!(start["params"]["sandbox"], "workspace-write");
         child.feed(r#"{"id":2,"result":{"thread":{"id":"th-1"}}}"#);
-        let turn = one_write(
-            child
-                .encode(Command::Prompt {
-                    text: "task".into(),
-                })
-                .expect("prompt"),
-        );
+        let turn = prompt(&mut child, "task");
         assert_eq!(turn["params"]["approvalPolicy"], "untrusted");
         assert_eq!(turn["params"]["sandboxPolicy"]["type"], "workspaceWrite");
         assert_eq!(child.workspace_writable(), Some(true));
@@ -3988,12 +3973,7 @@ mod tests {
     #[test]
     fn changing_mode_mid_turn_does_not_claim_the_current_sandbox_changed() {
         let mut a = started(Mode::Ask);
-        let first = one_write(
-            a.encode(Command::Prompt {
-                text: "Review".into(),
-            })
-            .expect("prompt"),
-        );
+        let first = prompt(&mut a, "Review");
         assert_eq!(first["params"]["sandboxPolicy"]["type"], "readOnly");
         a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu"}}}"#);
         a.encode(Command::SetMode {
@@ -4020,12 +4000,7 @@ mod tests {
                 mode: Mode::AcceptEdits
             }
         )));
-        let next = one_write(
-            a.encode(Command::Prompt {
-                text: "Edit".into(),
-            })
-            .expect("prompt"),
-        );
+        let next = prompt(&mut a, "Edit");
         assert_eq!(next["params"]["sandboxPolicy"]["type"], "workspaceWrite");
         assert_eq!(next["params"]["approvalPolicy"], "untrusted");
     }
@@ -4069,12 +4044,7 @@ mod tests {
         a.drain_outbox();
         a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu","status":"interrupted"}}}"#);
         assert_eq!(a.effective_mode, None);
-        let next = one_write(
-            a.encode(Command::Prompt {
-                text: "Plan".into(),
-            })
-            .expect("prompt"),
-        );
+        let next = prompt(&mut a, "Plan");
         assert_eq!(next["params"]["sandboxPolicy"]["type"], "readOnly");
         assert_eq!(next["params"]["approvalPolicy"], "never");
     }
@@ -4082,12 +4052,7 @@ mod tests {
     #[test]
     fn mode_change_during_pending_start_is_deferred_and_failed_start_clears_it() {
         let mut a = started(Mode::Ask);
-        let start = one_write(
-            a.encode(Command::Prompt {
-                text: "Review".into(),
-            })
-            .expect("prompt"),
-        );
+        let start = prompt(&mut a, "Review");
         a.encode(Command::SetMode {
             mode: Mode::AcceptEdits,
         })
@@ -4180,8 +4145,7 @@ mod tests {
             .is_empty());
         let mut events = Vec::new();
         let mut last_request: Option<String> = None;
-        for line in fixture.lines() {
-            let rec: Value = serde_json::from_str(line).expect("fixture line");
+        for rec in records(fixture, Malformed::Panic) {
             let frame = &rec["frame"];
             match rec["dir"].as_str() {
                 Some("out") => {
@@ -4208,12 +4172,10 @@ mod tests {
                             _ => Decision::Cancel,
                         };
                         let actions = a
-                            .encode(Command::Approve {
-                                request: last_request.clone().expect("approval seen"),
+                            .encode(approve_cmd(
+                                last_request.as_deref().expect("approval seen"),
                                 decision,
-                                updated_input: None,
-                                message: None,
-                            })
+                            ))
                             .expect("approve");
                         wrote.extend(writes(&actions));
                     }
@@ -4511,12 +4473,7 @@ mod tests {
             a.argv(&session(Mode::Ask, Some("th-1")));
             a.handshake();
             a.feed(r#"{"id":2,"result":{"thread":{"id":"th-1"}}}"#);
-            let sent = one_write(
-                a.encode(Command::Prompt {
-                    text: "continue".into(),
-                })
-                .expect("send"),
-            );
+            let sent = prompt(&mut a, "continue");
             let response = if success {
                 json!({"id":sent["id"],"result":{"turn":{"id":"tu"}}})
             } else {
@@ -4605,12 +4562,7 @@ mod tests {
         a.argv(&session(Mode::Ask, Some("th-1")));
         a.handshake();
         a.feed(r#"{"id":2,"result":{"thread":{"id":"th-1"}}}"#);
-        let sent = one_write(
-            a.encode(Command::Prompt {
-                text: "continue".into(),
-            })
-            .expect("send"),
-        );
+        let sent = prompt(&mut a, "continue");
         let failed = a.feed(r#"{"id":1,"error":{"message":"initialize denied"}}"#);
         assert!(failed.iter().any(|e| matches!(
             e.event,
@@ -4632,12 +4584,7 @@ mod tests {
         a.argv(&session(Mode::Ask, Some("th-1")));
         a.handshake();
         a.feed(r#"{"id":2,"result":{"thread":{"id":"th-1"}}}"#);
-        let sent = one_write(
-            a.encode(Command::Prompt {
-                text: "continue".into(),
-            })
-            .expect("send"),
-        );
+        let sent = prompt(&mut a, "continue");
         let reroute = a.feed(r#"{"method":"model/rerouted","params":{"threadId":"th-1","turnId":"tu","toModel":"fallback"}}"#);
         assert!(matches!(&reroute[0].event, Event::ModelChanged { model } if model == "fallback"));
         assert!(reroute[0].request.is_none());
@@ -4721,12 +4668,7 @@ mod tests {
             let flushed = writes(&a.drain_outbox().actions);
             assert_eq!(flushed[0]["params"]["model"], "gpt-5.5");
             assert_eq!(flushed[0]["params"]["effort"], "high");
-            let next = one_write(
-                a.encode(Command::Prompt {
-                    text: "next".into(),
-                })
-                .expect("send"),
-            );
+            let next = prompt(&mut a, "next");
             assert_eq!(next["params"]["model"], "gpt-5.5");
         }
     }
@@ -4768,7 +4710,7 @@ mod tests {
         ];
         for (mode, approval, sandbox) in table {
             let mut a = started(mode);
-            let w = one_write(a.encode(Command::Prompt { text: "hi".into() }).expect("ok"));
+            let w = prompt(&mut a, "hi");
             assert_eq!(
                 w,
                 json!({"id": 3, "method": "turn/start", "params": {
@@ -4815,7 +4757,7 @@ mod tests {
                 }),
             ]
         );
-        let w = one_write(a.encode(Command::Prompt { text: "x".into() }).expect("ok"));
+        let w = prompt(&mut a, "x");
         assert_eq!(w["params"]["model"], "gpt-5.5");
         assert_eq!(w["params"]["approvalPolicy"], "untrusted");
         assert_eq!(
@@ -4843,12 +4785,7 @@ mod tests {
                 .events
                 .iter()
                 .any(|e| matches!(e.event, Event::ModelChanged { .. })));
-            let sent = one_write(
-                a.encode(Command::Prompt {
-                    text: "first".into(),
-                })
-                .expect("send"),
-            );
+            let sent = prompt(&mut a, "first");
             a.encode(Command::SetModel {
                 model: "newer".into(),
                 effort: Some("low".into()),
@@ -4881,12 +4818,7 @@ mod tests {
             assert!(!events
                 .iter()
                 .any(|e| matches!(&e.event, Event::ModelChanged { model } if model == "newer")));
-            let next = one_write(
-                a.encode(Command::Prompt {
-                    text: "next".into(),
-                })
-                .expect("next"),
-            );
+            let next = prompt(&mut a, "next");
             assert_eq!(next["params"]["model"], "newer");
             assert_eq!(next["params"]["effort"], "low");
         }
@@ -4902,12 +4834,7 @@ mod tests {
             })
             .expect("select");
             a.drain_outbox();
-            let sent = one_write(
-                a.encode(Command::Prompt {
-                    text: "first".into(),
-                })
-                .expect("send"),
-            );
+            let sent = prompt(&mut a, "first");
             if newer {
                 a.encode(Command::SetModel {
                     model: "newer".into(),
@@ -4931,12 +4858,7 @@ mod tests {
                     ..
                 }
             )));
-            let next = one_write(
-                a.encode(Command::Prompt {
-                    text: "next".into(),
-                })
-                .expect("next"),
-            );
+            let next = prompt(&mut a, "next");
             assert_eq!(
                 next["params"]["model"],
                 if newer { "newer" } else { "gpt-5-codex" }
@@ -4958,12 +4880,7 @@ mod tests {
         })
         .expect("select");
         a.drain_outbox();
-        let sent = one_write(
-            a.encode(Command::Prompt {
-                text: "first".into(),
-            })
-            .expect("send"),
-        );
+        let sent = prompt(&mut a, "first");
         a.feed(&json!({"id":sent["id"],"result":{"turn":{"id":"tu"}}}).to_string());
         a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu","status":"completed"}}}"#);
         a.encode(Command::SetModel {
@@ -4972,19 +4889,9 @@ mod tests {
         })
         .expect("select invalid");
         a.drain_outbox();
-        let sent = one_write(
-            a.encode(Command::Prompt {
-                text: "second".into(),
-            })
-            .expect("send"),
-        );
+        let sent = prompt(&mut a, "second");
         a.feed(&json!({"id":sent["id"],"error":{"message":"no such model"}}).to_string());
-        let next = one_write(
-            a.encode(Command::Prompt {
-                text: "retry".into(),
-            })
-            .expect("send"),
-        );
+        let next = prompt(&mut a, "retry");
         assert_eq!(next["params"]["model"], "accepted");
         assert_eq!(next["params"]["effort"], "high");
     }
@@ -4998,12 +4905,7 @@ mod tests {
         })
         .expect("select");
         a.drain_outbox();
-        let sent = one_write(
-            a.encode(Command::Prompt {
-                text: "first".into(),
-            })
-            .expect("send"),
-        );
+        let sent = prompt(&mut a, "first");
         a.encode(Command::SetModel {
             model: "newer".into(),
             effort: Some("low".into()),
@@ -5022,12 +4924,7 @@ mod tests {
         assert!(
             matches!(&started[0].event, Event::TurnStarted { model: Some(model) } if model == "fallback")
         );
-        let next = one_write(
-            a.encode(Command::Prompt {
-                text: "next".into(),
-            })
-            .expect("next"),
-        );
+        let next = prompt(&mut a, "next");
         assert_eq!(next["params"]["model"], "newer");
         assert_eq!(next["params"]["effort"], "low");
     }
@@ -5042,12 +4939,7 @@ mod tests {
             })
             .expect("first choice");
             let first_key = a.drain_outbox().events[0].request.clone();
-            let sent = one_write(
-                a.encode(Command::Prompt {
-                    text: "first".into(),
-                })
-                .expect("send"),
-            );
+            let sent = prompt(&mut a, "first");
             for (model, effort) in [("other", "high"), ("same", "low")] {
                 a.encode(Command::SetModel {
                     model: model.into(),
@@ -5081,12 +4973,7 @@ mod tests {
                 .expect("selection acknowledgement");
             assert_eq!(ack.request, first_key);
             assert_ne!(ack.request, latest_key);
-            let next = one_write(
-                a.encode(Command::Prompt {
-                    text: "next".into(),
-                })
-                .expect("next"),
-            );
+            let next = prompt(&mut a, "next");
             assert_eq!(next["params"]["model"], "same");
             assert_eq!(next["params"]["effort"], "low");
         }
@@ -5095,14 +4982,14 @@ mod tests {
     #[test]
     fn effort_rides_on_every_turn_start() {
         let mut a = started(Mode::Ask);
-        let w = one_write(a.encode(Command::Prompt { text: "a".into() }).expect("ok"));
+        let w = prompt(&mut a, "a");
         assert!(w["params"].get("effort").is_none());
         a.encode(Command::SetModel {
             model: "gpt-5-codex".into(),
             effort: Some("high".into()),
         })
         .expect("set");
-        let w = one_write(a.encode(Command::Prompt { text: "b".into() }).expect("ok"));
+        let w = prompt(&mut a, "b");
         assert_eq!(w["params"]["effort"], "high");
         // `None` keeps the effort; no respawn is asked for.
         let actions = a
@@ -5112,7 +4999,7 @@ mod tests {
             })
             .expect("set");
         assert!(actions.is_empty());
-        let w = one_write(a.encode(Command::Prompt { text: "c".into() }).expect("ok"));
+        let w = prompt(&mut a, "c");
         assert_eq!(w["params"]["effort"], "high");
     }
 
@@ -5147,7 +5034,7 @@ mod tests {
         a.argv(&s);
         a.handshake();
         a.feed(r#"{"id":2,"result":{"thread":{"id":"th-1"}}}"#);
-        let w = one_write(a.encode(Command::Prompt { text: "a".into() }).expect("ok"));
+        let w = prompt(&mut a, "a");
         assert_eq!(w["params"]["effort"], "low");
     }
 
@@ -5200,24 +5087,11 @@ mod tests {
             ));
             let request = ev[0].request.clone().expect("canonical request");
             assert_ne!(request, "17");
-            let w = one_write(
-                a.encode(Command::Approve {
-                    request: request.clone(),
-                    decision,
-                    updated_input: None,
-                    message: None,
-                })
-                .expect("approve"),
-            );
+            let w = one_write(a.encode(approve_cmd(&request, decision)).expect("approve"));
             assert_eq!(w, json!({"id": 17, "result": {"decision": wire}}));
             // Answered once: a second answer is invalid, and nothing expires at exit.
             assert!(matches!(
-                a.encode(Command::Approve {
-                    request,
-                    decision,
-                    updated_input: None,
-                    message: None
-                }),
+                a.encode(approve_cmd(&request, decision)),
                 Err(AdapterError::Invalid(_))
             ));
             assert!(!a
@@ -5261,12 +5135,7 @@ mod tests {
             assert_eq!(
                 one_write(
                     resumed
-                        .encode(Command::Approve {
-                            request,
-                            decision: Decision::Allow,
-                            updated_input: None,
-                            message: None,
-                        })
+                        .encode(approve_cmd(&request, Decision::Allow))
                         .expect("approve resumed request")
                 ),
                 json!({"id": rpc_id, "result": {"decision": "accept"}}),
@@ -5330,13 +5199,8 @@ mod tests {
         let request = ev[0].request.clone().expect("canonical request");
         assert_ne!(request, "req-a");
         let w = one_write(
-            a.encode(Command::Approve {
-                request,
-                decision: Decision::Allow,
-                updated_input: None,
-                message: None,
-            })
-            .expect("approve"),
+            a.encode(approve_cmd(&request, Decision::Allow))
+                .expect("approve"),
         );
         assert_eq!(w, json!({"id": "req-a", "result": {"decision": "accept"}}));
     }
@@ -5358,9 +5222,8 @@ mod tests {
     const W0_EDIT: &str = include_str!("../../../tests/fixtures/real/codex/ask-edit-decline.jsonl");
 
     fn w0_request(fixture: &str, method: &str) -> String {
-        fixture
-            .lines()
-            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        records(fixture, Malformed::Skip)
+            .into_iter()
             .find(|rec| rec["frame"]["method"] == method)
             .expect("W0 approval frame")["frame"]
             .to_string()
@@ -5429,13 +5292,8 @@ mod tests {
             other => panic!("unexpected event: {other:?}"),
         }
         let w = one_write(
-            a.encode(Command::Approve {
-                request: req,
-                decision: Decision::AllowAlways,
-                updated_input: None,
-                message: None,
-            })
-            .expect("allow always"),
+            a.encode(approve_cmd(&req, Decision::AllowAlways))
+                .expect("allow always"),
         );
         assert_eq!(w, json!({"id": 6, "result": {"decision": "accept"}}));
     }
@@ -5483,12 +5341,7 @@ mod tests {
             r#"{"id":5,"method":"item/commandExecution/requestApproval","params":{"itemId":"i","availableDecisions":["decline","cancel"]}}"#,
         );
         let request = ev[0].request.clone().expect("canonical request");
-        let approve = |decision| Command::Approve {
-            request: request.clone(),
-            decision,
-            updated_input: None,
-            message: None,
-        };
+        let approve = |decision| approve_cmd(&request, decision);
         assert!(matches!(
             a.encode(approve(Decision::Allow)),
             Err(AdapterError::Invalid(m)) if m.contains("accept")
@@ -5539,10 +5392,7 @@ mod tests {
         let mut events = Vec::new();
         let mut rest = Vec::new();
         let mut reached = false;
-        for rec in fixture
-            .lines()
-            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        {
+        for rec in records(fixture, Malformed::Skip) {
             let frame = &rec["frame"];
             if reached {
                 if rec["dir"] == "out" {
@@ -5679,12 +5529,7 @@ mod tests {
         a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-1"}}}"#);
         let frame = approval_request("0", "item/commandExecution/requestApproval");
         let request = a.feed(&frame)[0].request.clone().expect("request");
-        let approve = |request| Command::Approve {
-            request,
-            decision: Decision::Allow,
-            updated_input: None,
-            message: None,
-        };
+        let approve = |request: String| approve_cmd(&request, Decision::Allow);
         assert_eq!(
             one_write(a.encode(approve(request.clone())).expect("answer")),
             json!({"id": 0, "result": {"decision": "accept"}})
@@ -5781,12 +5626,10 @@ mod tests {
         );
         assert_eq!(
             one_write(
-                a.encode(Command::Approve {
-                    request: next[0].request.clone().expect("current request"),
-                    decision: Decision::Allow,
-                    updated_input: None,
-                    message: None,
-                })
+                a.encode(approve_cmd(
+                    next[0].request.as_deref().expect("current request"),
+                    Decision::Allow
+                ))
                 .expect("approve current")
             ),
             json!({"id": 0, "result": {"decision": "accept"}})
@@ -5842,13 +5685,8 @@ mod tests {
             if item == 0 {
                 first = Some((last.clone(), request.clone()));
             }
-            a.encode(Command::Approve {
-                request,
-                decision: Decision::Allow,
-                updated_input: None,
-                message: None,
-            })
-            .expect("approve");
+            a.encode(approve_cmd(&request, Decision::Allow))
+                .expect("approve");
         }
         assert_eq!(
             a.settled_requests.len(),
@@ -5869,23 +5707,10 @@ mod tests {
             "the first answered request cannot revive after 1,024 answers"
         );
         assert!(
-            a.encode(Command::Approve {
-                request: first_key,
-                decision: Decision::Allow,
-                updated_input: None,
-                message: None
-            })
-            .is_err(),
+            a.encode(approve_cmd(&first_key, Decision::Allow)).is_err(),
             "an old answer cannot approve current wire id 0"
         );
-        assert!(a
-            .encode(Command::Approve {
-                request: current,
-                decision: Decision::Allow,
-                updated_input: None,
-                message: None
-            })
-            .is_ok());
+        assert!(a.encode(approve_cmd(&current, Decision::Allow)).is_ok());
         a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"many-requests","status":"completed"}}}"#);
         assert!(
             a.settled_requests.is_empty(),
@@ -5939,13 +5764,8 @@ mod tests {
                 .is_empty(),
             "known child active scope rejects explicit old turns too"
         );
-        a.encode(Command::Approve {
-            request: child_key,
-            decision: Decision::Allow,
-            updated_input: None,
-            message: None,
-        })
-        .expect("answer child");
+        a.encode(approve_cmd(&child_key, Decision::Allow))
+            .expect("answer child");
         let completed = r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu-1","status":"completed"}}}"#;
         assert!(a
             .feed(completed)
@@ -6041,13 +5861,8 @@ mod tests {
         .to_string();
         let child_key = a.feed(&child)[0].request.clone().expect("child request");
         assert!(child_key.contains("child-turn") && !child_key.contains("parent-turn"));
-        a.encode(Command::Approve {
-            request: child_key,
-            decision: Decision::Allow,
-            updated_input: None,
-            message: None,
-        })
-        .expect("settled child request");
+        a.encode(approve_cmd(&child_key, Decision::Allow))
+            .expect("settled child request");
         let pending = a.feed(&child.replace("child-item", "child-pending"))[0]
             .request
             .clone()
@@ -6076,13 +5891,7 @@ mod tests {
             .is_empty());
         assert!(a.feed(&question).is_empty());
         assert!(
-            a.encode(Command::Approve {
-                request: parent_key.clone(),
-                decision: Decision::Allow,
-                updated_input: None,
-                message: None
-            })
-            .is_ok(),
+            a.encode(approve_cmd(&parent_key, Decision::Allow)).is_ok(),
             "parent remains answerable"
         );
         assert!(
@@ -6326,12 +6135,7 @@ mod tests {
     #[test]
     fn compact_prompt_becomes_thread_compact_start() {
         let mut a = started(Mode::Ask);
-        let w = one_write(
-            a.encode(Command::Prompt {
-                text: " /Compact ".into(),
-            })
-            .expect("ok"),
-        );
+        let w = prompt(&mut a, " /Compact ");
         assert_eq!(
             w,
             json!({"id": 3, "method": "thread/compact/start", "params": {"threadId": "th-1"}})
@@ -6356,12 +6160,7 @@ mod tests {
             Err(AdapterError::Invalid(_))
         ));
         // A longer text that merely starts with it is a normal prompt.
-        let w = one_write(
-            a.encode(Command::Prompt {
-                text: "/compact please".into(),
-            })
-            .expect("ok"),
-        );
+        let w = prompt(&mut a, "/compact please");
         assert_eq!(w["method"], "turn/start");
     }
 
@@ -6523,9 +6322,8 @@ mod tests {
     /// action has no path); a `read` action titles `Read <path>`.
     #[test]
     fn w0_command_items_title_through_the_shared_grammar() {
-        let item = W0_SHELL
-            .lines()
-            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        let item = records(W0_SHELL, Malformed::Skip)
+            .into_iter()
             .find_map(|r| {
                 let item = &r["frame"]["params"]["item"];
                 (item["type"] == "commandExecution").then(|| item.clone())
@@ -7254,9 +7052,8 @@ mod tests {
 
     /// A frame of the recorded run, on this test's thread and turn.
     fn mcp_fixture_frame(method: &str, kind: Option<&str>) -> String {
-        MCP_APPROVAL
-            .lines()
-            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        records(MCP_APPROVAL, Malformed::Skip)
+            .into_iter()
             .find(|rec| {
                 rec["frame"]["method"] == method
                     && kind.is_none_or(|k| rec["frame"]["params"]["item"]["type"] == k)

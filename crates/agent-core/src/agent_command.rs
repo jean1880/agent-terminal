@@ -18,6 +18,7 @@
 use serde_json::Value;
 
 use crate::adapter::Driver;
+use crate::shell_words::{basename, is_assignment};
 
 /// How the agent was reached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -352,18 +353,6 @@ fn skip_blanks(chars: &[char], mut i: usize) -> usize {
 
 // ---- reading one simple command ----
 
-fn basename(word: &str) -> &str {
-    word.rsplit('/').next().unwrap_or(word)
-}
-
-fn is_assignment(word: &str) -> bool {
-    word.split_once('=').is_some_and(|(name, _)| {
-        !name.is_empty()
-            && !name.starts_with(|c: char| c.is_ascii_digit())
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-    })
-}
-
 /// Reserved words and groupers that can open a simple command.
 const OPENERS: &[&str] = &[
     "if", "then", "else", "elif", "do", "while", "until", "{", "!",
@@ -558,12 +547,7 @@ fn scan(args: &[String], values: &[&str], go: bool) -> Scan {
 /// Text that is safe to show: no control (a line break and tab aside), bidi or zero-width
 /// character.
 fn plain(s: &str) -> bool {
-    !s.chars().any(|c| {
-        (c.is_control() && !matches!(c, '\n' | '\t'))
-            || matches!(c,
-                '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}'
-                | '\u{2066}'..='\u{2069}' | '\u{FEFF}' | '\u{E0000}'..='\u{E007F}')
-    })
+    !crate::text::has_control_or_bidi(s, &['\n', '\t'])
 }
 
 fn shown(text: Option<String>) -> Option<String> {
