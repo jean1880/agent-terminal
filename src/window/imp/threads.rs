@@ -37,11 +37,11 @@ use crate::chat::{ChatBackend, EnvelopeSink, SessionStatus};
 use crate::config::{profile_driver, Profile};
 use crate::model_catalog::{retirement_banner, ModelCatalog};
 use crate::window::sidebar_model::{
-    badge_for, busy_reason, continue_label, driver_key, driver_label, fold_groups,
-    forbids_unasked_edits, held_finish_due, is_busy, limit_over, needs_attention, parse_driver,
-    react, redraw_for, relative_time, resume_as, row_tooltip, safe_handoff_target,
-    sidebar_sections, stop_heading, stored_model, thread_title, turn_finishes_thread, Attention,
-    Badge, ChildAsks, FolderGroup, OpenState, Redraw, ResumeAs, RowKey, SidebarModel, SidebarRow,
+    badge_for, busy_reason, continue_label, display_title, fold_groups, forbids_unasked_edits,
+    held_finish_due, is_busy, limit_over, needs_attention, parse_driver, react, redraw_for,
+    relative_time, resume_as, row_tooltip, safe_handoff_target, sidebar_sections, stop_heading,
+    stored_model, thread_title, turn_finishes_thread, Attention, Badge, ChildAsks, FolderGroup,
+    OpenState, Redraw, ResumeAs, RowKey, SidebarModel, SidebarRow,
 };
 use crate::window::sidebar_model::{
     reopen_offer, sessions_added_toast, thread_activity, ThreadActivity,
@@ -101,12 +101,9 @@ fn rebind_thread(
     model: Option<&str>,
 ) -> agent_kit::store::Result<crate::chat::session::Handoff> {
     let messages = store.transcript_messages(thread)?;
-    let handoff = build_handoff(
-        &messages,
-        &format!("{} thread {thread}", driver_label(from)),
-    );
+    let handoff = build_handoff(&messages, &format!("{} thread {thread}", from.info().label));
     store.atomically(|s| {
-        let pt = s.add_provider_thread(thread, driver_key(target), model.unwrap_or("default"))?;
+        let pt = s.add_provider_thread(thread, target.info().key, model.unwrap_or("default"))?;
         s.set_active_provider_thread(thread, &pt)?;
         s.set_thread_profile(thread, None)?;
         for env in crate::chat::session::switched_handoff_events(&handoff, target) {
@@ -353,12 +350,8 @@ pub(super) const SIDEBAR_COLLAPSE_SP: f64 = 720.0;
 /// The "stop and switch?" question: its heading and body, for a thread titled `title` moving to
 /// `driver` while work would be cut short.
 pub(super) fn switch_warning(title: &str, driver: Driver) -> (String, String) {
-    let agent = driver_label(driver);
-    let subject = if title.is_empty() {
-        "This thread".to_owned()
-    } else {
-        format!("“{title}”")
-    };
+    let agent = driver.info().label;
+    let subject = thread_subject(title);
     (
         format!("Stop the Running Work and Switch to {agent}?"),
         format!(
@@ -434,11 +427,7 @@ pub(super) fn window_close_question(
     let lines = threads
         .iter()
         .map(|(title, r)| {
-            let title = if title.is_empty() {
-                "New thread"
-            } else {
-                title
-            };
+            let title = display_title(title);
             if r.draft {
                 format!("• {title} has an unsent message")
             } else {
@@ -898,7 +887,7 @@ impl ChatBackend for SessionSlot {
                     view.apply(&Envelope::new(Event::Error {
                         message: format!(
                             "{} is not running for this thread yet, so the message was not sent.",
-                            driver_label(self.driver.get())
+                            self.driver.get().info().label
                         ),
                     }));
                 }
@@ -1038,6 +1027,26 @@ fn carried_settings(
         effort,
         mode: mode.map(Mode::session_safe),
     }
+}
+
+/// [`carried_settings`] with what the live thread did not say taken from its store: the provider
+/// thread's model and the mode last chosen in its history.
+fn carried_with_stored(
+    model: Option<String>,
+    effort: Option<String>,
+    mode: Option<Mode>,
+    loaded: &LoadedThread,
+) -> CarriedSettings {
+    carried_settings(
+        model.or_else(|| {
+            loaded
+                .provider
+                .as_ref()
+                .and_then(|p| stored_model(Some(&p.model)))
+        }),
+        effort,
+        mode.or_else(|| crate::chat::session::chosen_mode(loaded.history.iter().map(|(_, e)| e))),
+    )
 }
 
 /// A chat agent's binary and its profile's environment, resolved off the main thread.
@@ -1495,7 +1504,7 @@ fn record_new_thread_as(
         title: spec.title.as_deref(),
         provider: Some(agent_kit::store::ProviderRecord {
             id: Some(&ids.provider),
-            driver: driver_key(spec.driver),
+            driver: spec.driver.info().key,
             model: spec.model.as_deref(),
             native_id: None,
         }),
@@ -1768,7 +1777,7 @@ fn link_recent_sessions(
 ) -> Vec<Driver> {
     let mut added = Vec::new();
     for s in sessions {
-        let key = driver_key(s.driver);
+        let key = s.driver.info().key;
         let known = store
             .thread_with_native_id(key, &s.native_id)
             .map(|t| t.is_some())
@@ -1787,7 +1796,7 @@ fn link_recent_sessions(
         );
         match made {
             Ok(_) => added.push(s.driver),
-            Err(e) => warn!("Cannot list a {} session: {e}", driver_label(s.driver)),
+            Err(e) => warn!("Cannot list a {} session: {e}", s.driver.info().label),
         }
     }
     added
@@ -1825,10 +1834,7 @@ fn native_history_of(
     let envs = match agent_kit::native::read_native_history(home, &session) {
         Ok(envs) => envs,
         Err(e) => {
-            warn!(
-                "Cannot import {} session history: {e}",
-                driver_label(driver)
-            );
+            warn!("Cannot import {} session history: {e}", driver.info().label);
             vec![Envelope::new(Event::Notice {
                 text: format!("The earlier conversation could not be loaded: {e}"),
             })]
@@ -1847,7 +1853,7 @@ fn store_imported(
 ) -> bool {
     match store.import_events(thread, Some(provider_thread), envs) {
         Ok(n) => {
-            info!("Imported {n} events of a {} session", driver_label(driver));
+            info!("Imported {n} events of a {} session", driver.info().label);
             true
         }
         Err(e) => {
@@ -1897,7 +1903,7 @@ async fn wait_for_fresh_catalog(driver: Driver) {
     if !catalog.is_fresh(driver) {
         info!(
             "{} model list not fresh after {:?}; starting on the stored model",
-            driver_label(driver),
+            driver.info().label,
             CATALOG_WAIT
         );
     }
@@ -2260,7 +2266,7 @@ fn not_ready_reason(driver: Driver, state: &Availability) -> String {
         Availability::Detecting => "is still being detected",
         Availability::Missing | Availability::Ready(_) => "is not available",
     };
-    format!("{} {why}.", driver_label(driver))
+    format!("{} {why}.", driver.info().label)
 }
 
 /// The adapter for `driver`. Codex reports this app's version in `initialize`'s `clientInfo`.
@@ -2376,10 +2382,17 @@ fn cached_agy_hook_target(
     let config = config.borrow();
     let profile = agent_profile_or_new(&config, Driver::Agy);
     let resolved = cached_agent(&profile)?;
-    Some(crate::hook_config::HookTarget::new(
-        &agent_env(resolved.env, &config.clear_env),
-        cwd,
-    ))
+    Some(agy_target_from(resolved, &config.clear_env, cwd))
+}
+
+/// The hook sources an agy process resolved as `resolved` (with `clear` removed from its
+/// environment) reads in `cwd`. Says where to look; never a verdict.
+fn agy_target_from(
+    resolved: ResolvedAgent,
+    clear: &[String],
+    cwd: Option<std::path::PathBuf>,
+) -> crate::hook_config::HookTarget {
+    crate::hook_config::HookTarget::new(&agent_env(resolved.env, clear), cwd)
 }
 
 /// Whether a switch to agy in `cwd` would get its approval hook now, from the cached proof the
@@ -2401,7 +2414,7 @@ pub(super) async fn agy_hook_target(
         )
     };
     let resolved = resolve_agent(profile).await;
-    crate::hook_config::HookTarget::new(&agent_env(resolved.env, &clear), cwd)
+    agy_target_from(resolved, &clear, cwd)
 }
 
 /// Every active agy environment and every possible switch target, without retaining env values.
@@ -3092,8 +3105,7 @@ impl AgentTerminalWindow {
                 };
                 let title = match chat {
                     Some(c) if !c.title.is_empty() => c.title.clone(),
-                    _ if !s.title.is_empty() => s.title.clone(),
-                    _ => "New thread".to_owned(),
+                    _ => display_title(&s.title).to_owned(),
                 };
                 SidebarRow {
                     key: RowKey::Thread(s.id.clone()),
@@ -3593,8 +3605,8 @@ impl AgentTerminalWindow {
                 let dot = Image::from_gicon(&crate::icons::driver_icon(driver));
                 dot.set_pixel_size(14);
                 dot.add_css_class("thread-dot");
-                dot.add_css_class(&format!("dot-{}", driver_key(driver)));
-                dot.set_tooltip_text(Some(driver_label(driver)));
+                dot.add_css_class(&format!("dot-{}", driver.info().key));
+                dot.set_tooltip_text(Some(driver.info().label));
                 line.append(&dot);
             }
             None => {
@@ -4154,11 +4166,7 @@ impl AgentTerminalWindow {
         }
         let home = env::var("HOME").unwrap_or_default();
         if let Some(window_title) = self.window_title.borrow().as_ref() {
-            window_title.set_title(if title.is_empty() {
-                "New thread"
-            } else {
-                &title
-            });
+            window_title.set_title(display_title(&title));
             window_title.set_subtitle(&crate::utils::tildify(&dir, &home));
             window_title.set_tooltip_text(None);
         }
@@ -4596,11 +4604,7 @@ impl AgentTerminalWindow {
         content.append(&paned);
 
         let page = tab_view.append(&content);
-        let title = if summary.title.is_empty() {
-            "New thread".to_owned()
-        } else {
-            summary.title.clone()
-        };
+        let title = display_title(&summary.title).to_owned();
         page.set_title(&title);
 
         self.configure_terminal(&terminal);
@@ -4634,7 +4638,7 @@ impl AgentTerminalWindow {
             ThreadDiffs::new(
                 &summary.cwd,
                 key,
-                driver_label(driver),
+                driver.info().label,
                 Rc::new(move |text: &str| {
                     if let Some(window) = holder.upgrade().as_ref().and_then(window_of) {
                         window.imp().show_toast(text);
@@ -4965,7 +4969,7 @@ impl AgentTerminalWindow {
         } else {
             info!(
                 "Thread {thread} opened without a session: {} is not ready",
-                driver_label(driver)
+                driver.info().label
             );
             // A switch parked while the thread was being built: its own agent will not start
             // it (still being detected excepted), so the thread moves to the new agent now.
@@ -5171,7 +5175,7 @@ impl AgentTerminalWindow {
         };
         info!(
             "Opening thread {thread} on {} in {dir}",
-            driver_label(driver)
+            driver.info().label
         );
         let session = ChatSession::with_options(
             adapter,
@@ -5570,7 +5574,7 @@ impl AgentTerminalWindow {
                 self.refresh_sidebar();
             }
             After::RateLimited(banner, driver) => {
-                banner.set_title(&format!("{} hit its rate limit", driver_label(driver)));
+                banner.set_title(&format!("{} hit its rate limit", driver.info().label));
                 // With no other usable agent there is nothing to continue in: no button. An agy
                 // that would edit unasked is offered only as a last resort, and says so.
                 let unasked = self.agy_cannot_ask_for(thread);
@@ -5667,11 +5671,7 @@ impl AgentTerminalWindow {
         let key = self.with_page_tab(page, |t| t.key);
         let notification = gtk4::gio::Notification::new(heading);
         let title = page.title();
-        notification.set_body(Some(if title.is_empty() {
-            "New thread"
-        } else {
-            &title
-        }));
+        notification.set_body(Some(display_title(&title)));
         notification.set_priority(gtk4::gio::NotificationPriority::High);
         // Without a default action, clicking it activates the app and opens a second window.
         if let Some(key) = key {
@@ -5775,7 +5775,7 @@ impl AgentTerminalWindow {
                 c.slot
                     .switch_serial
                     .set(c.slot.switch_serial.get().wrapping_add(1));
-                let label = (driver_label(c.slot.driver()).to_owned(), c.title.clone());
+                let label = (c.slot.driver().info().label.to_owned(), c.title.clone());
                 ((c.slot.get(), !c.unread, label), c.thread.clone())
             })
             .unzip();
@@ -5987,7 +5987,7 @@ impl AgentTerminalWindow {
             None => self.show_toast("This thread is already switching agent"),
             Some(SwitchRoute::Rebind) if target == slot.driver() => self.show_toast(&format!(
                 "{} is not available, so this thread's model cannot be changed",
-                driver_label(target)
+                target.info().label
             )),
             Some(SwitchRoute::Rebind) => self.rebind_unstarted(thread, target, model, effort),
             Some(SwitchRoute::Live | SwitchRoute::Park) => {}
@@ -6015,8 +6015,8 @@ impl AgentTerminalWindow {
         };
         info!(
             "Switching thread {thread} from {} to {} before any session ran it",
-            driver_label(from),
-            driver_label(target)
+            from.info().label,
+            target.info().label
         );
         let id = thread.to_owned();
         let thread = thread.to_owned();
@@ -6037,7 +6037,7 @@ impl AgentTerminalWindow {
         effort: Option<String>,
         outcome: Option<agent_kit::store::Result<crate::chat::session::Handoff>>,
     ) {
-        let label = driver_label(target);
+        let label = target.info().label;
         let landed = {
             let mut tabs = self.tabs.borrow_mut();
             let Some(tab) = tabs
@@ -6146,7 +6146,7 @@ impl AgentTerminalWindow {
             &format!(
                 "{} has unfinished work. {why} Switching continues with the selected agent; \
                  the new turn can ask again.",
-                driver_label(from),
+                from.info().label,
             ),
             ("cancel", "Keep Waiting"),
             ("switch", "Switch and Continue"),
@@ -6167,7 +6167,7 @@ impl AgentTerminalWindow {
         if self.unasked_prompt_open.replace(true) {
             return;
         }
-        let label = driver_label(target);
+        let label = target.info().label;
         let dialog = confirm_dialog(
             &format!("Continue in {label}?"),
             &format!(
@@ -6250,18 +6250,7 @@ impl AgentTerminalWindow {
                     return;
                 }
             };
-            let settings = carried_settings(
-                live.model.or_else(|| {
-                    loaded
-                        .provider
-                        .as_ref()
-                        .and_then(|p| stored_model(Some(&p.model)))
-                }),
-                None,
-                live.mode.or_else(|| {
-                    crate::chat::session::chosen_mode(loaded.history.iter().map(|(_, e)| e))
-                }),
-            );
+            let settings = carried_with_stored(live.model, None, live.mode, &loaded);
             obj.imp().create_chat_thread(NewThread {
                 here: dir,
                 model: settings.model,
@@ -6359,18 +6348,7 @@ impl AgentTerminalWindow {
                     return;
                 }
             };
-            let settings = carried_settings(
-                model.or_else(|| {
-                    loaded
-                        .provider
-                        .as_ref()
-                        .and_then(|p| stored_model(Some(&p.model)))
-                }),
-                effort,
-                mode.or_else(|| {
-                    crate::chat::session::chosen_mode(loaded.history.iter().map(|(_, e)| e))
-                }),
-            );
+            let settings = carried_with_stored(model, effort, mode, &loaded);
             let profile_id = profile_id.or_else(|| carried_stored_profile(&loaded, driver));
             imp.create_chat_thread(NewThread {
                 dir,
@@ -6706,36 +6684,25 @@ impl AgentTerminalWindow {
                 present_message(&self.obj(), "Cannot Create a Thread", &e.to_string());
                 return None;
             }
-            info!("New {} thread in {cwd}", driver_label(driver));
+            info!("New {} thread in {cwd}", driver.info().label);
             return self.open_created(&thread, created);
         }
         // Stored by the writer first, and the page opens only once it is: a thread that could
-        // not be stored gets the dialog, never a page whose every write would fail.
-        let obj = self.obj().downgrade();
-        glib::MainContext::default().spawn_local(async move {
-            let reload = obj.clone();
-            let stored = write_job_or_late("create a thread", record, move || {
-                // Landed after all: the list shows it now.
-                if let Some(obj) = reload.upgrade() {
-                    obj.imp().reload_summaries();
-                }
-            })
-            .await;
-            let Some(obj) = obj.upgrade() else { return };
-            match stored {
-                Some(Ok(())) => {
-                    info!("New {} thread in {cwd}", driver_label(driver));
-                    obj.imp().open_created(&thread, created);
-                }
-                Some(Err(e)) => present_message(&obj, "Cannot Create a Thread", &e.to_string()),
-                None => {
-                    present_message(
-                        &obj,
-                        "The Thread Is Not Ready Yet",
-                        "The thread store is far behind. The thread may still be saved: it \
-                         will show in the list once it is.",
-                    );
-                }
+        // not be stored gets the dialog, never a page whose every write would fail. One that
+        // lands late after all shows in the list then.
+        self.write_store_then("create a thread", record, move |imp, stored| match stored {
+            Some(Ok(())) => {
+                info!("New {} thread in {cwd}", driver.info().label);
+                imp.open_created(&thread, created);
+            }
+            Some(Err(e)) => present_message(&imp.obj(), "Cannot Create a Thread", &e.to_string()),
+            None => {
+                present_message(
+                    &imp.obj(),
+                    "The Thread Is Not Ready Yet",
+                    "The thread store is far behind. The thread may still be saved: it \
+                     will show in the list once it is.",
+                );
             }
         });
         None
@@ -6830,7 +6797,7 @@ impl AgentTerminalWindow {
         let record = {
             let (thread, native) = (thread.clone(), native.clone());
             move |s: &Store| {
-                let key = driver_key(driver);
+                let key = driver.info().key;
                 let record = agent_kit::store::ThreadRecord {
                     provider: Some(agent_kit::store::ProviderRecord {
                         id: None,
@@ -6847,21 +6814,21 @@ impl AgentTerminalWindow {
             agent_kit::store::NativeThread::Created => {
                 info!(
                     "Resuming {} session {native} as a thread",
-                    driver_label(driver)
+                    driver.info().label
                 );
                 imp.open_thread(&thread, true);
             }
             agent_kit::store::NativeThread::Existing(existing) => {
                 info!(
                     "{} session {native} is already thread {existing}: opening it",
-                    driver_label(driver)
+                    driver.info().label
                 );
                 imp.open_thread(&existing, true);
             }
             agent_kit::store::NativeThread::Supervised => {
                 warn!(
                     "{} session {native} belongs to a delegated worker: not resumed",
-                    driver_label(driver)
+                    driver.info().label
                 );
                 present_message(
                     &imp.obj(),
@@ -6878,29 +6845,24 @@ impl AgentTerminalWindow {
             }
             return;
         }
-        let obj = self.obj().downgrade();
-        glib::MainContext::default().spawn_local(async move {
-            let reload = obj.clone();
-            let stored = write_job_or_late("resume a session as a thread", record, move || {
-                if let Some(obj) = reload.upgrade() {
-                    obj.imp().reload_summaries();
+        self.write_store_then(
+            "resume a session as a thread",
+            record,
+            move |imp, stored| match stored {
+                Some(Ok(made)) => opened(imp, made),
+                Some(Err(e)) => {
+                    present_message(&imp.obj(), "Cannot Resume the Session", &e.to_string())
                 }
-            })
-            .await;
-            let Some(obj) = obj.upgrade() else { return };
-            match stored {
-                Some(Ok(made)) => opened(obj.imp(), made),
-                Some(Err(e)) => present_message(&obj, "Cannot Resume the Session", &e.to_string()),
                 None => {
                     present_message(
-                        &obj,
+                        &imp.obj(),
                         "The Session Is Not Ready Yet",
                         "The thread store is far behind. The session may still be saved as a \
                          thread: it will show in the list once it is.",
                     );
                 }
-            }
-        });
+            },
+        );
     }
 
     /// Routes a resume to a chat thread or, for a CLI with no adapter, a terminal page.
@@ -7256,7 +7218,7 @@ impl AgentTerminalWindow {
             } else {
                 ModelNotice::None
             };
-            match retirement_banner(driver_label(driver), &notice) {
+            match retirement_banner(driver.info().label, &notice) {
                 Some(text) => {
                     banner.set_title(&text);
                     banner.set_revealed(true);
@@ -7564,6 +7526,32 @@ fn is_interruption(event: &Event) -> bool {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    /// The file store at a path, installed as the app's (reader, path and writer) for one test.
+    /// Dropping it takes all three out again, so a failing test leaves no store behind.
+    struct InstalledStore {
+        reader: Rc<Store>,
+        writer: StoreWriter,
+    }
+
+    impl InstalledStore {
+        fn at(path: std::path::PathBuf) -> Self {
+            let reader = Rc::new(Store::open(&path).expect("open"));
+            let writer = StoreWriter::spawn(&path).expect("writer");
+            STORE.with(|s| *s.borrow_mut() = Some(reader.clone()));
+            STORE_PATH.with(|p| *p.borrow_mut() = Some(path));
+            WRITER.with(|w| *w.borrow_mut() = Some(writer.clone()));
+            Self { reader, writer }
+        }
+    }
+
+    impl Drop for InstalledStore {
+        fn drop(&mut self) {
+            WRITER.with(|w| *w.borrow_mut() = None);
+            STORE_PATH.with(|p| *p.borrow_mut() = None);
+            STORE.with(|s| *s.borrow_mut() = None);
+        }
+    }
 
     /// Forgets every cached hook verdict, so the next test starts unproven.
     pub(super) fn reset_hook_verdicts() {
@@ -8347,20 +8335,9 @@ pub(super) mod tests {
             .downcast::<adw::AlertDialog>()
             .unwrap();
         assert!(dialog.body().contains("1 background task will stop"));
-        let cancel = crate::testutil::descendants(dialog.upcast_ref())
-            .into_iter()
-            .filter_map(|widget| widget.downcast::<gtk4::Button>().ok())
-            .find(|button| {
-                button.label().as_deref() == Some("Keep Waiting")
-                    || crate::testutil::descendants(button.upcast_ref())
-                        .iter()
-                        .any(|widget| {
-                            widget
-                                .downcast_ref::<gtk4::Label>()
-                                .is_some_and(|label| label.text() == "Keep Waiting")
-                        })
-            })
-            .unwrap();
+        let cancel =
+            crate::window::imp::test_support::button_labelled(dialog.upcast_ref(), "Keep Waiting")
+                .unwrap();
         assert!(
             crate::testutil::pump_until(&ctx, 5, || cancel.is_mapped() && cancel.is_sensitive())
         );
@@ -8797,19 +8774,9 @@ pub(super) mod tests {
             };
             assert!(pump_until(&ctx, 5, || open().is_some()), "asks: {heading}");
             let dialog = open().expect("the dialog");
-            let target = crate::testutil::descendants(dialog.upcast_ref())
-                .into_iter()
-                .filter_map(|w| w.downcast::<gtk4::Button>().ok())
-                .find(|b| {
-                    b.label().as_deref() == Some(button)
-                        || crate::testutil::descendants(b.upcast_ref())
-                            .iter()
-                            .any(|w| {
-                                w.downcast_ref::<gtk4::Label>()
-                                    .is_some_and(|l| l.text() == button)
-                            })
-                })
-                .unwrap_or_else(|| panic!("{heading} has a {button} button"));
+            let target =
+                crate::window::imp::test_support::button_labelled(dialog.upcast_ref(), button)
+                    .unwrap_or_else(|| panic!("{heading} has a {button} button"));
             // A dialog still animating in ignores its buttons: click only once it is shown.
             assert!(
                 pump_until(&ctx, 10, || target.is_mapped() && target.is_sensitive()),
@@ -9776,7 +9743,7 @@ pub(super) mod tests {
             let store = Store::open_in_memory().expect("store");
             let source = store.create_thread("/w", Some("source")).expect("thread");
             let pt = store
-                .add_provider_thread(&source, driver_key(driver), "m1")
+                .add_provider_thread(&source, driver.info().key, "m1")
                 .expect("pt");
             store.set_active_provider_thread(&source, &pt).expect("set");
             let say = |text: &str| Envelope::new(Event::Notice { text: text.into() });
@@ -10060,12 +10027,8 @@ pub(super) mod tests {
     fn main_thread_writes_are_queued_and_store_jobs_read_them_back() {
         use crate::testutil::{in_loop, pump_until};
         let dir = tempfile::tempdir().expect("tmp");
-        let path = dir.path().join("threads.db");
-        let reader = Rc::new(Store::open(&path).expect("open"));
-        let writer = StoreWriter::spawn(&path).expect("writer");
-        STORE.with(|s| *s.borrow_mut() = Some(reader.clone()));
-        STORE_PATH.with(|p| *p.borrow_mut() = Some(path));
-        WRITER.with(|w| *w.borrow_mut() = Some(writer.clone()));
+        let installed = InstalledStore::at(dir.path().join("threads.db"));
+        let (reader, writer) = (installed.reader.clone(), installed.writer.clone());
 
         let handle = app_handle();
         assert!(handle.writer().is_some());
@@ -10127,9 +10090,7 @@ pub(super) mod tests {
             let got = out.borrow_mut().take();
             got
         });
-        WRITER.with(|w| *w.borrow_mut() = None);
-        STORE_PATH.with(|p| *p.borrow_mut() = None);
-        STORE.with(|s| *s.borrow_mut() = None);
+        drop(installed);
         let (read, renamed) = got.expect("ran");
         assert_eq!(read.expect("job").expect("events"), 300);
         assert_eq!(
@@ -10271,7 +10232,7 @@ pub(super) mod tests {
             );
             assert_eq!(
                 load_provider(&store, &ids.thread).unwrap().unwrap().driver,
-                driver_key(target)
+                target.info().key
             );
         }
         assert_eq!(
@@ -10456,12 +10417,8 @@ pub(super) mod tests {
         let config_home = tempfile::tempdir().unwrap();
         std::env::set_var("XDG_CONFIG_HOME", config_home.path());
         let state = tempfile::tempdir().unwrap();
-        let path = state.path().join("threads.db");
-        let reader = Rc::new(Store::open(&path).expect("open"));
-        let writer = StoreWriter::spawn(&path).expect("writer");
-        STORE.with(|s| *s.borrow_mut() = Some(reader.clone()));
-        STORE_PATH.with(|p| *p.borrow_mut() = Some(path));
-        WRITER.with(|w| *w.borrow_mut() = Some(writer.clone()));
+        let installed = InstalledStore::at(state.path().join("threads.db"));
+        let (reader, writer) = (installed.reader.clone(), installed.writer.clone());
         let app = adw::Application::builder()
             .application_id("org.test.WorktreeThreadReopen")
             .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
@@ -10532,9 +10489,7 @@ pub(super) mod tests {
 
         window.destroy();
         crate::testutil::settle(&ctx);
-        WRITER.with(|w| *w.borrow_mut() = None);
-        STORE_PATH.with(|p| *p.borrow_mut() = None);
-        STORE.with(|s| *s.borrow_mut() = None);
+        drop(installed);
         assert_eq!(writer.failures().0, 0);
     }
 
@@ -10743,12 +10698,8 @@ pub(super) mod tests {
         let config_home = tempfile::tempdir().unwrap();
         std::env::set_var("XDG_CONFIG_HOME", config_home.path());
         let state = tempfile::tempdir().unwrap();
-        let path = state.path().join("threads.db");
-        let reader = Rc::new(Store::open(&path).expect("open"));
-        let writer = StoreWriter::spawn(&path).expect("writer");
-        STORE.with(|s| *s.borrow_mut() = Some(reader.clone()));
-        STORE_PATH.with(|p| *p.borrow_mut() = Some(path));
-        WRITER.with(|w| *w.borrow_mut() = Some(writer.clone()));
+        let installed = InstalledStore::at(state.path().join("threads.db"));
+        let (reader, writer) = (installed.reader.clone(), installed.writer.clone());
         let app = adw::Application::builder()
             .application_id("org.test.CloseGuards")
             .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
@@ -10797,19 +10748,9 @@ pub(super) mod tests {
             };
             assert!(pump_until(&ctx, 5, || open().is_some()), "asks: {heading}");
             let dialog = open().expect("the dialog");
-            let target = crate::testutil::descendants(dialog.upcast_ref())
-                .into_iter()
-                .filter_map(|w| w.downcast::<gtk4::Button>().ok())
-                .find(|b| {
-                    b.label().as_deref() == Some(button)
-                        || crate::testutil::descendants(b.upcast_ref())
-                            .iter()
-                            .any(|w| {
-                                w.downcast_ref::<gtk4::Label>()
-                                    .is_some_and(|l| l.text() == button)
-                            })
-                })
-                .unwrap_or_else(|| panic!("{heading} has a {button} button"));
+            let target =
+                crate::window::imp::test_support::button_labelled(dialog.upcast_ref(), button)
+                    .unwrap_or_else(|| panic!("{heading} has a {button} button"));
             assert!(pump_until(&ctx, 10, || target.is_mapped() && target.is_sensitive()));
             settle(&ctx);
             target.emit_clicked();
@@ -11039,8 +10980,6 @@ pub(super) mod tests {
 
         window.destroy();
         settle(&ctx);
-        WRITER.with(|w| *w.borrow_mut() = None);
-        STORE_PATH.with(|p| *p.borrow_mut() = None);
-        STORE.with(|s| *s.borrow_mut() = None);
+        drop(installed);
     }
 }

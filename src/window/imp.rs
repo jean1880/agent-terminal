@@ -1136,7 +1136,7 @@ thread_local! {
 
     /// Counts profile re-resolutions, so a slow one that finishes after a
     /// newer one is discarded rather than applied last.
-    static PROFILE_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static PROFILE_GENERATION: super::Generation = const { super::Generation::new() };
 
     /// Watches config.json for hand edits, once per process.
     static CONFIG_MONITOR: RefCell<Option<gtk4::gio::FileMonitor>> = const { RefCell::new(None) };
@@ -1208,6 +1208,18 @@ impl std::ops::Deref for SharedConfig {
     fn deref(&self) -> &Self::Target {
         &self.0
     }
+}
+
+/// When a [`AgentTerminalWindow::config_switch`] writes its flag.
+#[derive(Clone, Copy)]
+pub(super) enum SaveWhen {
+    /// Set on every change, saved through the debounce.
+    Debounced(fn(&mut crate::config::TerminalConfig, bool)),
+    /// Set only when it differs and written at once, with a toast if the file could not be:
+    /// a security switch a stale read or a crash in the debounce must not bring back.
+    Now(fn(&mut crate::config::TerminalConfig, bool)),
+    /// The row's `then` sets and saves it through the setting's own setter.
+    Owned,
 }
 
 /// Internal state for the AgentTerminalWindow.
@@ -2750,13 +2762,10 @@ impl AgentTerminalWindow {
             with.append_item(&gtk4::gio::MenuItem::new(Some(label), Some("win.no-agent")));
         }
         for driver in ready {
-            let item = gtk4::gio::MenuItem::new(
-                Some(crate::window::sidebar_model::driver_label(driver)),
-                None,
-            );
+            let item = gtk4::gio::MenuItem::new(Some(driver.info().label), None);
             item.set_action_and_target_value(
                 Some("win.new-thread-agent"),
-                Some(&crate::window::sidebar_model::driver_key(driver).to_variant()),
+                Some(&driver.info().key.to_variant()),
             );
             with.append_item(&item);
         }
@@ -2880,25 +2889,14 @@ impl AgentTerminalWindow {
     /// The "Check for Updates at Startup" switch, shared by Settings → General and setup. It
     /// applies from the next start; on a first run setup's close starts the check if it is on.
     pub(super) fn update_check_row(&self) -> adw::SwitchRow {
-        let obj = self.obj();
-        let row = adw::SwitchRow::builder()
-            .title("Check for Updates at Startup")
-            .subtitle(
-                "Ask GitHub in the background whether a newer release is out; one found puts a \
-                 yellow dot on the menu. Off, the app only checks when you pick Check for Updates",
-            )
-            .active(self.config.borrow().check_updates_on_startup)
-            .build();
-        row.connect_active_notify(glib::clone!(
-            #[weak]
-            obj,
-            move |row| {
-                let imp = obj.imp();
-                imp.config.borrow_mut().check_updates_on_startup = row.is_active();
-                imp.schedule_config_save();
-            }
-        ));
-        row
+        self.config_switch(
+            "Check for Updates at Startup",
+            "Ask GitHub in the background whether a newer release is out; one found puts a \
+             yellow dot on the menu. Off, the app only checks when you pick Check for Updates",
+            |c| c.check_updates_on_startup,
+            SaveWhen::Debounced(|c, on| c.check_updates_on_startup = on),
+            |_, _| {},
+        )
     }
 
     /// "Check for Updates…": asks GitHub for the newest release (off the main thread; the one
@@ -3827,6 +3825,97 @@ impl AgentTerminalWindow {
         self.config.borrow().save_checked()
     }
 
+    /// A settings switch over one config flag: starts at `get`, writes a change as `save` says,
+    /// then runs `then` with the new state (side effects, mirrors).
+    pub(super) fn config_switch(
+        &self,
+        title: &str,
+        subtitle: &str,
+        get: fn(&crate::config::TerminalConfig) -> bool,
+        save: SaveWhen,
+        then: impl Fn(&Self, bool) + 'static,
+    ) -> adw::SwitchRow {
+        let obj = self.obj();
+        let row = adw::SwitchRow::builder()
+            .title(title)
+            .subtitle(subtitle)
+            .active(get(&self.config.borrow()))
+            .build();
+        row.connect_active_notify(glib::clone!(
+            #[weak]
+            obj,
+            move |row| {
+                let imp = obj.imp();
+                let active = row.is_active();
+                match save {
+                    SaveWhen::Debounced(set) => {
+                        set(&mut imp.config.borrow_mut(), active);
+                        then(imp, active);
+                        imp.schedule_config_save();
+                    }
+                    SaveWhen::Now(set) => {
+                        if get(&imp.config.borrow()) != active {
+                            set(&mut imp.config.borrow_mut(), active);
+                            imp.save_approval_switch();
+                        }
+                        then(imp, active);
+                    }
+                    SaveWhen::Owned => then(imp, active),
+                }
+            }
+        ));
+        row
+    }
+
+    /// A settings row whose entry names a folder (the starting directory, the worktree folder).
+    /// A path that does not exist is refused inline and never saved: one used to be accepted,
+    /// saved, and then silently swapped for $HOME at spawn time with only a log line, so the
+    /// user saw a tab in the wrong place and no explanation. A usable one saves on change.
+    fn directory_row(
+        &self,
+        title: &str,
+        help: &'static str,
+        placeholder: &str,
+        get: fn(&crate::config::TerminalConfig) -> &String,
+        set: fn(&mut crate::config::TerminalConfig, String),
+    ) -> adw::ActionRow {
+        let obj = self.obj();
+        let entry = gtk4::Entry::builder()
+            .text(get(&self.config.borrow()))
+            .hexpand(true)
+            .valign(gtk4::Align::Center)
+            .placeholder_text(placeholder)
+            .build();
+        let row = adw::ActionRow::builder()
+            .title(title)
+            .subtitle(help)
+            .build();
+        row.add_suffix(&entry);
+        entry.connect_changed(glib::clone!(
+            #[weak]
+            obj,
+            #[weak]
+            row,
+            move |entry| {
+                let text = entry.text().to_string();
+                if !directory_is_usable(&text) {
+                    entry.add_css_class("error");
+                    row.set_subtitle("That directory does not exist");
+                    return;
+                }
+                entry.remove_css_class("error");
+                row.set_subtitle(help);
+                let imp = obj.imp();
+                if *get(&imp.config.borrow()) == text {
+                    return;
+                }
+                set(&mut imp.config.borrow_mut(), text);
+                imp.schedule_config_save();
+            }
+        ));
+        row
+    }
+
     /// Cancels a queued save and writes immediately, if one was pending.
     fn flush_pending_save(&self) {
         if let Some(pending) = self.pending_save.borrow_mut().take() {
@@ -4075,18 +4164,13 @@ impl AgentTerminalWindow {
             .title("Settings")
             .build();
 
-        let starting_directory_entry = gtk4::Entry::builder()
-            .text(&config.starting_directory)
-            .hexpand(true)
-            .valign(gtk4::Align::Center)
-            .placeholder_text("Home folder")
-            .build();
-
-        let starting_directory_row = adw::ActionRow::builder()
-            .title("Starting Directory")
-            .subtitle(STARTING_DIRECTORY_HELP)
-            .build();
-        starting_directory_row.add_suffix(&starting_directory_entry);
+        let starting_directory_row = self.directory_row(
+            "Starting Directory",
+            STARTING_DIRECTORY_HELP,
+            "Home folder",
+            |c| &c.starting_directory,
+            |c, dir| c.starting_directory = dir,
+        );
 
         let scroll_adj = gtk4::Adjustment::new(
             config.scrollback_lines as f64,
@@ -4162,25 +4246,25 @@ impl AgentTerminalWindow {
             .selected(selected_index)
             .build();
 
-        let theme_names: Vec<String> = crate::config::ThemeChoice::ALL
-            .iter()
-            .map(ToString::to_string)
-            .collect();
-        let theme_name_refs: Vec<&str> = theme_names.iter().map(String::as_str).collect();
-        let theme_model = gtk4::StringList::new(&theme_name_refs);
-        let theme_index = crate::config::ThemeChoice::ALL
-            .iter()
-            .position(|t| *t == config.theme)
-            .unwrap_or(0) as u32;
-        let theme_row = adw::ComboRow::builder()
-            .title("Theme")
-            .subtitle(
-                "Colours of the whole app: threads, terminals and diffs. Use System Theme takes \
-                 them from your desktop and follows it when it changes",
-            )
-            .model(&theme_model)
-            .selected(theme_index)
-            .build();
+        let theme_row = self.choice_row(
+            "Theme",
+            "Colours of the whole app: threads, terminals and diffs. Use System Theme takes \
+             them from your desktop and follows it when it changes",
+            crate::config::ThemeChoice::ALL
+                .iter()
+                .map(|t| (*t, t.to_string()))
+                .collect(),
+            config.theme,
+            |imp, theme| {
+                let theme = theme.unwrap_or_default();
+                imp.config.borrow_mut().theme = theme;
+                // Themes apply live to the whole app and every open tab; no restart needed.
+                crate::palette::apply(theme);
+                imp.for_each_terminal_everywhere(|term| Theme::apply(term, theme));
+                imp.recolour_diff_panels(theme);
+                imp.schedule_config_save();
+            },
+        );
         Self::keep_value_whole(&theme_row);
         Self::keep_value_whole(&cli_client_row);
 
@@ -4215,101 +4299,122 @@ impl AgentTerminalWindow {
             .build();
         font_row.add_suffix(&font_button);
 
-        let cursor_names: Vec<String> = crate::config::CursorShapeChoice::ALL
-            .iter()
-            .map(ToString::to_string)
-            .collect();
-        let cursor_name_refs: Vec<&str> = cursor_names.iter().map(String::as_str).collect();
-        let cursor_row = adw::ComboRow::builder()
-            .title("Cursor Shape")
-            .subtitle("How the terminal draws its cursor")
-            .model(&gtk4::StringList::new(&cursor_name_refs))
-            .selected(
-                crate::config::CursorShapeChoice::ALL
-                    .iter()
-                    .position(|c| *c == config.cursor_shape)
-                    .unwrap_or(0) as u32,
-            )
-            .build();
+        let cursor_row = self.choice_row(
+            "Cursor Shape",
+            "How the terminal draws its cursor",
+            crate::config::CursorShapeChoice::ALL
+                .iter()
+                .map(|c| (*c, c.to_string()))
+                .collect(),
+            config.cursor_shape,
+            |imp, shape| {
+                imp.config.borrow_mut().cursor_shape = shape.unwrap_or_default();
+                imp.apply_appearance_to_all();
+                imp.schedule_config_save();
+            },
+        );
         Self::keep_value_whole(&cursor_row);
 
-        let blink_row = adw::SwitchRow::builder()
-            .title("Blinking Cursor")
-            .subtitle("Blink the terminal cursor")
-            .active(config.cursor_blink)
-            .build();
+        let blink_row = self.config_switch(
+            "Blinking Cursor",
+            "Blink the terminal cursor",
+            |c| c.cursor_blink,
+            SaveWhen::Debounced(|c, on| c.cursor_blink = on),
+            |imp, _| imp.apply_appearance_to_all(),
+        );
 
-        let reopen_thread_row = adw::SwitchRow::builder()
-            .title("Reopen Last Thread")
-            .subtitle(
-                "Start with the threads open when you last closed the app, showing the one you \
-                 were in. Off: start with no thread open and pick one from the sidebar",
-            )
-            .active(config.reopen_last_thread)
-            .build();
+        let reopen_thread_row = self.config_switch(
+            "Reopen Last Thread",
+            "Start with the threads open when you last closed the app, showing the one you \
+             were in. Off: start with no thread open and pick one from the sidebar",
+            |c| c.reopen_last_thread,
+            SaveWhen::Debounced(|c, on| c.reopen_last_thread = on),
+            |_, _| {},
+        );
 
-        let quick_replies_row = adw::SwitchRow::builder()
-            .title("Suggest quick replies when a reply ends with a question")
-            .subtitle(
-                "Codex and Antigravity: when a reply ends with a question and a short list of \
-                 choices, offer the choices under the reply. Choosing one fills the message box; \
-                 nothing is sent until you press Enter",
-            )
-            .active(config.suggest_quick_replies)
-            .build();
+        let quick_replies_row = self.config_switch(
+            "Suggest quick replies when a reply ends with a question",
+            "Codex and Antigravity: when a reply ends with a question and a short list of \
+             choices, offer the choices under the reply. Choosing one fills the message box; \
+             nothing is sent until you press Enter",
+            |c| c.suggest_quick_replies,
+            SaveWhen::Owned,
+            Self::set_quick_replies,
+        );
 
-        let skip_animation_row = adw::SwitchRow::builder()
-            .title("Skip Load Animation")
-            .subtitle("Show the window as soon as it is ready, without the logo intro")
-            .active(config.skip_load_animation)
-            .build();
+        let skip_animation_row = self.config_switch(
+            "Skip Load Animation",
+            "Show the window as soon as it is ready, without the logo intro",
+            |c| c.skip_load_animation,
+            SaveWhen::Debounced(|c, on| c.skip_load_animation = on),
+            |_, _| {},
+        );
 
         // `notify_on_bell` in the file: once only a terminal's bell, now a thread's finished turn too.
-        let notify_row = adw::SwitchRow::builder()
-            .title("Notify When an Agent Finishes")
-            .subtitle(
-                "A desktop notification when a thread you are not looking at finishes its turn, or \
-                 a terminal tab rings its bell. Requests for your approval always notify",
-            )
-            .active(config.notify_on_bell)
-            .build();
+        let notify_row = self.config_switch(
+            "Notify When an Agent Finishes",
+            "A desktop notification when a thread you are not looking at finishes its turn, or \
+             a terminal tab rings its bell. Requests for your approval always notify",
+            |c| c.notify_on_bell,
+            SaveWhen::Debounced(|c, on| c.notify_on_bell = on),
+            |imp, on| {
+                // Off means off: a notification already raised would otherwise
+                // stay on the dock badge until something withdrew it.
+                if !on {
+                    imp.for_each_window(|window| {
+                        for tab in window.tabs.borrow_mut().iter_mut() {
+                            tab.bell_pending = false;
+                        }
+                    });
+                    imp.withdraw_bell_if_answered();
+                }
+            },
+        );
 
-        let notify_quota_row = adw::SwitchRow::builder()
-            .title("Notify When Out of Quota")
-            .subtitle("A desktop notification offering to continue the work in another agent")
-            .active(config.notify_on_quota)
-            .build();
+        let notify_quota_row = self.config_switch(
+            "Notify When Out of Quota",
+            "A desktop notification offering to continue the work in another agent",
+            |c| c.notify_on_quota,
+            SaveWhen::Debounced(|c, on| c.notify_on_quota = on),
+            |imp, on| {
+                if !on {
+                    imp.for_each_window(Self::withdraw_quota_notifications);
+                }
+            },
+        );
 
         let update_check_row = self.update_check_row();
 
-        let restore_row = adw::SwitchRow::builder()
-            .title("Reopen Terminal Tabs")
-            .subtitle(
-                "Reopen the last session's terminal tabs, in their folders, as fresh sessions",
-            )
-            .active(config.restore_session)
-            .build();
+        let restore_row = self.config_switch(
+            "Reopen Terminal Tabs",
+            "Reopen the last session's terminal tabs, in their folders, as fresh sessions",
+            |c| c.restore_session,
+            SaveWhen::Debounced(|c, on| c.restore_session = on),
+            |_, on| {
+                // Nothing is recorded while this is off, so a layout left behind
+                // now would come back, however old, the day it is turned on.
+                if !on {
+                    crate::config::SessionState::default().save();
+                }
+            },
+        );
 
-        let checkpoints_row = adw::SwitchRow::builder()
-            .title("Checkpoint Each Turn")
-            .subtitle(
-                "When a turn ends in a git repository, snapshot the files into hidden refs, so \
-                 each turn can be diffed and undone. Your branches, index and stash are untouched",
-            )
-            .active(config.checkpoints)
-            .build();
+        let checkpoints_row = self.config_switch(
+            "Checkpoint Each Turn",
+            "When a turn ends in a git repository, snapshot the files into hidden refs, so \
+             each turn can be diffed and undone. Your branches, index and stash are untouched",
+            |c| c.checkpoints,
+            SaveWhen::Debounced(|c, on| c.checkpoints = on),
+            |_, _| {},
+        );
 
-        let worktree_root_entry = gtk4::Entry::builder()
-            .text(&config.worktree_root)
-            .hexpand(true)
-            .valign(gtk4::Align::Center)
-            .placeholder_text("Beside the repository")
-            .build();
-        let worktree_root_row = adw::ActionRow::builder()
-            .title("Worktree Folder")
-            .subtitle(WORKTREE_ROOT_HELP)
-            .build();
-        worktree_root_row.add_suffix(&worktree_root_entry);
+        let worktree_root_row = self.directory_row(
+            "Worktree Folder",
+            WORKTREE_ROOT_HELP,
+            "Beside the repository",
+            |c| &c.worktree_root,
+            |c, dir| c.worktree_root = dir,
+        );
 
         // Pages by what a setting touches: the app as a whole, the agents (added below), git, and
         // the terminal pages and drawer.
@@ -4379,20 +4484,15 @@ impl AgentTerminalWindow {
         behaviour.add(&cli_client_row);
         behaviour.add(&scrollback_row);
         behaviour.add(&suspend_row);
-        let outside_row = adw::SwitchRow::builder()
-            .title("Show Sessions Started Outside Agent Terminal")
-            .subtitle(
-                "List the agents' own recent sessions (started in a terminal or another tool) as \
-                 threads in the sidebar. Off: their session files are not scanned; threads \
-                 already listed stay",
-            )
-            .active(config.list_outside_sessions)
-            .build();
-        outside_row.connect_active_notify(glib::clone!(
-            #[weak]
-            obj,
-            move |row| obj.imp().set_list_outside_sessions(row.is_active())
-        ));
+        let outside_row = self.config_switch(
+            "Show Sessions Started Outside Agent Terminal",
+            "List the agents' own recent sessions (started in a terminal or another tool) as \
+             threads in the sidebar. Off: their session files are not scanned; threads \
+             already listed stay",
+            |c| c.list_outside_sessions,
+            SaveWhen::Owned,
+            Self::set_list_outside_sessions,
+        );
         behaviour.add(&outside_row);
         terminal.add(&behaviour);
         dialog.add(&terminal);
@@ -4407,141 +4507,6 @@ impl AgentTerminalWindow {
                 let imp = obj.imp();
                 imp.config.borrow_mut().font = desc.to_str().to_string();
                 imp.apply_appearance_to_all();
-                imp.schedule_config_save();
-            }
-        ));
-
-        cursor_row.connect_selected_notify(glib::clone!(
-            #[weak]
-            obj,
-            move |row| {
-                let shape = crate::config::CursorShapeChoice::ALL
-                    .get(row.selected() as usize)
-                    .copied()
-                    .unwrap_or_default();
-                let imp = obj.imp();
-                imp.config.borrow_mut().cursor_shape = shape;
-                imp.apply_appearance_to_all();
-                imp.schedule_config_save();
-            }
-        ));
-
-        blink_row.connect_active_notify(glib::clone!(
-            #[weak]
-            obj,
-            move |row| {
-                let imp = obj.imp();
-                imp.config.borrow_mut().cursor_blink = row.is_active();
-                imp.apply_appearance_to_all();
-                imp.schedule_config_save();
-            }
-        ));
-
-        notify_row.connect_active_notify(glib::clone!(
-            #[weak]
-            obj,
-            move |row| {
-                let imp = obj.imp();
-                imp.config.borrow_mut().notify_on_bell = row.is_active();
-                // Off means off: a notification already raised would otherwise
-                // stay on the dock badge until something withdrew it.
-                if !row.is_active() {
-                    imp.for_each_window(|window| {
-                        for tab in window.tabs.borrow_mut().iter_mut() {
-                            tab.bell_pending = false;
-                        }
-                    });
-                    imp.withdraw_bell_if_answered();
-                }
-                imp.schedule_config_save();
-            }
-        ));
-
-        notify_quota_row.connect_active_notify(glib::clone!(
-            #[weak]
-            obj,
-            move |row| {
-                let imp = obj.imp();
-                imp.config.borrow_mut().notify_on_quota = row.is_active();
-                if !row.is_active() {
-                    imp.for_each_window(Self::withdraw_quota_notifications);
-                }
-                imp.schedule_config_save();
-            }
-        ));
-
-        restore_row.connect_active_notify(glib::clone!(
-            #[weak]
-            obj,
-            move |row| {
-                let imp = obj.imp();
-                imp.config.borrow_mut().restore_session = row.is_active();
-                // Nothing is recorded while this is off, so a layout left behind
-                // now would come back, however old, the day it is turned on.
-                if !row.is_active() {
-                    crate::config::SessionState::default().save();
-                }
-                imp.schedule_config_save();
-            }
-        ));
-
-        worktree_root_entry.connect_changed(glib::clone!(
-            #[weak]
-            obj,
-            #[weak]
-            worktree_root_row,
-            move |entry| {
-                let text = entry.text().to_string();
-                // Like the starting directory: a folder that does not exist is
-                // refused here, not discovered when a worktree cannot be made.
-                if !directory_is_usable(&text) {
-                    entry.add_css_class("error");
-                    worktree_root_row.set_subtitle("That directory does not exist");
-                    return;
-                }
-                entry.remove_css_class("error");
-                worktree_root_row.set_subtitle(WORKTREE_ROOT_HELP);
-                let imp = obj.imp();
-                if imp.config.borrow().worktree_root == text {
-                    return;
-                }
-                imp.config.borrow_mut().worktree_root = text;
-                imp.schedule_config_save();
-            }
-        ));
-
-        checkpoints_row.connect_active_notify(glib::clone!(
-            #[weak]
-            obj,
-            move |row| {
-                let imp = obj.imp();
-                imp.config.borrow_mut().checkpoints = row.is_active();
-                imp.schedule_config_save();
-            }
-        ));
-
-        reopen_thread_row.connect_active_notify(glib::clone!(
-            #[weak]
-            obj,
-            move |row| {
-                let imp = obj.imp();
-                imp.config.borrow_mut().reopen_last_thread = row.is_active();
-                imp.schedule_config_save();
-            }
-        ));
-
-        quick_replies_row.connect_active_notify(glib::clone!(
-            #[weak]
-            obj,
-            move |row| obj.imp().set_quick_replies(row.is_active())
-        ));
-
-        skip_animation_row.connect_active_notify(glib::clone!(
-            #[weak]
-            obj,
-            move |row| {
-                let imp = obj.imp();
-                imp.config.borrow_mut().skip_load_animation = row.is_active();
                 imp.schedule_config_save();
             }
         ));
@@ -4585,24 +4550,6 @@ impl AgentTerminalWindow {
             }
         ));
 
-        theme_row.connect_selected_notify(glib::clone!(
-            #[weak]
-            obj,
-            move |row| {
-                let theme = crate::config::ThemeChoice::ALL
-                    .get(row.selected() as usize)
-                    .copied()
-                    .unwrap_or_default();
-                obj.imp().config.borrow_mut().theme = theme;
-                // Themes apply live to the whole app and every open tab; no restart needed.
-                crate::palette::apply(theme);
-                obj.imp()
-                    .for_each_terminal_everywhere(|term| Theme::apply(term, theme));
-                obj.imp().recolour_diff_panels(theme);
-                obj.imp().schedule_config_save();
-            }
-        ));
-
         cli_client_row.connect_selected_notify(glib::clone!(
             #[weak]
             obj,
@@ -4637,34 +4584,6 @@ impl AgentTerminalWindow {
             }
         ));
 
-        starting_directory_entry.connect_changed(glib::clone!(
-            #[weak]
-            obj,
-            #[weak]
-            starting_directory_row,
-            move |entry| {
-                let text = entry.text().to_string();
-                // A path that does not exist used to be accepted, saved, and then
-                // silently swapped for $HOME at spawn time with only a log line —
-                // the user saw a tab in the wrong place and no explanation. Say so
-                // here instead, and refuse to persist it.
-                if !directory_is_usable(&text) {
-                    entry.add_css_class("error");
-                    starting_directory_row.set_subtitle("That directory does not exist");
-                    return;
-                }
-                entry.remove_css_class("error");
-                starting_directory_row.set_subtitle(STARTING_DIRECTORY_HELP);
-
-                let imp = obj.imp();
-                if imp.config.borrow().starting_directory == text {
-                    return;
-                }
-                imp.config.borrow_mut().starting_directory = text;
-                imp.schedule_config_save();
-            }
-        ));
-
         dialog.present(Some(obj.upcast_ref::<gtk4::Widget>()));
     }
 
@@ -4694,16 +4613,13 @@ impl AgentTerminalWindow {
         // A slow resolution (an -ic probe) can finish after a quicker one
         // started later — for a newer choice, or a newer profile list under
         // auto-detect. Only the latest request may land.
-        let generation = PROFILE_GENERATION.with(|g| {
-            g.set(g.get() + 1);
-            g.get()
-        });
+        let generation = PROFILE_GENERATION.with(super::Generation::next);
         glib::MainContext::default().spawn_local(glib::clone!(
             #[weak]
             obj,
             async move {
                 let resolved = resolve_active_profile(profiles, preferred, path, home, shell).await;
-                if PROFILE_GENERATION.with(std::cell::Cell::get) != generation {
+                if !PROFILE_GENERATION.with(|g| g.is_current(generation)) {
                     debug!("Dropping a profile resolution a newer one has superseded");
                     return;
                 }
@@ -6245,7 +6161,7 @@ impl AgentTerminalWindow {
 
         // Each edit supersedes the check before it: only the newest may
         // enable Create. Checked after a pause, and off the main thread.
-        let generation = std::rc::Rc::new(std::cell::Cell::new(0u64));
+        let generation = std::rc::Rc::new(super::Generation::new());
         let validate = std::rc::Rc::new(glib::clone!(
             #[weak]
             dialog,
@@ -6264,8 +6180,7 @@ impl AgentTerminalWindow {
             #[strong]
             generation,
             move || {
-                let current = generation.get().wrapping_add(1);
-                generation.set(current);
+                let current = generation.next();
                 dialog.set_response_enabled("create", false);
                 let name = branch.text().trim().to_string();
                 let start = base.text().trim().to_string();
@@ -6287,7 +6202,7 @@ impl AgentTerminalWindow {
                         #[weak]
                         problem,
                         move || {
-                            if generation.get() != current {
+                            if !generation.is_current(current) {
                                 return;
                             }
                             glib::MainContext::default().spawn_local(async move {
@@ -6296,7 +6211,7 @@ impl AgentTerminalWindow {
                                     crate::worktree::resolve_base(&main, &start).map(|_| ())
                                 })
                                 .await;
-                                if generation.get() != current {
+                                if !generation.is_current(current) {
                                     return;
                                 }
                                 match checked {

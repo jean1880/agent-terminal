@@ -20,6 +20,29 @@ glib::wrapper! {
         @implements gio::ActionGroup, gio::ActionMap, gtk4::Accessible, gtk4::Buildable, gtk4::ConstraintTarget, gtk4::Native, gtk4::Root, gtk4::ShortcutManager;
 }
 
+/// A stale-result counter: each request takes [`Generation::next`], and its answer lands only
+/// while [`Generation::is_current`] says no newer request has started since.
+#[derive(Debug, Default)]
+pub(crate) struct Generation(std::cell::Cell<u64>);
+
+impl Generation {
+    pub(crate) const fn new() -> Self {
+        Self(std::cell::Cell::new(0))
+    }
+
+    /// Starts a request: its generation, which supersedes every earlier one.
+    pub(crate) fn next(&self) -> u64 {
+        let next = self.0.get().wrapping_add(1);
+        self.0.set(next);
+        next
+    }
+
+    /// Whether `generation` is still the newest request.
+    pub(crate) fn is_current(&self, generation: u64) -> bool {
+        self.0.get() == generation
+    }
+}
+
 /// Starts applying hand edits of config.json to every window. Once per
 /// process, from the application's `startup`.
 pub fn watch_config_file(app: &adw::Application) {
