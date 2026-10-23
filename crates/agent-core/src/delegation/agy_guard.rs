@@ -58,24 +58,36 @@ pub enum L2Refusal {
     DiscoveryFailed,
 }
 
-/// The config-directory flag `arg` names, if any: one or two leading dashes, `-` and `_`
-/// alike, the value inline after `=` or in the next argument.
-fn config_dir_flag(arg: &str) -> Option<&'static str> {
+/// How agy's Go flag parser reads `arg`: its name with `-` as `_`, and whether its value is
+/// inline (`=value`). One or two leading dashes; `None` for anything else, three dashes too.
+pub fn flag_name(arg: &str) -> Option<(String, bool)> {
     let body = arg.strip_prefix("--").or_else(|| arg.strip_prefix('-'))?;
     if body.starts_with('-') {
         return None;
     }
-    let name = body.split_once('=').map_or(body, |(n, _)| n);
-    let normalised = name.replace('-', "_");
-    CONFIG_DIR_FLAGS.into_iter().find(|f| *f == normalised)
+    let (name, inline_value) = match body.split_once('=') {
+        Some((name, _)) => (name, true),
+        None => (body, false),
+    };
+    Some((name.replace('-', "_"), inline_value))
+}
+
+/// The config-directory flag `arg` names, if any ([`CONFIG_DIR_FLAGS`] read by
+/// [`flag_name`]), and whether its value is inline rather than in the next argument.
+pub fn config_directory_flag(arg: &str) -> Option<(&'static str, bool)> {
+    let (name, inline_value) = flag_name(arg)?;
+    CONFIG_DIR_FLAGS
+        .into_iter()
+        .find(|f| *f == name)
+        .map(|f| (f, inline_value))
 }
 
 /// The first config-directory flag in the final argv (after `--` too), as `--<name>`. Same
 /// classification as the agy adapter's (PR #44); defence in depth.
 pub fn argv_redirect(argv: &[String]) -> Option<String> {
     argv.iter()
-        .find_map(|a| config_dir_flag(a))
-        .map(|f| format!("--{f}"))
+        .find_map(|a| config_directory_flag(a))
+        .map(|(f, _)| format!("--{f}"))
 }
 
 /// The first redirecting variable name in the final environment; a name only.
@@ -229,6 +241,23 @@ mod tests {
         ] {
             assert_eq!(argv_redirect(&argv(miss)), None, "{miss:?}");
         }
+    }
+
+    #[test]
+    fn flag_names_follow_the_go_parser() {
+        assert_eq!(flag_name("--a-b=1"), Some(("a_b".into(), true)));
+        assert_eq!(flag_name("-a_b"), Some(("a_b".into(), false)));
+        assert_eq!(flag_name("---a"), None);
+        assert_eq!(flag_name("a"), None);
+        assert_eq!(
+            config_directory_flag("--app-data-dir=/x"),
+            Some(("app_data_dir", true))
+        );
+        assert_eq!(
+            config_directory_flag("-gemini_dir"),
+            Some(("gemini_dir", false))
+        );
+        assert_eq!(config_directory_flag("--model"), None);
     }
 
     #[test]

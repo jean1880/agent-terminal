@@ -18,6 +18,7 @@ use crate::adapter::{
     Outbox,
 };
 use crate::caps::Capabilities;
+use crate::delegation::agy_guard;
 use crate::event::{
     Envelope, Event, ItemKind, ItemStatus, ReasoningLabel, ReasoningState, StreamKind, TurnState,
     Usage,
@@ -44,11 +45,6 @@ static ADAPTER_SEQ: AtomicU64 = AtomicU64::new(0);
 /// The flag the adapter alone decides on (it is the hook's fail-safe, see [`Adapter::argv`]).
 const SKIP_PERMISSIONS: &str = "--dangerously-skip-permissions";
 
-/// Undocumented agy flags that move its whole configuration directory (hooks, MCP servers,
-/// settings) away from `$HOME/.gemini`, the one the app's hook proof reads. Verified live for
-/// `--gemini_dir=` (agy 1.3.5). Both take a
-/// value, inline (`=`) or as the next argument.
-const CONFIG_DIR_FLAGS: [&str; 2] = ["gemini_dir", "app_data_dir"];
 
 /// What a profile argument is to the adapter's launch decisions.
 #[derive(Debug, PartialEq, Eq)]
@@ -63,20 +59,19 @@ enum ProfileArg {
 
 /// agy is a Go binary: its flag parser takes one or two leading dashes and an optional
 /// `=value`. Names are compared with `-` and `_` treated alike, so near-spellings are caught too.
+/// The undocumented config-directory flags ([`agy_guard::CONFIG_DIR_FLAGS`]) move agy's whole
+/// configuration (hooks, MCP servers, settings) away from `$HOME/.gemini`, the one the app's
+/// hook proof reads (verified live for `--gemini_dir=`, agy 1.3.5); they take a value, inline
+/// or as the next argument.
 fn classify_profile_arg(arg: &str) -> ProfileArg {
-    let Some(flag) = arg.strip_prefix("--").or_else(|| arg.strip_prefix('-')) else {
+    let Some((name, inline_value)) = agy_guard::flag_name(arg) else {
         return ProfileArg::Keep;
     };
-    let (name, inline_value) = match flag.split_once('=') {
-        Some((name, _)) => (name, true),
-        None => (flag, false),
-    };
-    let name = name.replace('-', "_");
     if name == SKIP_PERMISSIONS.trim_start_matches('-').replace('-', "_") {
         // A boolean flag: it never consumes the next argument.
         return ProfileArg::Drop;
     }
-    if CONFIG_DIR_FLAGS.contains(&name.as_str()) {
+    if agy_guard::CONFIG_DIR_FLAGS.contains(&name.as_str()) {
         return if inline_value {
             ProfileArg::Drop
         } else {
