@@ -18,11 +18,7 @@ use crate::model_catalog::ModelCatalog;
 mod delegation;
 
 /// The default-mode dropdown, by index both ways.
-const MODES: [(Mode, &str); 3] = [
-    (Mode::Ask, "Ask before edits"),
-    (Mode::AcceptEdits, "Accept edits"),
-    (Mode::Plan, "Plan"),
-];
+const MODES: [Mode; 3] = [Mode::Ask, Mode::AcceptEdits, Mode::Plan];
 
 /// Effort levels offered when the catalogue lists none for the agent.
 const FALLBACK_EFFORTS: [&str; 3] = ["low", "medium", "high"];
@@ -502,10 +498,11 @@ impl AgentTerminalWindow {
         {
             return;
         }
-        let name = MODES
-            .iter()
-            .find(|(m, _)| *m == mode)
-            .map_or("This mode", |(_, n)| *n);
+        let name = if MODES.contains(&mode) {
+            mode.label()
+        } else {
+            "This mode"
+        };
         self.action_toast(
             &format!("{name} for this thread"),
             &format!("Make Default for {}", driver.info().long_label),
@@ -582,31 +579,55 @@ impl AgentTerminalWindow {
         }
     }
 
-    /// The "Default Agent for New Threads" dropdown. Applies on change.
-    pub(super) fn default_agent_row(&self) -> adw::ComboRow {
+    /// A dropdown over a fixed list of (value, label) `choices`, by index both ways: it starts at
+    /// `current` (else the first) and hands `changed` the chosen value (none past the end).
+    pub(super) fn choice_row<T: Copy + PartialEq + 'static>(
+        &self,
+        title: &str,
+        subtitle: &str,
+        choices: Vec<(T, String)>,
+        current: T,
+        changed: impl Fn(&Self, Option<T>) + 'static,
+    ) -> adw::ComboRow {
         let obj = self.obj();
-        let choices = default_agent_choices();
-        let names: Vec<&str> = choices.iter().map(|(_, n)| *n).collect();
-        let current = self.config.borrow().default_agent;
-        let default_row = adw::ComboRow::builder()
-            .title("Default Agent for New Threads")
-            .subtitle("Automatic: the default profile's agent, else the first installed")
-            .model(&gtk4::StringList::new(&names))
-            .selected(choices.iter().position(|(d, _)| *d == current).unwrap_or(0) as u32)
+        let labels: Vec<&str> = choices.iter().map(|(_, n)| n.as_str()).collect();
+        let row = adw::ComboRow::builder()
+            .title(title)
+            .subtitle(subtitle)
+            .model(&gtk4::StringList::new(&labels))
+            .selected(choices.iter().position(|(v, _)| *v == current).unwrap_or(0) as u32)
             .build();
-        Self::keep_value_whole(&default_row);
-        default_row.connect_selected_notify(glib::clone!(
+        row.connect_selected_notify(glib::clone!(
             #[weak]
             obj,
             move |row| {
-                let choice = choices.get(row.selected() as usize).and_then(|(d, _)| *d);
-                let imp = obj.imp();
+                let choice = choices.get(row.selected() as usize).map(|(v, _)| *v);
+                changed(obj.imp(), choice);
+            }
+        ));
+        row
+    }
+
+    /// The "Default Agent for New Threads" dropdown. Applies on change.
+    pub(super) fn default_agent_row(&self) -> adw::ComboRow {
+        let current = self.config.borrow().default_agent;
+        let default_row = self.choice_row(
+            "Default Agent for New Threads",
+            "Automatic: the default profile's agent, else the first installed",
+            default_agent_choices()
+                .into_iter()
+                .map(|(d, n)| (d, n.to_owned()))
+                .collect(),
+            current,
+            |imp, choice| {
+                let choice = choice.flatten();
                 if imp.config.borrow().default_agent != choice {
                     imp.config.borrow_mut().default_agent = choice;
                     imp.schedule_config_save();
                 }
-            }
-        ));
+            },
+        );
+        Self::keep_value_whole(&default_row);
         default_row
     }
 
@@ -1991,33 +2012,22 @@ impl AgentTerminalWindow {
         ));
         group.add(&model_row);
 
-        let mode_names: Vec<&str> = MODES.iter().map(|(_, n)| *n).collect();
-        let mode_row = adw::ComboRow::builder()
-            .title("Default Mode")
-            .model(&gtk4::StringList::new(&mode_names))
-            .selected(
-                MODES
-                    .iter()
-                    .position(|(m, _)| *m == profile.default_mode.unwrap_or_default())
-                    .unwrap_or(0) as u32,
-            )
-            .build();
-        mode_row.set_subtitle(if driver == Driver::Agy {
-            "New threads start here; a thread keeps its own. Without the approval hook, \
-             Ask before edits runs as Plan"
-        } else {
-            "New threads start here; a thread keeps its own"
-        });
-        mode_row.connect_selected_notify(glib::clone!(
-            #[weak]
-            obj,
-            move |row| {
-                let mode = MODES.get(row.selected() as usize).map(|(m, _)| *m);
-                obj.imp().edit_agent_profile(driver, |p| {
+        let mode_row = self.choice_row(
+            "Default Mode",
+            if driver == Driver::Agy {
+                "New threads start here; a thread keeps its own. Without the approval hook, \
+                 Ask before edits runs as Plan"
+            } else {
+                "New threads start here; a thread keeps its own"
+            },
+            MODES.iter().map(|m| (*m, m.label().to_owned())).collect(),
+            profile.default_mode.unwrap_or_default(),
+            move |imp, mode| {
+                imp.edit_agent_profile(driver, |p| {
                     p.default_mode = mode.filter(|m| *m != Mode::Ask);
                 });
-            }
-        ));
+            },
+        );
         group.add(&mode_row);
 
         let efforts = catalogue_efforts(driver);
@@ -2967,16 +2977,16 @@ pub(super) mod tests {
     fn the_default_mode_dropdown_lists_every_mode_once() {
         // Exhaustive: a new mode does not compile until it is placed in `MODES` (or kept out).
         let slot = |m: Mode| match m {
-            Mode::Ask | Mode::AcceptEdits | Mode::Plan => MODES.iter().position(|(x, _)| *x == m),
+            Mode::Ask | Mode::AcceptEdits | Mode::Plan => MODES.iter().position(|x| *x == m),
             // Session-only: never a default.
             Mode::Bypass => None,
         };
         for m in [Mode::Ask, Mode::AcceptEdits, Mode::Plan] {
             let i = slot(m).expect("listed");
-            assert_eq!(MODES[i].0, m);
+            assert_eq!(MODES[i], m);
         }
-        assert!(MODES.iter().all(|(m, _)| *m != Mode::Bypass));
-        let mut seen: Vec<Mode> = MODES.iter().map(|(m, _)| *m).collect();
+        assert!(MODES.iter().all(|m| *m != Mode::Bypass));
+        let mut seen: Vec<Mode> = MODES.to_vec();
         seen.dedup();
         assert_eq!(seen.len(), MODES.len(), "no mode twice");
     }
@@ -2997,12 +3007,12 @@ pub(super) mod tests {
 
     #[test]
     fn dropdown_arrays_are_complete_and_indexed_both_ways() {
-        for (i, (mode, _)) in MODES.iter().enumerate() {
+        for (i, mode) in MODES.iter().enumerate() {
             match mode {
                 Mode::Ask | Mode::AcceptEdits | Mode::Plan => {}
                 Mode::Bypass => panic!("dangerous permissive mode is never a default"),
             }
-            assert_eq!(MODES.iter().position(|(m, _)| m == mode), Some(i));
+            assert_eq!(MODES.iter().position(|m| m == mode), Some(i));
         }
         // The default-agent dropdown is Automatic plus every registered driver, in order.
         let choices = default_agent_choices();
