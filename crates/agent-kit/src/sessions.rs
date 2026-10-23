@@ -334,16 +334,52 @@ pub fn list_sessions(
     title_pointer: Option<&str>,
 ) -> Result<Vec<SessionSummary>, String> {
     let store = std::path::PathBuf::from(expand_tilde(store));
-    let top = std::fs::read_dir(&store)
+    let transcripts = transcript_files(&store, true)
         .map_err(|err| format!("Could not read {}: {err}", store.display()))?;
+    Ok(transcripts
+        .into_iter()
+        .take(MAX_LISTED_SESSIONS)
+        .map(|t| summarize_session(&t.path, t.id, t.modified, title_pointer))
+        .collect())
+}
 
-    let mut transcripts: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
+/// One `<id>.jsonl` transcript found by [`transcript_files`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptFile {
+    pub path: std::path::PathBuf,
+    /// The file stem, already a valid session ID.
+    pub id: String,
+    /// When the session was last active.
+    pub modified: std::time::SystemTime,
+}
+
+/// The `*.jsonl` transcripts one directory below `root` (and directly in it when
+/// `include_root_files`), newest first. Shallow on purpose: the root may be user-named, and a
+/// session's own `<session>/subagents/` transcripts sit two levels down, out of sight. A file
+/// whose name is not a valid session ID, or whose modification time cannot be read, is left out.
+///
+/// `Err` only when `root` itself cannot be read; an unreadable subdirectory adds nothing.
+/// Blocking: call it off the main thread.
+pub fn transcript_files(
+    root: &std::path::Path,
+    include_root_files: bool,
+) -> std::io::Result<Vec<TranscriptFile>> {
+    let top = std::fs::read_dir(root)?;
+    let mut transcripts = Vec::new();
     let mut consider = |path: std::path::PathBuf| {
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             return;
         }
+        let Some(id) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| validate_session_id(s).ok())
+            .map(str::to_owned)
+        else {
+            return;
+        };
         if let Ok(modified) = path.metadata().and_then(|m| m.modified()) {
-            transcripts.push((path, modified));
+            transcripts.push(TranscriptFile { path, id, modified });
         }
     };
     for entry in top.flatten() {
@@ -352,22 +388,12 @@ pub fn list_sessions(
             for sub in std::fs::read_dir(&path).into_iter().flatten().flatten() {
                 consider(sub.path());
             }
-        } else {
+        } else if include_root_files {
             consider(path);
         }
     }
-
-    transcripts.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
-    Ok(transcripts
-        .into_iter()
-        .filter_map(|(path, modified)| {
-            let id = path.file_stem()?.to_str()?;
-            let id = validate_session_id(id).ok()?.to_string();
-            Some((path, id, modified))
-        })
-        .take(MAX_LISTED_SESSIONS)
-        .map(|(path, id, modified)| summarize_session(&path, id, modified, title_pointer))
-        .collect())
+    transcripts.sort_by_key(|t| std::cmp::Reverse(t.modified));
+    Ok(transcripts)
 }
 
 /// Reads the working directory and latest title from a transcript's two ends.
@@ -448,6 +474,37 @@ pub(crate) fn summarize_session(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn the_transcript_inventory_is_shallow_valid_and_newest_first() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("proj/s1/subagents")).unwrap();
+        let at = |secs: u64| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        let put = |rel: &str, secs: u64| {
+            let path = root.join(rel);
+            std::fs::write(&path, "{}\n").unwrap();
+            let file = std::fs::File::options().write(true).open(&path).unwrap();
+            file.set_modified(at(secs)).unwrap();
+        };
+        put("top.jsonl", 300);
+        put("proj/s1.jsonl", 100);
+        put("proj/s2.jsonl", 200);
+        put("proj/s1/subagents/deep.jsonl", 400);
+        put("proj/bad id.jsonl", 500);
+        put("proj/notes.txt", 600);
+
+        let ids = |include_root_files| -> Vec<String> {
+            transcript_files(root, include_root_files)
+                .unwrap()
+                .into_iter()
+                .map(|t| t.id)
+                .collect()
+        };
+        assert_eq!(ids(true), ["top", "s2", "s1"]);
+        assert_eq!(ids(false), ["s2", "s1"]);
+        assert!(transcript_files(&root.join("missing"), true).is_err());
+    }
 
     #[test]
     fn a_line_window_is_bounded_lossy_and_drops_its_first_piece_only_when_asked() {
