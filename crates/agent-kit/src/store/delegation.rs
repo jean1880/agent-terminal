@@ -14,6 +14,9 @@
 //! is stored exactly as given). Free-text columns (names, bodies, reasons, activity) are masked
 //! again here with [`redact`], which leaves already-masked text as it is.
 
+use agent_core::adapter::Driver;
+use agent_core::delegation::authority::TaskMode;
+use agent_core::delegation::ids::{AuthorityEpoch, WorkerId};
 use agent_core::delegation::operation::OperationKind;
 use agent_core::delegation::wire::Delivery;
 use agent_core::redact::redact;
@@ -290,6 +293,50 @@ pub struct RunRow {
     pub usage_json: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// A stored enum value read leniently: one this build cannot read is `None`.
+fn lenient_enum<T: serde::de::DeserializeOwned>(s: &str) -> Option<T> {
+    serde_json::from_value(serde_json::Value::String(s.to_owned())).ok()
+}
+
+impl RootRow {
+    /// The authority epoch as a typed value; a negative stored epoch reads as 0.
+    pub fn epoch(&self) -> AuthorityEpoch {
+        AuthorityEpoch(self.authority_epoch.max(0) as u64)
+    }
+}
+
+impl WorkerRow {
+    /// The parent worker's handle: `None` for the root worker, and for a stored id that is not a
+    /// valid handle.
+    pub fn parent(&self) -> Option<WorkerId> {
+        self.parent_id
+            .as_deref()
+            .and_then(|p| WorkerId::parse(p).ok())
+    }
+
+    /// The task mode, `None` when unset or not one this build knows.
+    pub fn task_mode_kind(&self) -> Option<TaskMode> {
+        self.task_mode.as_deref().and_then(lenient_enum)
+    }
+
+    /// The agent driver, `None` when not one this build knows.
+    pub fn driver_kind(&self) -> Option<Driver> {
+        lenient_enum(&self.driver)
+    }
+}
+
+impl RunRow {
+    /// Whether the run has ended, as far as ending it again is concerned: `completed`,
+    /// `interrupted`, `failed` or `unknown`. Unlike `RunState::is_terminal`, `unknown` (a run
+    /// recovery could not account for) counts as ended, so nothing overwrites it.
+    pub fn settled(&self) -> bool {
+        matches!(
+            self.state.as_str(),
+            "completed" | "interrupted" | "failed" | "unknown"
+        )
+    }
 }
 
 /// One `delegation_operations` row.
@@ -811,6 +858,23 @@ impl Store {
         super::require_row(n, id)
     }
 
+    /// Ends run `id` as `state` with `reason`, unless it is missing or already ended
+    /// ([`RunRow::settled`]), so whichever ending comes first wins. Returns whether it ended it
+    /// here. Run it inside the caller's transaction so the check and the write are one step.
+    pub fn end_delegation_run_if_open(
+        &self,
+        id: &str,
+        state: &str,
+        reason: Option<&str>,
+        at: i64,
+    ) -> Result<bool> {
+        if !self.delegation_run(id)?.is_some_and(|r| !r.settled()) {
+            return Ok(false);
+        }
+        self.set_delegation_run_state(id, state, None, reason, None, at)?;
+        Ok(true)
+    }
+
     // ---- operations ----
 
     /// Inserts an accepted operation. The same (principal, kind, key) twice is a constraint error:
@@ -1321,6 +1385,76 @@ mod tests {
         let done = s.delegation_run("r_1").expect("q").expect("row");
         assert_eq!(done.native_turn_id.as_deref(), Some("turn-1"));
         assert_eq!(done.state, "completed");
+    }
+
+    #[test]
+    fn row_accessors_read_leniently() {
+        let mut w = worker("w_x", "ro", Some("w_abcdefgh12"), "supervised", 1);
+        assert_eq!(w.parent(), WorkerId::parse("w_abcdefgh12").ok());
+        assert_eq!(w.task_mode_kind(), Some(TaskMode::Plan));
+        assert_eq!(w.driver_kind(), Some(Driver::Codex));
+        // Invalid stored values read as None, never as an error or a guess.
+        w.parent_id = Some("w_short".into());
+        w.task_mode = Some("bogus".into());
+        w.driver = "bogus".into();
+        assert_eq!(
+            (w.parent(), w.task_mode_kind(), w.driver_kind()),
+            (None, None, None)
+        );
+        w.parent_id = None;
+        w.task_mode = None;
+        assert_eq!((w.parent(), w.task_mode_kind()), (None, None));
+
+        let mut r = root("ro", "t");
+        r.authority_epoch = 7;
+        assert_eq!(r.epoch(), AuthorityEpoch(7));
+        r.authority_epoch = -3;
+        assert_eq!(r.epoch(), AuthorityEpoch(0));
+
+        for (state, settled) in [
+            ("reserved", false),
+            ("starting", false),
+            ("running", false),
+            ("stopping", false),
+            ("completed", true),
+            ("interrupted", true),
+            ("failed", true),
+            ("unknown", true),
+        ] {
+            assert_eq!(run("r", "w", state).settled(), settled, "{state}");
+        }
+    }
+
+    #[test]
+    fn an_open_run_is_ended_once_and_an_ended_one_is_left_alone() {
+        let Tree { s, .. } = tree();
+        s.insert_delegation_run(&run("r_1", "w_child", "running"))
+            .expect("run");
+        assert!(s
+            .end_delegation_run_if_open("r_1", "interrupted", Some("stopped"), 5)
+            .expect("end"));
+        // Whichever ending came first wins.
+        assert!(!s
+            .end_delegation_run_if_open("r_1", "failed", Some("late"), 6)
+            .expect("again"));
+        let ended = s.delegation_run("r_1").expect("q").expect("row");
+        assert_eq!(
+            (ended.state.as_str(), ended.terminal_reason.as_deref()),
+            ("interrupted", Some("stopped"))
+        );
+        // A run recovery marked unknown is not overwritten, and a missing run is no error.
+        s.insert_delegation_run(&run("r_2", "w_child", "unknown"))
+            .expect("unknown run");
+        assert!(!s
+            .end_delegation_run_if_open("r_2", "failed", None, 7)
+            .expect("unknown"));
+        assert_eq!(
+            s.delegation_run("r_2").expect("q").expect("row").state,
+            "unknown"
+        );
+        assert!(!s
+            .end_delegation_run_if_open("r_missing", "failed", None, 8)
+            .expect("missing"));
     }
 
     fn op(id: &str, kind: &str, key: &str) -> OperationRow {
