@@ -260,6 +260,15 @@ struct McpCall {
     arguments: Value,
 }
 
+/// What an approval card shows besides its options, which come from its [`PendingApproval`].
+struct ApprovalCard {
+    tool: String,
+    title: Option<String>,
+    input: Value,
+    reason: Option<String>,
+    remembers: Option<String>,
+}
+
 /// An unanswered MCP form (`mcpServer/elicitation/request`).
 #[derive(Debug, Clone)]
 struct PendingForm {
@@ -1328,37 +1337,19 @@ impl CodexAdapter {
             scope.clone(),
             TURN_TOMBSTONE_LIMIT,
         );
-        let mut approvals: Vec<String> = self
-            .approvals
-            .iter()
-            .filter(|(_, p)| p.scope == scope)
-            .map(|(key, _)| key.clone())
-            .collect();
-        approvals.sort();
-        for key in approvals {
-            if let Some(pending) = self.approvals.remove(&key) {
-                out.push(
-                    Envelope::new(Event::ApprovalExpired)
-                        .item(pending.item)
-                        .request(key),
-                );
-            }
+        for (key, pending) in take_sorted_where(&mut self.approvals, |p| p.scope == scope) {
+            out.push(
+                Envelope::new(Event::ApprovalExpired)
+                    .item(pending.item)
+                    .request(key),
+            );
         }
-        let mut questions: Vec<String> = self
-            .questions
-            .iter()
-            .filter(|(_, p)| p.scope == scope)
-            .map(|(key, _)| key.clone())
-            .collect();
-        questions.sort();
-        for key in questions {
-            if let Some(pending) = self.questions.remove(&key) {
-                out.push(
-                    Envelope::new(Event::QuestionResolved { answered: false })
-                        .item(pending.item)
-                        .request(key),
-                );
-            }
+        for (key, pending) in take_sorted_where(&mut self.questions, |p| p.scope == scope) {
+            out.push(
+                Envelope::new(Event::QuestionResolved { answered: false })
+                    .item(pending.item)
+                    .request(key),
+            );
         }
         // A turnless form belongs to no turn, so no turn's end (not even one with no id) takes it.
         if scope.turn.is_some() {
@@ -1370,23 +1361,14 @@ impl CodexAdapter {
     /// Expires the open forms `which` picks, in key order: each card closes as cancelled, and
     /// nothing is sent (the server has resolved it, or the connection is gone).
     fn expire_forms(&mut self, which: impl Fn(&PendingForm) -> bool, out: &mut Vec<Envelope>) {
-        let mut keys: Vec<String> = self
-            .forms
-            .iter()
-            .filter(|(_, p)| which(p))
-            .map(|(key, _)| key.clone())
-            .collect();
-        keys.sort();
-        for key in keys {
-            if let Some(form) = self.forms.remove(&key) {
-                self.remember_settled_request(key.clone(), form.scope);
-                out.push(
-                    Envelope::new(Event::FormResolved {
-                        action: crate::form::FormAction::Cancel,
-                    })
-                    .request(key),
-                );
-            }
+        for (key, form) in take_sorted_where(&mut self.forms, which) {
+            self.remember_settled_request(key.clone(), form.scope);
+            out.push(
+                Envelope::new(Event::FormResolved {
+                    action: crate::form::FormAction::Cancel,
+                })
+                .request(key),
+            );
         }
     }
 
@@ -1698,26 +1680,45 @@ impl CodexAdapter {
                 obj.entry("changes").or_insert_with(|| changes.clone());
             }
         }
-        self.approvals.insert(
-            key.clone(),
-            PendingApproval {
-                rpc_id: id.clone(),
-                item: item.clone(),
-                scope: self.request_scope(params),
-                options: options.clone(),
-                grant: None,
-                form: false,
-            },
-        );
+        let pending = PendingApproval {
+            rpc_id: id.clone(),
+            item,
+            scope: self.request_scope(params),
+            options,
+            grant: None,
+            form: false,
+        };
+        let card = ApprovalCard {
+            tool: tool.to_owned(),
+            title,
+            input,
+            reason: s(params, "reason").map(str::to_owned),
+            remembers,
+        };
+        self.publish_approval(key, pending, card, out);
+    }
+
+    /// Registers `pending` under `key` and shows its card, which offers exactly the options the
+    /// pending request accepts. The caller has worked out the options and validated the request.
+    fn publish_approval(
+        &mut self,
+        key: String,
+        pending: PendingApproval,
+        card: ApprovalCard,
+        out: &mut Vec<Envelope>,
+    ) {
+        let item = pending.item.clone();
+        let options = pending.options.clone();
+        self.approvals.insert(key.clone(), pending);
         out.push(
             Envelope::new(Event::ApprovalRequested {
-                tool: tool.to_owned(),
-                title,
-                input,
-                reason: s(params, "reason").map(str::to_owned),
+                tool: card.tool,
+                title: card.title,
+                input: card.input,
+                reason: card.reason,
                 options,
                 response: ResponseCapability::Live,
-                remembers,
+                remembers: card.remembers,
             })
             .item(item)
             .request(key),
@@ -1749,30 +1750,22 @@ impl CodexAdapter {
         } else {
             vec![Decision::Deny, Decision::Cancel]
         };
-        self.approvals.insert(
-            key.clone(),
-            PendingApproval {
-                rpc_id: id.clone(),
-                item: item.clone(),
-                scope: self.request_scope(params),
-                options: options.clone(),
-                grant: Some(parsed.grant),
-                form: false,
-            },
-        );
-        out.push(
-            Envelope::new(Event::ApprovalRequested {
-                tool: PERMISSIONS_TOOL.to_owned(),
-                title: Some(parsed.title),
-                input: parsed.input,
-                reason: s(params, "reason").map(str::to_owned),
-                options,
-                response: ResponseCapability::Live,
-                remembers: None,
-            })
-            .item(item)
-            .request(key),
-        );
+        let pending = PendingApproval {
+            rpc_id: id.clone(),
+            item,
+            scope: self.request_scope(params),
+            options,
+            grant: Some(parsed.grant),
+            form: false,
+        };
+        let card = ApprovalCard {
+            tool: PERMISSIONS_TOOL.to_owned(),
+            title: Some(parsed.title),
+            input: parsed.input,
+            reason: s(params, "reason").map(str::to_owned),
+            remembers: None,
+        };
+        self.publish_approval(key, pending, card, out);
     }
 
     /// `mcpServer/elicitation/request`: a form card, or a decline with a notice.
@@ -1903,31 +1896,22 @@ impl CodexAdapter {
                     .unwrap_or(Value::Null),
             ),
         };
-        let options = ALL_DECISIONS.to_vec();
-        self.approvals.insert(
-            key.clone(),
-            PendingApproval {
-                rpc_id: id.clone(),
-                item: item.clone(),
-                scope,
-                options: options.clone(),
-                grant: None,
-                form: true,
-            },
-        );
-        out.push(
-            Envelope::new(Event::ApprovalRequested {
-                tool,
-                title: s(params, "message").map(|m| clip(&permissions::visible(m), MCP_TITLE_MAX)),
-                input,
-                reason: None,
-                options,
-                response: ResponseCapability::Live,
-                remembers: None,
-            })
-            .item(item)
-            .request(key),
-        );
+        let pending = PendingApproval {
+            rpc_id: id.clone(),
+            item,
+            scope,
+            options: ALL_DECISIONS.to_vec(),
+            grant: None,
+            form: true,
+        };
+        let card = ApprovalCard {
+            tool,
+            title: s(params, "message").map(|m| clip(&permissions::visible(m), MCP_TITLE_MAX)),
+            input,
+            reason: None,
+            remembers: None,
+        };
+        self.publish_approval(key, pending, card, out);
     }
 
     /// `turn/interrupt` for the active turn, when `scope` is that turn; `None` otherwise (a
@@ -2794,18 +2778,14 @@ impl Adapter for CodexAdapter {
             self.emit_workers(&mut out);
         }
         self.close_all(&mut out);
-        let mut approvals: Vec<_> = std::mem::take(&mut self.approvals).into_iter().collect();
-        approvals.sort_by(|a, b| a.0.cmp(&b.0));
-        for (request, approval) in approvals {
+        for (request, approval) in take_sorted_where(&mut self.approvals, |_| true) {
             out.push(
                 Envelope::new(Event::ApprovalExpired)
                     .item(approval.item)
                     .request(request),
             );
         }
-        let mut questions: Vec<_> = std::mem::take(&mut self.questions).into_iter().collect();
-        questions.sort_by(|a, b| a.0.cmp(&b.0));
-        for (request, question) in questions {
+        for (request, question) in take_sorted_where(&mut self.questions, |_| true) {
             out.push(
                 Envelope::new(Event::QuestionResolved { answered: false })
                     .item(question.item)
@@ -2937,6 +2917,24 @@ const ALL_DECISIONS: [Decision; 5] = [
     Decision::Deny,
     Decision::Cancel,
 ];
+
+/// Removes the entries of `pending` that `matches` picks and returns them in key order, so what
+/// they emit is deterministic. What the caller then does with them (tombstones, which forms a
+/// scope covers) is its own policy.
+fn take_sorted_where<T>(
+    pending: &mut HashMap<String, T>,
+    matches: impl Fn(&T) -> bool,
+) -> Vec<(String, T)> {
+    let mut keys: Vec<String> = pending
+        .iter()
+        .filter(|(_, p)| matches(p))
+        .map(|(key, _)| key.clone())
+        .collect();
+    keys.sort();
+    keys.into_iter()
+        .filter_map(|key| pending.remove(&key).map(|p| (key, p)))
+        .collect()
+}
 
 fn remember_bounded<T: Clone + Eq + std::hash::Hash>(
     keys: &mut HashSet<T>,
