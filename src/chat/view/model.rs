@@ -219,6 +219,10 @@ pub struct SubagentSummary {
     /// The provider is known independently of model/effort, which may remain unknown.
     pub driver: Option<Driver>,
     pub delegation: Option<agent_core::event::WorkerDelegation>,
+    /// The model and effort the parent asked for when it started the sub-agent (Claude's
+    /// `Agent` input, a shell launch's `--model`): requested, never confirmed by the provider.
+    pub requested_model: Option<String>,
+    pub requested_effort: Option<String>,
 }
 
 impl SubagentSummary {
@@ -300,6 +304,8 @@ impl SubagentSummary {
             activity: None,
             driver: Some(launch.driver),
             delegation: None,
+            requested_model: launch.model,
+            requested_effort: None,
         })
     }
 
@@ -345,6 +351,8 @@ impl SubagentSummary {
                 .as_ref()
                 .and_then(|input| input.get("delegation"))
                 .and_then(|value| serde_json::from_value(value.clone()).ok()),
+            requested_model: field("model"),
+            requested_effort: field("effort"),
         }
     }
 }
@@ -3357,7 +3365,8 @@ mod tests {
             &task(
                 "a",
                 None,
-                json!({"subagent_type": "Explore", "description": "Find the parser"}),
+                json!({"subagent_type": "Explore", "description": "Find the parser",
+                       "model": "sonnet", "effort": "high"}),
             ),
             Driver::Claude,
         );
@@ -3384,6 +3393,10 @@ mod tests {
         assert_eq!(list[0].status, ToolStatus::Running);
         assert_eq!(list[1].name, "Task", "no type: the tool's title");
         assert_eq!(list[1].task, "Check the tests");
+        assert_eq!(list[0].requested_model.as_deref(), Some("sonnet"));
+        assert_eq!(list[0].requested_effort.as_deref(), Some("high"));
+        assert_eq!(list[1].requested_model, None, "none asked for: none shown");
+        assert_eq!(list[1].requested_effort, None);
     }
 
     #[test]
