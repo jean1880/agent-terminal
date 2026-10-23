@@ -279,16 +279,11 @@ impl AgentTerminalWindow {
                 let obj = obj.downgrade();
                 let weak_row = weak_row.clone();
                 glib::MainContext::default().spawn_local(async move {
-                    let result = match registration_context(profile, clear).await {
-                        Ok((home, state, _, _)) => {
-                            blocking_or(
-                                move || delegation_config::undo(&home, &state),
-                                Err("Registration worker failed".into()),
-                            )
-                            .await
-                        }
-                        Err(error) => Err(error),
-                    };
+                    let result = registration_job(profile, clear, |ctx| {
+                        delegation_config::undo(&ctx.home, &ctx.state)
+                    })
+                    .await
+                    .and_then(|undone| undone);
                     let text = match result {
                         Ok(()) => "Registration restored. Reopen enabled threads to use it.".into(),
                         Err(error) => error,
@@ -334,14 +329,21 @@ impl AgentTerminalWindow {
             row.set_subtitle("Checking the selected profile's registration…");
         }
         glib::MainContext::default().spawn_local(async move {
-            let result = match registration_context(profile, clear).await {
-                Ok((home, state, command, launch)) => gtk4::gio::spawn_blocking(move || {
-                    let preview=delegation_config::preview(&home, &state, &command, Action::Configure);
-                    let diagnostic=delegation_config::bridge_diagnostic(&command,&launch.env,&launch.unset);
-                    (preview,diagnostic)
-                }).await.map_err(|_| "Registration worker failed".to_owned()),
-                Err(error) => Err(error),
-            };
+            let result = registration_job(profile, clear, |ctx| {
+                let preview = delegation_config::preview(
+                    &ctx.home,
+                    &ctx.state,
+                    &ctx.command,
+                    Action::Configure,
+                );
+                let diagnostic = delegation_config::bridge_diagnostic(
+                    &ctx.command,
+                    &ctx.launch.env,
+                    &ctx.launch.unset,
+                );
+                (preview, diagnostic)
+            })
+            .await;
             let text=match result {
                 Ok((preview,diagnostic))=>{
                     let registration=registration_status(&preview);
@@ -360,23 +362,16 @@ impl AgentTerminalWindow {
         let profile = self.agent_profile_now(Driver::Agy);
         let clear = self.config.borrow().clear_env.clone();
         glib::MainContext::default().spawn_local(async move {
-            let text = match registration_context(profile, clear).await {
-                Ok((home, state, command, _)) => {
-                    blocking_or(
-                        move || {
-                            registration_status(&delegation_config::preview(
-                                &home,
-                                &state,
-                                &command,
-                                Action::Configure,
-                            ))
-                        },
-                        "Registration worker failed".to_owned(),
-                    )
-                    .await
-                }
-                Err(error) => error,
-            };
+            let text = registration_job(profile, clear, |ctx| {
+                registration_status(&delegation_config::preview(
+                    &ctx.home,
+                    &ctx.state,
+                    &ctx.command,
+                    Action::Configure,
+                ))
+            })
+            .await
+            .unwrap_or_else(|error| error);
             if let Some(row) = row.upgrade() {
                 row.set_subtitle(&text);
             }
@@ -401,18 +396,11 @@ impl AgentTerminalWindow {
             row.set_subtitle("Checking the selected profile's registration…");
         }
         glib::MainContext::default().spawn_local(async move {
-            let result = match registration_context(profile, clear).await {
-                Ok((home, state, command, _)) => {
-                    blocking_or(
-                        move || {
-                            delegation_config::preview_repairing(&home, &state, &command, action)
-                        },
-                        Err("Registration worker failed".to_owned()),
-                    )
-                    .await
-                }
-                Err(error) => Err(error),
-            };
+            let result = registration_job(profile, clear, move |ctx| {
+                delegation_config::preview_repairing(&ctx.home, &ctx.state, &ctx.command, action)
+            })
+            .await
+            .and_then(|plan| plan);
             let finish = |row: &glib::WeakRef<adw::ActionRow>, text: &str| {
                 if let Some(row) = row.upgrade() {
                     row.set_subtitle(text);
@@ -626,10 +614,33 @@ fn registration_status(preview: &Result<delegation_config::Preview, String>) -> 
     }
 }
 
+/// What a registration job works on: the Antigravity profile's verified home, the app's
+/// delegation state under it, this executable, and the profile's launch environment.
+struct RegistrationCtx {
+    home: PathBuf,
+    state: PathBuf,
+    command: PathBuf,
+    launch: crate::agent_proc::AgentEnv,
+}
+
+/// Resolves `profile`'s [`RegistrationCtx`], then runs `job` on it off the main thread. A
+/// context that cannot be resolved is an `Err` saying why; a job that panics, "Registration
+/// worker failed".
+async fn registration_job<T: Send + 'static>(
+    profile: Profile,
+    clear: Vec<String>,
+    job: impl FnOnce(RegistrationCtx) -> T + Send + 'static,
+) -> Result<T, String> {
+    let ctx = registration_context(profile, clear).await?;
+    gtk4::gio::spawn_blocking(move || job(ctx))
+        .await
+        .map_err(|_| "Registration worker failed".to_owned())
+}
+
 async fn registration_context(
     profile: Profile,
     clear: Vec<String>,
-) -> Result<(PathBuf, PathBuf, PathBuf, crate::agent_proc::AgentEnv), String> {
+) -> Result<RegistrationCtx, String> {
     let file = profile.env_file.clone();
     let env =
         gtk4::gio::spawn_blocking(move || match file.filter(|path| !path.trim().is_empty()) {
@@ -650,7 +661,12 @@ async fn registration_context(
     let state = home.join(".config/agent-terminal/delegation");
     let command = std::env::current_exe()
         .map_err(|_| "Cannot locate the installed Agent Terminal executable")?;
-    Ok((home, state, command, launch))
+    Ok(RegistrationCtx {
+        home,
+        state,
+        command,
+        launch,
+    })
 }
 
 #[cfg(test)]
