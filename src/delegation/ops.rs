@@ -850,14 +850,14 @@ impl Supervisor {
         let limits = self.limits;
         let bridge_command = self.services.bridge_command.clone();
         gio::spawn_blocking(move || {
-            let mut env = std::env::vars()
-                .filter(|(k, _)| !resolved.env.unset.contains(k))
-                .collect::<std::collections::BTreeMap<_, _>>();
-            env.extend(resolved.env.env);
-            let home = env
-                .get("HOME")
-                .map(std::path::PathBuf::from)
+            // The child's environment as it is spawned; a variable that is not UTF-8 is read
+            // lossily rather than panicking, and such a HOME proves no home.
+            let child = crate::agent_home::child_env(&resolved.env);
+            let home = crate::agent_home::home_in_child(&child)
                 .ok_or_else(|| error(ErrorCode::WorkspaceUntrusted, "agent home unavailable"))?;
+            let env = child
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>();
             managed_registration_ready(&home, &bridge_command)?;
             let input = super::agy_l2::L2Input {
                 argv: std::iter::once(resolved.program)
@@ -1718,20 +1718,11 @@ fn describe_filter(f: &PageFilter) -> String {
 fn filter_json(f: &PageFilter) -> Value {
     json!({"target": f.target, "workers": f.workers, "mailbox": f.mailbox})
 }
-/// The home an agent launched with `env` sees, as `check_agy` derives it: the profile's own
-/// `HOME`, else the app's, unless the profile unsets it.
+/// The home an agent launched with `env` sees, as its approval socket proves it
+/// ([`crate::agent_home::effective_home`]). A home it cannot prove (none, relative, with `..`)
+/// refuses the check.
 fn agent_home(env: &crate::agent_proc::AgentEnv) -> Result<std::path::PathBuf, ToolError> {
-    env.env
-        .iter()
-        .rev()
-        .find(|(k, _)| k == "HOME")
-        .map(|(_, v)| v.clone())
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .filter(|_| !env.unset.iter().any(|k| k == "HOME"))
-        })
-        .map(std::path::PathBuf::from)
+    crate::agent_home::effective_home(env)
         .ok_or_else(|| error(ErrorCode::WorkspaceUntrusted, "agent home unavailable"))
 }
 pub(super) fn managed_registration_ready(
@@ -1768,5 +1759,31 @@ pub(super) fn replay_value(r: ReplayOutcome) -> Result<Value, ToolError> {
             ErrorCode::CapacityReached,
             "operation dispatch is in progress; retry the same key",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent_proc::AgentEnv;
+
+    #[test]
+    fn the_registration_home_is_the_one_the_approval_socket_proves() {
+        let home = |value: &str| AgentEnv {
+            env: vec![("HOME".into(), value.into())],
+            unset: vec![],
+        };
+        assert_eq!(
+            agent_home(&home("/profile/home")).ok(),
+            Some("/profile/home".into())
+        );
+        for value in ["/app/../profile", "relative", ""] {
+            assert!(agent_home(&home(value)).is_err(), "{value}");
+        }
+        let unset = AgentEnv {
+            env: vec![],
+            unset: vec!["HOME".into()],
+        };
+        assert!(agent_home(&unset).is_err());
     }
 }
