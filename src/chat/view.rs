@@ -1656,28 +1656,11 @@ pub(crate) mod tests {
     use super::*;
     use agent_core::event::Decision;
 
-    /// GTK, libadwaita, the bundled icons and the stylesheet, as the app sets them up: for the
-    /// native tests that present windows.
-    pub(super) fn native_init() -> glib::MainContext {
-        gtk4::init().expect("GTK must be available for the native gate");
-        adw::init().expect("libadwaita init");
-        crate::icons::register();
-        crate::load_css();
-        glib::MainContext::default()
-    }
+    pub(super) use crate::testutil::native_init;
 
     /// Iterates the main loop until `cond` holds; false after 5 s.
     pub(super) fn pump_until(ctx: &glib::MainContext, cond: impl Fn() -> bool) -> bool {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !cond() {
-            if std::time::Instant::now() > deadline {
-                return false;
-            }
-            if !ctx.iteration(false) {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-        }
-        true
+        crate::testutil::pump_until(ctx, 5, cond)
     }
 
     pub(super) fn status_of(driver: Driver) -> SessionStatus {
@@ -2852,11 +2835,7 @@ pub(crate) mod tests {
     #[ignore = "presents a window; run on a private display"]
     fn a_jump_to_an_unbuilt_card_lands_on_it() {
         use agent_core::event::{Event, ItemKind};
-        gtk4::init().expect("GTK init");
-        adw::init().expect("adw init");
-        crate::icons::register();
-        crate::load_css();
-        let ctx = glib::MainContext::default();
+        let ctx = crate::testutil::native_init();
         let view = ChatView::new(StubBackend::new(Driver::Claude));
         let window = gtk4::Window::new();
         window.set_default_size(560, 460);
@@ -3118,11 +3097,7 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "presents a window; run on a private display"]
     fn the_newest_row_stays_in_view_while_following() {
-        gtk4::init().expect("GTK init");
-        adw::init().expect("adw init");
-        crate::icons::register();
-        crate::load_css();
-        let ctx = glib::MainContext::default();
+        let ctx = crate::testutil::native_init();
         let backend = demo::demo_backend();
         let view = ChatView::new(backend.clone());
         backend.connect(view.sink());
@@ -3733,11 +3708,7 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "presents a window; run on a private display"]
     fn long_tool_titles_keep_user_messages_inside_the_viewport() {
-        gtk4::init().expect("GTK init");
-        adw::init().expect("adw init");
-        crate::icons::register();
-        crate::load_css();
-        let ctx = glib::MainContext::default();
+        let ctx = crate::testutil::native_init();
         let view = ChatView::new(StubBackend::new(Driver::Codex));
         let command = format!("git show {}", "a".repeat(820));
         let mut history = demo::DemoBackend::stress_history(180);

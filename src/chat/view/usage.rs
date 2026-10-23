@@ -631,19 +631,7 @@ pub(crate) mod tests {
             }
             n
         }
-        fn labels(widget: &gtk4::Widget) -> String {
-            let mut text = widget
-                .downcast_ref::<gtk4::Label>()
-                .map(|l| l.text().to_string())
-                .unwrap_or_default();
-            let mut child = widget.first_child();
-            while let Some(w) = child {
-                text.push_str(&labels(&w));
-                text.push('\n');
-                child = w.next_sibling();
-            }
-            text
-        }
+        let labels = |widget: &gtk4::Widget| crate::testutil::label_texts(widget).join("\n");
         assert_eq!(
             children(&usage.compact),
             1,

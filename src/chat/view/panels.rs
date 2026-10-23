@@ -1200,42 +1200,15 @@ pub(crate) mod tests {
             &pick,
             &caveats,
         );
-        fn find<T: IsA<gtk4::Widget> + glib::types::StaticType + Clone>(
-            widget: &gtk4::Widget,
-        ) -> Option<T> {
-            if let Ok(value) = widget.clone().downcast::<T>() {
-                return Some(value);
-            }
-            let mut child = widget.first_child();
-            while let Some(w) = child {
-                if let Some(found) = find::<T>(&w) {
-                    return Some(found);
-                }
-                child = w.next_sibling();
-            }
-            None
-        }
-        let row = find::<adw::ActionRow>(&list).expect("model row");
-        let dropdown = find::<gtk4::DropDown>(row.upcast_ref()).expect("effort choice");
-        fn find_class(widget: &gtk4::Widget, class: &str) -> Option<gtk4::Widget> {
-            if widget.has_css_class(class) {
-                return Some(widget.clone());
-            }
-            let mut child = widget.first_child();
-            while let Some(w) = child {
-                if let Some(found) = find_class(&w, class) {
-                    return Some(found);
-                }
-                child = w.next_sibling();
-            }
-            None
-        }
-        let find_apply = |w: &gtk4::Widget| {
-            find_class(w, "effort-apply").and_then(|b| b.downcast::<gtk4::Button>().ok())
-        };
-        let note = find_class(&list, "switch-caveats")
-            .and_then(|l| l.downcast::<gtk4::Label>().ok())
-            .expect("the other agent's group says what a switch costs");
+        let row =
+            crate::testutil::find_first::<adw::ActionRow>(list.upcast_ref()).expect("model row");
+        let dropdown =
+            crate::testutil::find_first::<gtk4::DropDown>(row.upcast_ref()).expect("effort choice");
+        let find_apply =
+            |w: &gtk4::Widget| crate::testutil::find_by_class::<gtk4::Button>(w, "effort-apply");
+        let note =
+            crate::testutil::find_by_class::<gtk4::Label>(list.upcast_ref(), "switch-caveats")
+                .expect("the other agent's group says what a switch costs");
         assert_eq!(note.text(), "costs of Codex");
         let apply = find_apply(row.upcast_ref()).expect("apply button");
         assert!(!apply.is_visible(), "nothing staged, nothing to apply");
@@ -1272,11 +1245,14 @@ pub(crate) mod tests {
         let no_caveats = |_| Vec::new();
         let list = model_list(&models, "", &on_opus, &pick, &no_caveats);
         assert!(
-            find_class(&list, "switch-caveats").is_none(),
+            crate::testutil::find_by_class::<gtk4::Widget>(list.upcast_ref(), "switch-caveats")
+                .is_none(),
             "the current agent's group has nothing to warn of"
         );
-        let row = find::<adw::ActionRow>(&list).expect("model row");
-        let dropdown = find::<gtk4::DropDown>(row.upcast_ref()).expect("effort choice");
+        let row =
+            crate::testutil::find_first::<adw::ActionRow>(list.upcast_ref()).expect("model row");
+        let dropdown =
+            crate::testutil::find_first::<gtk4::DropDown>(row.upcast_ref()).expect("effort choice");
         let apply = find_apply(row.upcast_ref()).expect("apply button");
         row.emit_by_name::<()>("activated", &[]);
         assert_eq!(
@@ -1520,28 +1496,17 @@ pub(crate) mod tests {
     /// Escape in the model picker's search field closes the picker: a `SearchEntry` keeps the key
     /// for its own `stop-search`, so the dialog never saw it.
     pub(crate) fn escape_in_the_pickers_search_closes_it(ctx: &PanelCtx) {
-        fn find<T: IsA<gtk4::Widget>>(widget: &gtk4::Widget) -> Option<T> {
-            if let Some(found) = widget.downcast_ref::<T>() {
-                return Some(found.clone());
-            }
-            let mut child = widget.first_child();
-            while let Some(w) = child {
-                if let Some(found) = find::<T>(&w) {
-                    return Some(found);
-                }
-                child = w.next_sibling();
-            }
-            None
-        }
         model_picker(ctx);
         let root = ctx.parent.root().expect("the view is in a window");
-        let picker = find::<adw::Dialog>(root.upcast_ref()).expect("the picker is presented");
+        let picker = crate::testutil::find_first::<adw::Dialog>(root.upcast_ref())
+            .expect("the picker is presented");
         let closed = Rc::new(Cell::new(false));
         picker.connect_closed({
             let closed = closed.clone();
             move |_| closed.set(true)
         });
-        let search = find::<gtk4::SearchEntry>(picker.upcast_ref()).expect("a search field");
+        let search = crate::testutil::find_first::<gtk4::SearchEntry>(picker.upcast_ref())
+            .expect("a search field");
         let context = glib::MainContext::default();
         // Libadwaita 1.5 ignores a close that lands while the sheet is still opening (CI's
         // Ubuntu 24.04; a user never presses Escape that soon), so let it open first, and press

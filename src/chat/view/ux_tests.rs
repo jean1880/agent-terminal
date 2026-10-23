@@ -1,6 +1,7 @@
 //! Native layout matrix using synthetic transcripts and observable frame conditions.
 use super::tests::StubBackend;
 use super::*;
+use crate::testutil::settle;
 use agent_core::event::{
     Decision, ItemKind, PlanStep, Question, QuestionOption, ResponseCapability, StepStatus,
     StreamKind,
@@ -11,11 +12,7 @@ use agent_core::event::{
 #[test]
 #[ignore = "native GTK layout; run alone in an isolated display"]
 fn native_header_lifecycle_hints_survive_narrow_breakpoints() {
-    gtk4::init().expect("GTK init");
-    adw::init().expect("adw init");
-    crate::icons::register();
-    crate::load_css();
-    let ctx = glib::MainContext::default();
+    let ctx = crate::testutil::native_init();
     for width in [360, 650, 950, 1100] {
         let header = header::Header::new();
         header.set_agent(Driver::Claude, Some("claude-sonnet-5-5"), None, None);
@@ -61,11 +58,7 @@ fn native_header_lifecycle_hints_survive_narrow_breakpoints() {
 #[test]
 #[ignore = "native GTK layout; run alone in an isolated display"]
 fn native_ux_matrix() {
-    gtk4::init().expect("GTK must be available for the native gate");
-    adw::init().expect("libadwaita init");
-    crate::icons::register();
-    crate::load_css();
-    let ctx = glib::MainContext::default();
+    let ctx = crate::testutil::native_init();
     for (width, scale, pane_open) in [
         (360, 1.0, false),
         (560, 1.0, true),
@@ -312,11 +305,6 @@ fn shown_view(
     (window, view)
 }
 
-/// Lets layout, scrolling and idle work run.
-fn settle(ctx: &glib::MainContext) {
-    crate::testutil::settle(ctx);
-}
-
 /// Where a press at the centre of `w` lands in `window`. A selectable label there would claim
 /// the press (a caret), so the press must pass through to `target`: the button, row or toggle
 /// that owns it. Returns what was hit when it is not.
@@ -401,11 +389,7 @@ fn item_started(id: &str, kind: ItemKind, title: &str, input: serde_json::Value)
 #[test]
 #[ignore = "native GTK layout; run alone in an isolated display"]
 fn native_click_matrix() {
-    gtk4::init().expect("GTK must be available for the native gate");
-    adw::init().expect("libadwaita init");
-    crate::icons::register();
-    crate::load_css();
-    let ctx = glib::MainContext::default();
+    let ctx = crate::testutil::native_init();
 
     // A tool card, a thought, a plan and a question, fresh in one thread.
     let tools = vec![
@@ -800,11 +784,7 @@ fn native_click_matrix() {
 #[test]
 #[ignore = "native GTK layout; run alone in an isolated display"]
 fn native_toasts_clear_the_composer() {
-    gtk4::init().expect("GTK must be available for the native gate");
-    adw::init().expect("libadwaita init");
-    crate::icons::register();
-    crate::load_css();
-    let ctx = glib::MainContext::default();
+    let ctx = crate::testutil::native_init();
     // A plan, a running sub-agent and an open question: the shelves are all up.
     let mut history = vec![
         Envelope::new(Event::TurnStarted { model: None }),
@@ -880,11 +860,7 @@ fn native_toasts_clear_the_composer() {
 #[test]
 #[ignore = "native GTK layout; run alone in an isolated display"]
 fn native_queue_stays_pinned_and_contained() {
-    gtk4::init().expect("GTK must be available for the native gate");
-    adw::init().expect("libadwaita init");
-    crate::icons::register();
-    crate::load_css();
-    let ctx = glib::MainContext::default();
+    let ctx = crate::testutil::native_init();
     for width in [360, 900] {
         let (window, view) = shown_view(width, &demo::queue_envelopes(), &ctx);
         let inner = view.inner().expect("view");
@@ -947,11 +923,7 @@ fn native_queue_stays_pinned_and_contained() {
 #[test]
 #[ignore = "native GTK layout; run alone in an isolated display"]
 fn native_quick_reply_chips_fill_the_composer_and_send_nothing() {
-    gtk4::init().expect("GTK must be available for the native gate");
-    adw::init().expect("libadwaita init");
-    crate::icons::register();
-    crate::load_css();
-    let ctx = glib::MainContext::default();
+    let ctx = crate::testutil::native_init();
     let backend = StubBackend::fixed(Driver::Codex);
     backend.panic_on_answer.set(true);
     let view = ChatView::new(backend.clone());
