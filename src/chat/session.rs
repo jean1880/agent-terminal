@@ -3345,7 +3345,7 @@ impl Inner {
                 |news| agent_core::delegation::wake::with_user_prompt(news.text(), text),
             );
             let accepted = self.command(Command::Steer { text: sent.clone() });
-            self.settle_news(news, accepted);
+            self.settle_news(news, accepted, &sent, text);
             if accepted {
                 self.remember_pre_init_prompt(&sent, None);
                 return;
@@ -3449,7 +3449,7 @@ impl Inner {
             stored,
         };
         let accepted = self.dispatch_sent_prompt(&sent, handoff);
-        self.settle_news(news, accepted);
+        self.settle_news(news, accepted, &sent, text);
         if accepted {
             self.note_unspawned_prompt(queued);
         } else {
@@ -3652,7 +3652,7 @@ impl Inner {
                 ..queued
             };
             let accepted = self.dispatch_sent_prompt(&sent, handoff);
-            self.settle_news(news, accepted);
+            self.settle_news(news, accepted, &sent, &queued.text);
             if !accepted {
                 self.hold_queued_prompt(queued);
                 return;

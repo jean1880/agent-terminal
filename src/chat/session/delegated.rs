@@ -273,6 +273,13 @@ impl Inner {
             (state.running_turn, "a turn is running"),
             (state.mode == Mode::Bypass, "dangerous permissive mode"),
             (process_gone, "the agent process is gone"),
+            (
+                self.proc
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|p| p.is_alive() && !p.can_write()),
+                "the agent's input failed",
+            ),
             (self.prompt_in_flight.get(), "a prompt is in flight"),
             (self.starting.borrow().is_some(), "the agent is starting"),
             (self.stopping.get(), "the agent is stopping"),
@@ -384,7 +391,17 @@ impl Inner {
     /// notice is left behind.
     ///
     /// [`AgentProcess::can_write`]: crate::agent_proc::AgentProcess::can_write
-    pub(super) fn settle_news(&self, news: Option<TakenNews>, sent: bool) {
+    ///
+    /// `decorated` is the prompt as sent (the news, then `plain`, the user's own text). When
+    /// the news goes back, the copy kept to replay Claude's pre-init input after a restart
+    /// becomes `plain`, so the replay never carries news that is back in the queue.
+    pub(super) fn settle_news(
+        &self,
+        news: Option<TakenNews>,
+        sent: bool,
+        decorated: &str,
+        plain: &str,
+    ) {
         let Some(news) = news else {
             return;
         };
@@ -392,9 +409,7 @@ impl Inner {
             drop(news);
             return;
         }
-        // Synchronous since the write: a process that can take writes now took that line.
-        let written = self.proc.borrow().as_ref().is_some_and(|p| p.can_write());
-        if written {
+        if self.wrote_now() {
             self.news_delivered(news);
             return;
         }
@@ -402,7 +417,22 @@ impl Inner {
             pending.news.push(news);
             return;
         }
+        if let Some(kept) = self
+            .pre_init_prompts
+            .borrow_mut()
+            .iter_mut()
+            .rev()
+            .find(|kept| kept.text == decorated)
+        {
+            kept.text = plain.to_owned();
+        }
         drop(news);
+    }
+
+    /// Whether a line written just now reached a process that can take it. Nothing runs between
+    /// a synchronous write and this check, so a process that can take writes now took that line.
+    fn wrote_now(&self) -> bool {
+        self.proc.borrow().as_ref().is_some_and(|p| p.can_write())
     }
 
     /// `news` reached the agent's process: posted as the app's notice.
@@ -436,6 +466,18 @@ impl Inner {
         self.prompt_in_flight.set(true);
         if !self.dispatch_sent_prompt(text, None) {
             self.prompt_in_flight.set(false);
+            return WakeOutcome::Busy;
+        }
+        // Started only on positive evidence, as held news is spent: the line went to a process
+        // that can take writes, or is held with a start still waiting on its checks. Otherwise
+        // (a process that exited and still drains, say) it was dropped: no turn runs, nothing is
+        // kept to replay, and the supervisor keeps the news and offers it again.
+        if !self.wrote_now() && self.starting.borrow().is_none() {
+            self.prompt_in_flight.set(false);
+            self.state.borrow_mut().running_turn = false;
+            self.pre_init_prompts
+                .borrow_mut()
+                .retain(|kept| kept.text != text);
             return WakeOutcome::Busy;
         }
         self.auto_wakes.set(self.auto_wakes.get().saturating_add(1));
