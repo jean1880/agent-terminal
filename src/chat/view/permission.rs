@@ -342,19 +342,30 @@ fn parse_entry(raw: &Value) -> Option<Entry> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use serde_json::json;
 
-    fn input(entries: Value, network: Value) -> Value {
+    /// A Codex permission request as the adapter hands it to the card: `entries` and `network`
+    /// in the workspace `/w`, offering "Allow for session" when `session_allowed`.
+    pub(in crate::chat::view) fn request_input(
+        entries: Value,
+        network: Value,
+        session_allowed: bool,
+    ) -> Value {
         json!({
-            "cwd": "/w", "reason": "Build needs the cache", "renderable": true,
-            "entries": entries, "network": network, "session_allowed": true,
-            "warning": null, "requested": {}
+            "cwd": "/w", "reason": "The build writes its cache", "renderable": true,
+            "entries": entries, "network": network, "session_allowed": session_allowed,
+            "warning": null, "requested": {"fileSystem": {"write": ["/w/out"]}}
         })
     }
 
-    fn path(access: &str, p: &str) -> Value {
+    fn input(entries: Value, network: Value) -> Value {
+        request_input(entries, network, true)
+    }
+
+    /// One entry: `access` to the path `p`.
+    pub(in crate::chat::view) fn path(access: &str, p: &str) -> Value {
         json!({"access": access, "target": {"kind": "path", "path": p}})
     }
 

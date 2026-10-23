@@ -3746,17 +3746,7 @@ pub(crate) mod tests {
         );
     }
 
-    fn permission_input(entries: Value, network: Value, session_allowed: bool) -> Value {
-        serde_json::json!({
-            "cwd": "/w", "reason": "The build writes its cache", "renderable": true,
-            "entries": entries, "network": network, "session_allowed": session_allowed,
-            "warning": null, "requested": {"fileSystem": {"write": ["/w/out"]}}
-        })
-    }
-
-    fn entry(access: &str, path: &str) -> Value {
-        serde_json::json!({"access": access, "target": {"kind": "path", "path": path}})
-    }
+    use super::super::permission::tests::{path as entry, request_input as permission_input};
 
     const ALL_FOUR: [Decision; 4] = [
         Decision::Allow,
