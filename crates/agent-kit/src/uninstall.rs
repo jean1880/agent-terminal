@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use crate::delegation_config::{self, Removal};
 use crate::git::{self, QUERY_TIMEOUT_SECS, REF_ROOT};
+pub use crate::paths::tilde;
 
 /// The app's folder under each XDG base directory.
 pub const APP_DIR: &str = "agent-terminal";
@@ -817,20 +818,6 @@ fn remove_scratch(dir: &Path) -> Result<(), String> {
     }
 }
 
-/// `path` with `home` written as `~`.
-pub fn tilde(path: &Path, home: &Path) -> String {
-    match path.strip_prefix(home) {
-        Ok(rest) if !home.as_os_str().is_empty() => {
-            if rest.as_os_str().is_empty() {
-                "~".to_owned()
-            } else {
-                format!("~/{}", rest.display())
-            }
-        }
-        _ => path.display().to_string(),
-    }
-}
-
 /// A byte count for people: `0 B`, `12 KB`, `1.6 GB`.
 pub fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
@@ -853,8 +840,7 @@ mod tests {
     use std::fs;
 
     fn uid() -> u32 {
-        // SAFETY: geteuid has no preconditions and cannot fail.
-        unsafe { libc::geteuid() }
+        crate::fsutil::effective_uid()
     }
 
     fn inputs(home: &Path) -> Inputs {

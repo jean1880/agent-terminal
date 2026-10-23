@@ -27,9 +27,35 @@ pub fn expand_tilde_with(path: &str, home: &str) -> String {
     format!("{home}{rest}")
 }
 
+/// `path` with `home` written as `~`, for showing a path to people. An empty `home` (unknown)
+/// leaves every path as it is rather than turning each into `~/…`.
+pub fn tilde(path: &std::path::Path, home: &std::path::Path) -> String {
+    match path.strip_prefix(home) {
+        Ok(rest) if !home.as_os_str().is_empty() => {
+            if rest.as_os_str().is_empty() {
+                "~".to_owned()
+            } else {
+                format!("~/{}", rest.display())
+            }
+        }
+        _ => path.display().to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn a_path_under_home_is_shown_with_a_tilde_and_an_unknown_home_changes_nothing() {
+        let home = Path::new("/home/u");
+        assert_eq!(tilde(Path::new("/home/u"), home), "~");
+        assert_eq!(tilde(Path::new("/home/u/a/b"), home), "~/a/b");
+        assert_eq!(tilde(Path::new("/home/user2/a"), home), "/home/user2/a");
+        assert_eq!(tilde(Path::new("/etc/x"), home), "/etc/x");
+        assert_eq!(tilde(Path::new("rel/x"), Path::new("")), "rel/x");
+    }
 
     #[test]
     fn tilde_paths_are_expanded_for_config_supplied_files() {
