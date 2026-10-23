@@ -70,6 +70,41 @@ impl PendingStart {
 #[path = "delegation_tests.rs"]
 pub(super) mod tests;
 
+/// Whether any tab, thread or terminal, in any window is in `path` or below it. No disk access
+/// on the UI path: workspace removal also proves containment and ownership on its worker
+/// before invoking git without --force.
+fn tab_open_in(path: &std::path::Path) -> bool {
+    every_window().iter().any(|window| {
+        window
+            .imp()
+            .tabs
+            .borrow()
+            .iter()
+            .any(|tab| std::path::Path::new(&tab.dir).starts_with(path))
+    })
+}
+
+/// Every window of the application, including one holding only terminal tabs, and any window
+/// an open thread is registered to that the application does not list.
+fn every_window() -> Vec<crate::window::AgentTerminalWindow> {
+    let mut windows: Vec<crate::window::AgentTerminalWindow> = gtk4::gio::Application::default()
+        .and_downcast::<gtk4::Application>()
+        .map(|app| {
+            app.windows()
+                .into_iter()
+                .filter_map(|w| w.downcast::<crate::window::AgentTerminalWindow>().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    OPEN_THREADS.with(|registry| {
+        for window in registry.borrow().values().filter_map(|w| w.upgrade()) {
+            if !windows.contains(&window) {
+                windows.push(window);
+            }
+        }
+    });
+    windows
+}
 /// One weak UI subscriber also records diffs in each child's actual working directory.
 struct ThreadWorkerSubscriber {
     slot: std::rc::Weak<SessionSlot>,
@@ -542,25 +577,7 @@ impl AgentTerminalWindow {
             }),
             make_adapter: Rc::new(make_adapter),
             hook_check: Rc::new(|target| std::boxed::Box::pin(check_hook(target))),
-            tab_open_in: Rc::new(|path| {
-                // No disk access on the UI path: workspace removal also proves containment
-                // and ownership on its worker before invoking git without --force.
-                let windows: Vec<_> = OPEN_THREADS.with(|registry| {
-                    registry
-                        .borrow()
-                        .values()
-                        .filter_map(|w| w.upgrade())
-                        .collect()
-                });
-                windows.iter().any(|window| {
-                    window
-                        .imp()
-                        .tabs
-                        .borrow()
-                        .iter()
-                        .any(|tab| std::path::Path::new(&tab.dir).starts_with(path))
-                })
-            }),
+            tab_open_in: Rc::new(tab_open_in),
             report: Rc::new(move |text| {
                 warn!(message = %agent_core::redact::redact(text), "Delegation");
                 if let Some(obj) = weak.upgrade() {
