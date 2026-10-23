@@ -534,6 +534,15 @@ pub fn relative_time(now_ms: i64, then_ms: i64) -> String {
 }
 
 /// A thread title from its first message: the first non-blank line, at most 60 characters.
+/// The name a thread is shown under: its title, or "New thread" while it has none.
+pub fn display_title(title: &str) -> &str {
+    if title.is_empty() {
+        "New thread"
+    } else {
+        title
+    }
+}
+
 pub fn thread_title(text: &str) -> String {
     const MAX: usize = 60;
     let line = text
@@ -1855,6 +1864,12 @@ mod tests {
             assert_ne!(handoff_target(d, |_| true), Some(d));
         }
         assert_eq!(Driver::Codex.info().label, "Codex");
+    }
+
+    #[test]
+    fn an_untitled_thread_is_shown_as_new_thread() {
+        assert_eq!(display_title(""), "New thread");
+        assert_eq!(display_title("Fix the build"), "Fix the build");
     }
 
     /// The 2026-10-11 sequence: the limit, then a turn Claude started itself (no output), then a

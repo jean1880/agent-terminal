@@ -37,11 +37,11 @@ use crate::chat::{ChatBackend, EnvelopeSink, SessionStatus};
 use crate::config::{profile_driver, Profile};
 use crate::model_catalog::{retirement_banner, ModelCatalog};
 use crate::window::sidebar_model::{
-    badge_for, busy_reason, continue_label, fold_groups, forbids_unasked_edits, held_finish_due,
-    is_busy, limit_over, needs_attention, parse_driver, react, redraw_for, relative_time,
-    resume_as, row_tooltip, safe_handoff_target, sidebar_sections, stop_heading, stored_model,
-    thread_title, turn_finishes_thread, Attention, Badge, ChildAsks, FolderGroup, OpenState,
-    Redraw, ResumeAs, RowKey, SidebarModel, SidebarRow,
+    badge_for, busy_reason, continue_label, display_title, fold_groups, forbids_unasked_edits,
+    held_finish_due, is_busy, limit_over, needs_attention, parse_driver, react, redraw_for,
+    relative_time, resume_as, row_tooltip, safe_handoff_target, sidebar_sections, stop_heading,
+    stored_model, thread_title, turn_finishes_thread, Attention, Badge, ChildAsks, FolderGroup,
+    OpenState, Redraw, ResumeAs, RowKey, SidebarModel, SidebarRow,
 };
 use crate::window::sidebar_model::{
     reopen_offer, sessions_added_toast, thread_activity, ThreadActivity,
@@ -351,11 +351,7 @@ pub(super) const SIDEBAR_COLLAPSE_SP: f64 = 720.0;
 /// `driver` while work would be cut short.
 pub(super) fn switch_warning(title: &str, driver: Driver) -> (String, String) {
     let agent = driver.info().label;
-    let subject = if title.is_empty() {
-        "This thread".to_owned()
-    } else {
-        format!("“{title}”")
-    };
+    let subject = thread_subject(title);
     (
         format!("Stop the Running Work and Switch to {agent}?"),
         format!(
@@ -431,11 +427,7 @@ pub(super) fn window_close_question(
     let lines = threads
         .iter()
         .map(|(title, r)| {
-            let title = if title.is_empty() {
-                "New thread"
-            } else {
-                title
-            };
+            let title = display_title(title);
             if r.draft {
                 format!("• {title} has an unsent message")
             } else {
@@ -1035,6 +1027,26 @@ fn carried_settings(
         effort,
         mode: mode.map(Mode::session_safe),
     }
+}
+
+/// [`carried_settings`] with what the live thread did not say taken from its store: the provider
+/// thread's model and the mode last chosen in its history.
+fn carried_with_stored(
+    model: Option<String>,
+    effort: Option<String>,
+    mode: Option<Mode>,
+    loaded: &LoadedThread,
+) -> CarriedSettings {
+    carried_settings(
+        model.or_else(|| {
+            loaded
+                .provider
+                .as_ref()
+                .and_then(|p| stored_model(Some(&p.model)))
+        }),
+        effort,
+        mode.or_else(|| crate::chat::session::chosen_mode(loaded.history.iter().map(|(_, e)| e))),
+    )
 }
 
 /// A chat agent's binary and its profile's environment, resolved off the main thread.
@@ -3086,8 +3098,7 @@ impl AgentTerminalWindow {
                 };
                 let title = match chat {
                     Some(c) if !c.title.is_empty() => c.title.clone(),
-                    _ if !s.title.is_empty() => s.title.clone(),
-                    _ => "New thread".to_owned(),
+                    _ => display_title(&s.title).to_owned(),
                 };
                 SidebarRow {
                     key: RowKey::Thread(s.id.clone()),
@@ -4148,11 +4159,7 @@ impl AgentTerminalWindow {
         }
         let home = env::var("HOME").unwrap_or_default();
         if let Some(window_title) = self.window_title.borrow().as_ref() {
-            window_title.set_title(if title.is_empty() {
-                "New thread"
-            } else {
-                &title
-            });
+            window_title.set_title(display_title(&title));
             window_title.set_subtitle(&crate::utils::tildify(&dir, &home));
             window_title.set_tooltip_text(None);
         }
@@ -4590,11 +4597,7 @@ impl AgentTerminalWindow {
         content.append(&paned);
 
         let page = tab_view.append(&content);
-        let title = if summary.title.is_empty() {
-            "New thread".to_owned()
-        } else {
-            summary.title.clone()
-        };
+        let title = display_title(&summary.title).to_owned();
         page.set_title(&title);
 
         self.configure_terminal(&terminal);
@@ -5661,11 +5664,7 @@ impl AgentTerminalWindow {
         let key = self.with_page_tab(page, |t| t.key);
         let notification = gtk4::gio::Notification::new(heading);
         let title = page.title();
-        notification.set_body(Some(if title.is_empty() {
-            "New thread"
-        } else {
-            &title
-        }));
+        notification.set_body(Some(display_title(&title)));
         notification.set_priority(gtk4::gio::NotificationPriority::High);
         // Without a default action, clicking it activates the app and opens a second window.
         if let Some(key) = key {
@@ -6244,18 +6243,7 @@ impl AgentTerminalWindow {
                     return;
                 }
             };
-            let settings = carried_settings(
-                live.model.or_else(|| {
-                    loaded
-                        .provider
-                        .as_ref()
-                        .and_then(|p| stored_model(Some(&p.model)))
-                }),
-                None,
-                live.mode.or_else(|| {
-                    crate::chat::session::chosen_mode(loaded.history.iter().map(|(_, e)| e))
-                }),
-            );
+            let settings = carried_with_stored(live.model, None, live.mode, &loaded);
             obj.imp().create_chat_thread(NewThread {
                 here: dir,
                 model: settings.model,
@@ -6353,18 +6341,7 @@ impl AgentTerminalWindow {
                     return;
                 }
             };
-            let settings = carried_settings(
-                model.or_else(|| {
-                    loaded
-                        .provider
-                        .as_ref()
-                        .and_then(|p| stored_model(Some(&p.model)))
-                }),
-                effort,
-                mode.or_else(|| {
-                    crate::chat::session::chosen_mode(loaded.history.iter().map(|(_, e)| e))
-                }),
-            );
+            let settings = carried_with_stored(model, effort, mode, &loaded);
             let profile_id = profile_id.or_else(|| carried_stored_profile(&loaded, driver));
             imp.create_chat_thread(NewThread {
                 dir,

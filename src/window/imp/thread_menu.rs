@@ -21,7 +21,8 @@ use crate::chat::session::build_handoff;
 use crate::chat::ChatBackend;
 use crate::model_catalog::ModelCatalog;
 use crate::window::sidebar_model::{
-    menu_agents, thread_menu, MenuAgent, MenuEntry, RowKey, ThreadAction, ThreadMenuInput,
+    display_title, menu_agents, thread_menu, MenuAgent, MenuEntry, RowKey, ThreadAction,
+    ThreadMenuInput,
 };
 
 /// The action every enabled menu item activates, with the encoded [`ThreadAction`] as target.
@@ -278,13 +279,7 @@ impl AgentTerminalWindow {
             ThreadAction::Fork(ref thread) | ThreadAction::Compact(ref thread) => {
                 let compact = matches!(action, ThreadAction::Compact(_));
                 if let Some(summary) = self.summary_of(thread) {
-                    let driver = self.slot_of(thread).map(|s| s.driver()).or_else(|| {
-                        summary
-                            .driver
-                            .as_deref()
-                            .and_then(crate::window::sidebar_model::parse_driver)
-                    });
-                    if let Some(driver) = driver {
+                    if let Some(driver) = self.thread_driver(thread, &summary) {
                         self.fork_thread(thread, driver, Some(summary.cwd), compact);
                     }
                 }
@@ -296,12 +291,7 @@ impl AgentTerminalWindow {
             ThreadAction::OpenFolder(thread) => self.open_thread_folder(&thread),
             ThreadAction::ReviewEnvironment(thread) => {
                 if let Some(summary) = self.summary_of(&thread) {
-                    let driver = self.slot_of(&thread).map(|slot| slot.driver()).or_else(|| {
-                        summary
-                            .driver
-                            .as_deref()
-                            .and_then(crate::window::sidebar_model::parse_driver)
-                    });
+                    let driver = self.thread_driver(&thread, &summary);
                     self.confirm_environment_review(summary.cwd, driver);
                 }
             }
@@ -312,17 +302,29 @@ impl AgentTerminalWindow {
         }
     }
 
+    /// The agent `thread` runs on: its open session's, else the one its `summary` recorded.
+    fn thread_driver(
+        &self,
+        thread: &str,
+        summary: &agent_kit::store::ThreadSummary,
+    ) -> Option<Driver> {
+        self.slot_of(thread).map(|slot| slot.driver()).or_else(|| {
+            summary
+                .driver
+                .as_deref()
+                .and_then(crate::window::sidebar_model::parse_driver)
+        })
+    }
+
     /// What the sidebar calls the thread.
     pub(super) fn thread_title_of(&self, thread: &str) -> String {
         let open = self
             .with_chat(thread, |c| c.title.clone())
             .filter(|t| !t.is_empty());
-        open.or_else(|| {
-            self.summary_of(thread)
-                .map(|s| s.title)
-                .filter(|t| !t.is_empty())
-        })
-        .unwrap_or_else(|| "New thread".to_owned())
+        let title = open
+            .or_else(|| self.summary_of(thread).map(|s| s.title))
+            .unwrap_or_default();
+        display_title(&title).to_owned()
     }
 
     // ---- continue / switch ----
