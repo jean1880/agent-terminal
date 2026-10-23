@@ -131,16 +131,13 @@ impl AgentTerminalWindow {
                     .unwrap_or_default(),
             )
             .build();
-        let expand_row = adw::SwitchRow::builder()
-            .title("Expand Diffs")
-            .subtitle("Show a file edit's diff as soon as the edit completes")
-            .active(self.config.borrow().diffs_expanded)
-            .build();
-        expand_row.connect_active_notify(glib::clone!(
-            #[weak]
-            obj,
-            move |row| obj.imp().set_diffs_expanded(row.is_active())
-        ));
+        let expand_row = self.config_switch(
+            "Expand Diffs",
+            "Show a file edit's diff as soon as the edit completes",
+            |c| c.diffs_expanded,
+            SaveWhen::Owned,
+            Self::set_diffs_expanded,
+        );
         group.add(&expand_row);
         group.add(&preset_row);
         group.add(&command_row);

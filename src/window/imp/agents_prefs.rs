@@ -611,7 +611,7 @@ impl AgentTerminalWindow {
     }
 
     /// Writes an approval switch now, and says so if the settings could not be saved.
-    fn save_approval_switch(&self) {
+    pub(super) fn save_approval_switch(&self) {
         if !self.save_config_now() {
             self.show_toast("Your settings could not be saved. The change lasts until you quit.");
         }
@@ -620,61 +620,31 @@ impl AgentTerminalWindow {
     /// "Automatic Pattern Approvals": whether saved Always-allow rules approve matching requests.
     /// Shared by Settings → Agents and setup; applies on change.
     pub(super) fn pattern_approval_row(&self) -> adw::SwitchRow {
-        let obj = self.obj();
-        let row = adw::SwitchRow::builder()
-            .title("Automatic Pattern Approvals")
-            .subtitle(
-                "Saved Always-allow rules approve matching requests without asking. Off: every \
-                 request asks, except what you allow for this session. Rules exported to an \
-                 agent's own settings are that agent's to apply.",
-            )
-            .active(self.config.borrow().pattern_auto_approval)
-            .build();
-        row.connect_active_notify(glib::clone!(
-            #[weak]
-            obj,
-            move |row| {
-                let imp = obj.imp();
-                let active = row.is_active();
-                if imp.config.borrow().pattern_auto_approval != active {
-                    // The config is shared by every window, so this is the one copy. A security
-                    // switch is written at once, not debounced, so a stale read or a crash in
-                    // the debounce cannot bring it back on.
-                    imp.config.borrow_mut().pattern_auto_approval = active;
-                    imp.save_approval_switch();
-                }
-                // Process-wide, last writer wins; the settings file monitor keeps windows in step.
-                crate::always_allow::set_saved_rules_enabled(active);
-            }
-        ));
-        row
+        // The config is shared by every window, so this is the one copy. A security switch is
+        // written at once, not debounced, so a stale read or a crash in the debounce cannot
+        // bring it back on.
+        self.config_switch(
+            "Automatic Pattern Approvals",
+            "Saved Always-allow rules approve matching requests without asking. Off: every \
+             request asks, except what you allow for this session. Rules exported to an \
+             agent's own settings are that agent's to apply.",
+            |c| c.pattern_auto_approval,
+            SaveWhen::Now(|c, on| c.pattern_auto_approval = on),
+            // Process-wide, last writer wins; the settings file monitor keeps windows in step.
+            |_, on| crate::always_allow::set_saved_rules_enabled(on),
+        )
     }
 
     /// "Confirm and Customise Patterns on Save", shared like [`Self::pattern_approval_row`].
     pub(super) fn confirm_rule_row(&self) -> adw::SwitchRow {
-        let obj = self.obj();
-        let row = adw::SwitchRow::builder()
-            .title("Confirm and Customise Patterns on Save")
-            .subtitle(
-                "Prompt with an interactive dialogue to loosen or tighten patterns when choosing 'Always allow'",
-            )
-            .active(self.config.borrow().confirm_rule_modification)
-            .build();
-        row.connect_active_notify(glib::clone!(
-            #[weak]
-            obj,
-            move |row| {
-                let imp = obj.imp();
-                let active = row.is_active();
-                if imp.config.borrow().confirm_rule_modification != active {
-                    imp.config.borrow_mut().confirm_rule_modification = active;
-                    imp.save_approval_switch();
-                }
-                // Process-wide, last writer wins; the settings file monitor keeps windows in step.
-                crate::always_allow::set_confirm_rule_modification(active);
-            }
-        ));
-        row
+        self.config_switch(
+            "Confirm and Customise Patterns on Save",
+            "Prompt with an interactive dialogue to loosen or tighten patterns when choosing 'Always allow'",
+            |c| c.confirm_rule_modification,
+            SaveWhen::Now(|c, on| c.confirm_rule_modification = on),
+            // Process-wide, last writer wins; the settings file monitor keeps windows in step.
+            |_, on| crate::always_allow::set_confirm_rule_modification(on),
+        )
     }
 
     /// The "In-App Approvals and Pattern Matching" preferences group.
