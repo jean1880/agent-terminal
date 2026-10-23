@@ -129,6 +129,10 @@ pub struct TranscriptView {
     /// Per card building only its newest [`CHILD_CAP`] children: the index (into
     /// `Item::children`) of its first built child, and the button that builds the rest.
     earlier: RefCell<HashMap<ItemId, (usize, gtk4::Button)>>,
+    /// Per card whose newest children arrived away from the bottom with the window at its
+    /// budget: how many there are (the last ones of `Item::children`), not built, and the button
+    /// under the built ones that builds them.
+    later: RefCell<HashMap<ItemId, (usize, gtk4::Button)>>,
     /// Cards whose earlier children the user asked for: not capped again while they are built.
     uncapped: RefCell<HashSet<ItemId>>,
     /// A top-level row the trim passed while it held keyboard focus: kept, first in the list,
@@ -268,6 +272,7 @@ impl TranscriptView {
             tail: Cell::new(0),
             newer_queued: Cell::new(false),
             earlier: RefCell::new(HashMap::new()),
+            later: RefCell::new(HashMap::new()),
             uncapped: RefCell::new(HashSet::new()),
             pinned: RefCell::new(None),
             this: this.clone(),
@@ -468,13 +473,13 @@ impl TranscriptView {
         let adj = self.scroller.vadjustment();
         let pending = self.jump_to.borrow().clone();
         if let Some(id) = pending {
+            let row = self.rows.borrow().get(&id).map(Row::widget);
+            // In a card still opening: placed once it has opened.
+            if row.as_ref().is_some_and(|w| self.opening(w)) {
+                return;
+            }
             // Gone meanwhile, or hidden (never allocated): nothing to jump to.
-            let row = self
-                .rows
-                .borrow()
-                .get(&id)
-                .map(Row::widget)
-                .filter(WidgetExt::is_mapped);
+            let row = row.filter(WidgetExt::is_mapped);
             match row {
                 // Built since the last layout: no allocation yet (the frame tick runs before
                 // layout), and its bounds would be a stale zero-sized rectangle. A later
@@ -722,6 +727,9 @@ impl TranscriptView {
                 }
                 if let (Some(view), Some(model)) = (weak.upgrade(), weak_model.upgrade()) {
                     if let Ok(m) = model.try_borrow() {
+                        if view.stick.get() {
+                            view.build_all_later(&m);
+                        }
                         view.trim(&m);
                     }
                 }
@@ -735,7 +743,7 @@ impl TranscriptView {
         self.anchor.set(None);
         self.restore_to.set(None);
         self.jump.set_visible(false);
-        if self.tail.get() > 0 {
+        if self.tail.get() > 0 || !self.later.borrow().is_empty() {
             self.build_tail();
         }
         let adj = self.scroller.vadjustment();
@@ -745,7 +753,7 @@ impl TranscriptView {
     /// Following again with rows not built at the end: builds them (then trims to the window),
     /// or, when there are more than a window of them, starts over from the newest window as a
     /// thread open does. Never the latter while focus is in the transcript, which it would take
-    /// away.
+    /// away, or a pending request is built, whose unsent answer lives in its widgets.
     fn build_tail(&self) {
         let Some(model) = self.model.borrow().upgrade() else {
             return;
@@ -757,7 +765,8 @@ impl TranscriptView {
     }
 
     fn build_tail_of(&self, model: &Transcript) {
-        if self.tail.get() > WINDOW && !self.focus_in_list() {
+        self.build_all_later(model);
+        if self.tail.get() > WINDOW && self.may_start_over(model) {
             if let Some(this) = self.this.upgrade() {
                 this.reset(model);
                 return;
@@ -831,8 +840,12 @@ impl TranscriptView {
         // card's earlier step. Built now, it has no position until the next layout: `settle`
         // scrolls to it then, and nothing else (the fill's "keep my place" above all) moves the
         // view meanwhile.
-        if !self.rows.borrow().contains_key(id) {
-            if !(self.finish_fill() && self.rows.borrow().contains_key(id)) {
+        // A step inside a collapsed card is opened to first: hidden, it could not be shown.
+        let opened = self.open_ancestors(id);
+        if opened || !self.rows.borrow().contains_key(id) {
+            if !self.rows.borrow().contains_key(id)
+                && !(self.finish_fill() && self.rows.borrow().contains_key(id))
+            {
                 self.build_for(id);
             }
             if self.rows.borrow().contains_key(id) {
@@ -848,10 +861,68 @@ impl TranscriptView {
                 let adj = self.scroller.vadjustment();
                 self.stick.set(false);
                 self.move_to(Self::card_target(&adj, bounds.y()));
+                // Placed again after the next layout, which the move itself may change.
+                *self.jump_to.borrow_mut() = Some(id.to_owned());
                 return;
             }
         }
         self.scroll_to_end();
+    }
+
+    /// Expands every collapsed card `id` sits in, in the model (so it stays open, as if the user
+    /// had opened it) and on its built row. Whether any was collapsed.
+    fn open_ancestors(&self, id: &str) -> bool {
+        let Some(model) = self.model.borrow().upgrade() else {
+            return false;
+        };
+        let closed: Vec<ItemId> = {
+            let Ok(m) = model.try_borrow() else {
+                return false;
+            };
+            let mut closed = Vec::new();
+            let mut next = m.get(id).and_then(|i| i.parent.clone());
+            while let Some(parent) = next {
+                let item = m.get(&parent);
+                if item.is_some_and(|i| !i.expanded) {
+                    closed.push(parent.clone());
+                }
+                next = item.and_then(|i| i.parent.clone());
+            }
+            closed
+        };
+        if closed.is_empty() {
+            return false;
+        }
+        let Ok(mut m) = model.try_borrow_mut() else {
+            return false;
+        };
+        for card in &closed {
+            m.set_expanded(card, true);
+        }
+        drop(m);
+        if let Ok(m) = model.try_borrow() {
+            for card in &closed {
+                if let (Some(item), Some(row)) = (m.get(card), self.rows.borrow().get(card)) {
+                    row.update(item);
+                }
+            }
+        }
+        true
+    }
+
+    /// Whether a card `widget` sits in is still opening: it is laid out where it ends up only
+    /// once its revealer has finished.
+    fn opening(&self, widget: &gtk4::Widget) -> bool {
+        let mut at = widget.parent();
+        while let Some(w) = at.filter(|w| w != self.list.upcast_ref::<gtk4::Widget>()) {
+            if let Some(r) = w.downcast_ref::<gtk4::Revealer>() {
+                if r.reveals_child() && !r.is_child_revealed() {
+                    return true;
+                }
+            }
+            at = w.parent();
+        }
+        false
     }
 
     /// Where the view goes to show a card whose top is `y` px below the visible area's top: the
@@ -1070,6 +1141,7 @@ impl TranscriptView {
     fn unregister_tree(&self, model: &Transcript, id: &str) {
         self.rows.borrow_mut().remove(id);
         self.earlier.borrow_mut().remove(id);
+        self.later.borrow_mut().remove(id);
         self.uncapped.borrow_mut().remove(id);
         if let Some(item) = model.get(id) {
             for child in &item.children {
@@ -1086,6 +1158,7 @@ impl TranscriptView {
             }
         }
         self.earlier.borrow_mut().clear();
+        self.later.borrow_mut().clear();
         self.uncapped.borrow_mut().clear();
         self.pinned.take();
         self.tail.set(0);
@@ -1160,12 +1233,127 @@ impl TranscriptView {
     }
 
     fn set_earlier_count(button: &gtk4::Button, count: usize) {
+        Self::set_step_count(button, count, "earlier");
+    }
+
+    /// Words a step button: "3 earlier steps", "1 later step", for sight and for assistive
+    /// technology.
+    fn set_step_count(button: &gtk4::Button, count: usize, which: &str) {
         let steps = if count == 1 { "step" } else { "steps" };
-        button.set_label(&format!("{count} earlier {steps}"));
-        button.set_tooltip_text(Some("Show the steps before these"));
+        button.set_label(&format!("{count} {which} {steps}"));
+        button.set_tooltip_text(Some(if which == "later" {
+            "Show the steps after these"
+        } else {
+            "Show the steps before these"
+        }));
         button.update_property(&[gtk4::accessible::Property::Label(&format!(
-            "Show {count} earlier {steps}"
+            "Show {count} {which} {steps}"
         ))]);
+    }
+
+    /// The button under a card's built children that builds the `count` that arrived since.
+    fn later_button(&self, id: &str, count: usize) -> gtk4::Button {
+        let button = gtk4::Button::new();
+        button.add_css_class("flat");
+        button.add_css_class("later-steps");
+        button.set_halign(gtk4::Align::Start);
+        Self::set_step_count(&button, count, "later");
+        let weak = self.this.clone();
+        let id = id.to_owned();
+        button.connect_clicked(move |_| {
+            let Some(view) = weak.upgrade() else {
+                return;
+            };
+            let Some(model) = view.model.borrow().upgrade() else {
+                return;
+            };
+            if let Ok(model) = model.try_borrow() {
+                view.build_later(&model, &id, false);
+            };
+        });
+        button
+    }
+
+    /// Builds the children of card `id` that waited under its "later steps" button. `compact`
+    /// (following, or a jump, where the view moves anyway): when they are more than a card
+    /// builds, the card's steps start over from its newest [`CHILD_CAP`]. Otherwise (the user
+    /// asked, reading there) all of them are built in place below the others, so nothing above
+    /// moves; focus goes to the first of them when the button had it.
+    fn build_later(&self, model: &Transcript, id: &str, compact: bool) {
+        let Some((count, button)) = self.later.borrow_mut().remove(id) else {
+            return;
+        };
+        let (Some(item), Some(children)) = (
+            model.get(id),
+            self.rows
+                .borrow()
+                .get(id)
+                .and_then(|r| r.children_box().cloned()),
+        ) else {
+            return;
+        };
+        let n = item.children.len();
+        let start = n.saturating_sub(count);
+        let from = self.earlier.borrow().get(id).map_or(0, |(from, _)| *from);
+        let built = &item.children[from.min(start)..start];
+        let start_over = compact
+            && !self.uncapped.borrow().contains(id)
+            && count >= CHILD_CAP
+            && !built.iter().any(|c| self.protected(model, c));
+        let had_focus = button.is_focus();
+        if start_over {
+            for child in built {
+                let widget = self.rows.borrow().get(child).map(Row::widget);
+                if let Some(w) = widget {
+                    children.remove(&w);
+                }
+                self.unregister_tree(model, child);
+            }
+            children.remove(&button);
+            let from = n - CHILD_CAP;
+            for child in &item.children[from..] {
+                if let Some(w) = self.build_tree(model, child) {
+                    children.append(&w);
+                }
+            }
+            let mut earlier = self.earlier.borrow_mut();
+            match earlier.get_mut(id) {
+                Some(entry) => {
+                    entry.0 = from;
+                    Self::set_earlier_count(&entry.1, from);
+                }
+                None => {
+                    let button = self.earlier_button(id, from);
+                    children.prepend(&button);
+                    earlier.insert(id.to_owned(), (from, button));
+                }
+            }
+            return;
+        }
+        let mut first = None;
+        for child in &item.children[start..] {
+            if let Some(w) = self.build_tree(model, child) {
+                children.insert_child_after(&w, button.prev_sibling().as_ref());
+                first.get_or_insert(w);
+            }
+        }
+        if had_focus {
+            if let Some(w) = &first {
+                w.child_focus(gtk4::DirectionType::TabForward);
+            }
+        }
+        children.remove(&button);
+        if compact {
+            self.cap_children(model, id);
+        }
+    }
+
+    /// Builds every card's waiting steps: the view follows the end again.
+    fn build_all_later(&self, model: &Transcript) {
+        let cards: Vec<ItemId> = self.later.borrow().keys().cloned().collect();
+        for card in cards {
+            self.build_later(model, &card, true);
+        }
     }
 
     /// The user asked for a card's earlier children: builds them all, and keeps focus on the
@@ -1238,7 +1426,8 @@ impl TranscriptView {
             return;
         };
         let mut from = self.earlier.borrow().get(id).map_or(0, |(from, _)| *from);
-        while item.children.len().saturating_sub(from) > CHILD_CAP {
+        let later = self.later.borrow().get(id).map_or(0, |(n, _)| *n);
+        while item.children.len().saturating_sub(from + later) > CHILD_CAP {
             let oldest = &item.children[from];
             let widget = self.rows.borrow().get(oldest).map(Row::widget);
             if let Some(w) = &widget {
@@ -1281,6 +1470,22 @@ impl TranscriptView {
     /// it) is an approval, question or form waiting on the user.
     fn protected(&self, model: &Transcript, id: &str) -> bool {
         self.holds_focus(id) || Self::waits_on_user(model, id)
+    }
+
+    /// Whether the window may be taken down and built again elsewhere: nothing the user is in
+    /// the middle of lives in its widgets. Focus in the transcript would be lost, and a pending
+    /// approval, question or form keeps its unsent answer (choices, a form's fields) only in its
+    /// widgets.
+    fn may_start_over(&self, model: &Transcript) -> bool {
+        !self.focus_in_list()
+            && !self.rows.borrow().keys().any(|id| {
+                model.get(id).is_some_and(|item| match &item.body {
+                    Body::Approval(a) => a.state == ApprovalState::Pending,
+                    Body::Question(q) => q.state == QuestionState::Pending,
+                    Body::Form(f) => f.state == FormState::Pending,
+                    _ => false,
+                })
+            })
     }
 
     /// Whether the row for `id`, or a widget in it, has keyboard focus.
@@ -1337,24 +1542,31 @@ impl TranscriptView {
             let at = model
                 .get(card)
                 .and_then(|c| c.children.iter().position(|x| x == child));
-            match at {
-                Some(at) => {
-                    self.build_earlier(&model, card, at);
-                }
-                None => return,
+            let Some(at) = at else {
+                return;
+            };
+            let waiting = self.later.borrow().get(card).map_or(0, |(n, _)| *n);
+            let n = model.get(card).map_or(0, |c| c.children.len());
+            if at + waiting >= n && waiting > 0 {
+                self.build_later(&model, card, true);
+            }
+            if !self.rows.borrow().contains_key(child) {
+                self.build_earlier(&model, card, at);
             }
         }
     }
 
     /// Makes the top-level item at `index` (not built) part of the window: the rows between it
     /// and the window are built when they are at most a window's worth, or focus is in the
-    /// transcript; otherwise the window starts over at it, the rows after it built up to a
+    /// transcript or a pending request is built ([`Self::may_start_over`]); otherwise the window
+    /// starts over at it, the rows after it built up to a
     /// window (the rest load as the user scrolls either way).
     fn build_window_at(&self, model: &Transcript, index: usize) {
         let order = model.order();
         let first = self.first.get();
         let end = order.len() - self.tail.get();
-        if index >= end && (index - end < WINDOW || self.focus_in_list()) {
+        let keep = !self.may_start_over(model);
+        if index >= end && (index - end < WINDOW || keep) {
             for id in &order[end..=index] {
                 if let Some(w) = self.build_tree(model, id) {
                     self.list.append(&w);
@@ -1363,7 +1575,7 @@ impl TranscriptView {
             self.tail.set(order.len() - index - 1);
             return;
         }
-        if index < first && (first - index <= WINDOW || self.focus_in_list()) {
+        if index < first && (first - index <= WINDOW || keep) {
             let mut pin = self.pin_index(model);
             for at in (index..first).rev() {
                 self.prepend_at(model, at, &mut pin);
@@ -1484,6 +1696,35 @@ impl TranscriptView {
                             .position(|s| s == id)
                             .unwrap_or(siblings.len())
                     };
+                    let later = self.later.borrow().get(parent).map(|(n, _)| *n);
+                    if let Some(later) = later {
+                        // After steps still waiting: it waits with them.
+                        if let Some(entry) = self.later.borrow_mut().get_mut(parent) {
+                            entry.0 = later + 1;
+                            Self::set_step_count(&entry.1, later + 1, "later");
+                        }
+                        if self.stick.get() {
+                            // Following again: they are all built now.
+                            self.build_later(model, parent, true);
+                        }
+                        self.updated(model, parent);
+                        if self.stick.get() {
+                            self.trim(model);
+                        }
+                        return;
+                    } else if pos + 1 == siblings.len()
+                        && !self.stick.get()
+                        && self.rows.borrow().len() >= ROW_BUDGET
+                    {
+                        // Away from the bottom with the window at its budget: it waits, under
+                        // the built steps, as the window's own tail does. Nothing moves.
+                        let button = self.later_button(parent, 1);
+                        children.append(&button);
+                        self.later.borrow_mut().insert(parent.clone(), (1, button));
+                        self.updated(model, parent);
+                        self.jump.set_visible(true);
+                        return;
+                    }
                     let from = self.earlier.borrow().get(parent).map(|(from, _)| *from);
                     match from {
                         // Among the children not built: one more for the button to count.
@@ -1597,6 +1838,7 @@ impl TranscriptView {
     pub fn removed(&self, model: &Transcript, id: &str) {
         let row = self.rows.borrow_mut().remove(id);
         self.earlier.borrow_mut().remove(id);
+        self.later.borrow_mut().remove(id);
         self.uncapped.borrow_mut().remove(id);
         if self.pinned.borrow().as_deref() == Some(id) {
             self.pinned.take();

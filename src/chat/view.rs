@@ -3049,9 +3049,242 @@ pub(crate) mod tests {
         window.destroy();
     }
 
+    /// A live view in a presented window, and a helper that applies one finished step.
+    fn live_window() -> (ChatView, gtk4::Window, Rc<Inner>) {
+        let view = ChatView::new(StubBackend::new(Driver::Claude));
+        let window = gtk4::Window::new();
+        window.set_default_size(700, 600);
+        window.set_child(Some(&view));
+        window.present();
+        let inner = view.inner().expect("view");
+        (view, window, inner)
+    }
+
+    fn live_step(view: &ChatView, id: &str, parent: Option<&str>) {
+        use agent_core::event::{ItemKind, ItemStatus};
+        view.apply(&Envelope::item_started(
+            id,
+            ItemKind::Command,
+            format!("echo {id}"),
+            None,
+            parent,
+        ));
+        view.apply(&Envelope::item_completed(
+            id,
+            ItemStatus::Completed,
+            Some("ok"),
+            None,
+        ));
+    }
+
+    /// The first text field inside `widget`.
+    fn first_entry(widget: &gtk4::Widget) -> Option<gtk4::Editable> {
+        if let Some(e) = widget.downcast_ref::<gtk4::Editable>() {
+            return Some(e.clone());
+        }
+        let mut child = widget.first_child();
+        while let Some(c) = child {
+            if let Some(e) = first_entry(&c) {
+                return Some(e);
+            }
+            child = c.next_sibling();
+        }
+        None
+    }
+
+    /// A half-filled form keeps its widgets, and so its unsent answer, when the view returns to
+    /// the end past more than a window of rows that waited, and on a jump far from the window:
+    /// neither starts the window over while it is built.
+    pub(crate) fn a_pending_answer_survives_returning_to_the_end_and_a_far_jump() {
+        use agent_core::form::{FieldInput, Form, FormField};
+        let ctx = glib::MainContext::default();
+        let pump = || while ctx.iteration(false) {};
+        let (view, window, inner) = live_window();
+        let t = &inner.transcript;
+        for i in 0..300 {
+            live_step(&view, &format!("early-{i}"), None);
+        }
+        let form = Form::Fields {
+            fields: vec![FormField {
+                name: "repo".into(),
+                title: None,
+                description: None,
+                required: true,
+                input: FieldInput::Text {
+                    format: None,
+                    min_length: None,
+                    max_length: None,
+                    default: None,
+                },
+            }],
+        };
+        view.apply(
+            &Envelope::new(Event::FormRequested {
+                server: "github".into(),
+                message: "Which repo?".into(),
+                form,
+            })
+            .request("f"),
+        );
+        for i in 0..600 {
+            live_step(&view, &format!("mid-{i}"), None);
+        }
+        pump();
+        let card = t
+            .with_row("form:f", |r| r.widget())
+            .expect("the form is built");
+        let field = first_entry(&card).expect("a text field");
+        field.set_text("half-typed");
+        // Away (to the form), then more than a window of rows arrives and waits.
+        t.scroll_to_card("form:f");
+        for i in 0..200 {
+            live_step(&view, &format!("late-{i}"), None);
+        }
+        pump();
+        assert!(
+            t.tail_len() > transcript::WINDOW,
+            "{} waiting",
+            t.tail_len()
+        );
+        view.scroll_to_end();
+        pump();
+        let built = |id: &str| t.with_row(id, |_| ()).is_some();
+        assert!(built("late-199"), "back at the end");
+        assert_eq!(t.with_row("form:f", |r| r.widget()).as_ref(), Some(&card));
+        assert_eq!(field.text(), "half-typed", "the answer survives");
+        // A jump far above the window builds its way there instead of starting over.
+        assert!(!built("early-0"));
+        t.scroll_to_card("early-0");
+        assert!(built("early-0"));
+        assert_eq!(t.with_row("form:f", |r| r.widget()).as_ref(), Some(&card));
+        assert_eq!(field.text(), "half-typed");
+        window.destroy();
+    }
+
+    /// Steps arriving in an expanded sub-agent while the user reads inside it, away from the
+    /// end, wait once the window is at its budget: the rows stay within it and the view does
+    /// not move; returning to the end builds the newest of them.
+    pub(crate) fn nested_steps_arriving_while_reading_a_card_stay_within_the_budget() {
+        use agent_core::event::ItemKind;
+        use transcript::ROW_BUDGET;
+        let ctx = glib::MainContext::default();
+        let (view, window, inner) = live_window();
+        let t = &inner.transcript;
+        for i in 0..620 {
+            live_step(&view, &format!("s{i}"), None);
+        }
+        view.apply(&Envelope::item_started(
+            "agent",
+            ItemKind::Subagent,
+            "Agent",
+            None,
+            None,
+        ));
+        for c in 0..50 {
+            live_step(&view, &format!("agent-c{c}"), Some("agent"));
+        }
+        // Rows after the card, so a jump into it leaves the view well away from the end.
+        for i in 0..20 {
+            live_step(&view, &format!("after-{i}"), None);
+        }
+        assert!(t.row_count() <= ROW_BUDGET);
+        let top = || {
+            t.row_bounds_in_viewport("agent-c45")
+                .filter(|(b, _)| b.height() > 0.0)
+                .map(|(b, _)| b.y())
+        };
+        // Laid out (the scroller knows its content) and following the end, as a live view is
+        // before the user jumps.
+        let (_, adj) = t.scroll_parts();
+        assert!(crate::testutil::pump_until(&ctx, 10, || {
+            top().is_some()
+                && adj.upper() > adj.page_size() + 1000.0
+                && adj.value() + adj.page_size() >= adj.upper() - 1.0
+        }));
+        t.scroll_to_card("agent-c45");
+        let settle = || {
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+            let _ = crate::testutil::pump_until(&ctx, 3, || std::time::Instant::now() > until);
+        };
+        settle();
+        assert!(
+            top().is_some_and(|y| (-400.0..=400.0).contains(&y)),
+            "the jump did not reach the step: {:?} {}",
+            top(),
+            t.scroll_debug()
+        );
+        assert!(!t.last_row_overflow().expect("rows").1, "away from the end");
+        let before = top().expect("laid out");
+        for c in 50..1050 {
+            live_step(&view, &format!("agent-c{c}"), Some("agent"));
+            assert!(t.row_count() <= ROW_BUDGET, "{} rows", t.row_count());
+        }
+        // Frames go by: whatever would move the view has had its layout.
+        settle();
+        let after = top().expect("still built");
+        assert!(
+            (after - before).abs() < 1.0,
+            "the view moved: {before} -> {after}"
+        );
+        assert!(t.with_row("agent-c1049", |_| ()).is_none(), "it waits");
+        view.scroll_to_end();
+        while ctx.iteration(false) {}
+        assert!(
+            t.with_row("agent-c1049", |_| ()).is_some(),
+            "built back at the end"
+        );
+        assert!(t.row_count() <= ROW_BUDGET, "{} rows", t.row_count());
+        window.destroy();
+    }
+
+    /// A jump to a step inside a collapsed card opens the card (in the model, so it stays open)
+    /// and lands on the step.
+    pub(crate) fn a_jump_into_a_collapsed_card_lands_on_its_step() {
+        use agent_core::event::ItemKind;
+        let ctx = glib::MainContext::default();
+        let (view, window, inner) = live_window();
+        let t = &inner.transcript;
+        view.apply(&Envelope::item_started(
+            "box",
+            ItemKind::Subagent,
+            "Agent",
+            None,
+            None,
+        ));
+        for c in 0..5 {
+            live_step(&view, &format!("box-c{c}"), Some("box"));
+        }
+        inner.row_event(RowEvent::Toggle {
+            id: "box".into(),
+            expanded: false,
+        });
+        for i in 0..40 {
+            live_step(&view, &format!("after-{i}"), None);
+        }
+        assert!(crate::testutil::pump_until(&ctx, 10, || {
+            t.row_bounds_in_viewport("after-39")
+                .is_some_and(|(b, _)| b.height() > 0.0)
+        }));
+        t.scroll_to_card("box-c2");
+        assert!(inner.model.borrow().get("box").is_some_and(|i| i.expanded));
+        let landed = || {
+            t.row_bounds_in_viewport("box-c2")
+                .is_some_and(|(b, _)| b.height() > 0.0 && (0.0..=160.0).contains(&b.y()))
+        };
+        assert!(
+            crate::testutil::pump_until(&ctx, 10, landed),
+            "the jump never showed the step: {}",
+            t.scroll_debug()
+        );
+        window.destroy();
+    }
+
     pub(crate) fn ui_checks() {
         replay_fills_the_window_in_steps();
         live_append_keeps_the_window_bounded();
+        a_pending_answer_survives_returning_to_the_end_and_a_far_jump();
+        nested_steps_arriving_while_reading_a_card_stay_within_the_budget();
+        a_jump_into_a_collapsed_card_lands_on_its_step();
         cards::tests::a_closed_revealer_measures_its_child_unless_hidden();
         all_subagent_cards_toggle_together();
         model_chip_follows_pending_acceptance_and_rejection();
