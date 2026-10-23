@@ -513,6 +513,7 @@ fn one_line(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{records, Malformed};
     use serde_json::json;
 
     fn title(item: ItemKind, name: &str, input: Value) -> String {
@@ -521,10 +522,7 @@ mod tests {
 
     /// The frames of one agent, as recorded.
     fn frames(fixture: &str) -> Vec<Value> {
-        fixture
-            .lines()
-            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-            .collect()
+        records(fixture, Malformed::Skip)
     }
 
     /// Golden titles from the Claude recording: its `Bash touch x.tmp` call.

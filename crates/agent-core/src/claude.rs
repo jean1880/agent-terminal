@@ -1754,6 +1754,7 @@ fn questions_of(input: &Value) -> Vec<Question> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{stdout_frames, Malformed};
 
     #[test]
     fn only_a_refused_rate_limit_is_reported() {
@@ -1793,11 +1794,8 @@ mod tests {
     fn replay(fixture: &str) -> (ClaudeAdapter, Vec<Envelope>) {
         let mut a = ClaudeAdapter::new();
         let mut out = Vec::new();
-        for line in fixture.lines().filter(|l| !l.trim().is_empty()) {
-            let rec: Value = serde_json::from_str(line).expect("fixture line is JSON");
-            if str_of(&rec, "dir") == Some("out") {
-                out.extend(a.feed(&rec["frame"].to_string()));
-            }
+        for frame in stdout_frames(fixture, Malformed::Panic) {
+            out.extend(a.feed(&frame));
         }
         (a, out)
     }
@@ -3411,11 +3409,9 @@ mod tests {
     /// Every frame the CLI sent in a recording, fed in order.
     fn replay_w0(fixture: &str) -> Vec<Envelope> {
         let mut a = ClaudeAdapter::new();
-        fixture
-            .lines()
-            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-            .filter(|rec| rec["dir"] == "out")
-            .flat_map(|rec| a.feed(&rec["frame"].to_string()))
+        stdout_frames(fixture, Malformed::Skip)
+            .iter()
+            .flat_map(|frame| a.feed(frame))
             .collect()
     }
 

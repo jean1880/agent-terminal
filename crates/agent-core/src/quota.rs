@@ -388,6 +388,7 @@ pub fn resets_in_text(secs_left: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{records, Malformed};
     use serde_json::json;
 
     #[test]
@@ -491,10 +492,9 @@ mod tests {
     const TURN: &str = include_str!("../tests/fixtures/claude-turn-approval.ndjson");
     const CONTROLS: &str = include_str!("../tests/fixtures/claude-controls-slash.ndjson");
 
-    fn frames(fixture: &str) -> impl Iterator<Item = Value> + '_ {
-        fixture
-            .lines()
-            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+    fn frames(fixture: &str) -> impl Iterator<Item = Value> {
+        records(fixture, Malformed::Skip)
+            .into_iter()
             .map(|r| r["frame"].clone())
     }
 

@@ -28,6 +28,8 @@ pub mod quota;
 pub mod redact;
 pub mod serde_name;
 pub mod shell_words;
+#[cfg(test)]
+mod test_support;
 pub mod text;
 pub mod tool_title;
 pub mod transition;

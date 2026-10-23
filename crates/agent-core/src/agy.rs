@@ -1094,6 +1094,7 @@ impl From<&AgyUsage> for Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{records, Malformed};
 
     const EDIT: &str = include_str!("../tests/fixtures/agy-edit.ndjson");
     const HOOK: &str = include_str!("../tests/fixtures/agy-hook-approval.ndjson");
@@ -1105,8 +1106,7 @@ mod tests {
     fn replay(fixture: &str) -> Vec<Envelope> {
         let mut adapter = AgyAdapter::default();
         let mut events = Vec::new();
-        for line in fixture.lines() {
-            let rec: Value = serde_json::from_str(line).expect("fixture line");
+        for rec in records(fixture, Malformed::Panic) {
             let frame = &rec["frame"];
             match rec["dir"].as_str() {
                 Some("out") => events.extend(adapter.feed(&frame.to_string())),

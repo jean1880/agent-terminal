@@ -3355,6 +3355,7 @@ fn strings(v: &Value, key: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{records, Malformed};
 
     const TURN: &str = include_str!("../tests/fixtures/codex-synthetic-turn.ndjson");
 
@@ -4144,8 +4145,7 @@ mod tests {
             .is_empty());
         let mut events = Vec::new();
         let mut last_request: Option<String> = None;
-        for line in fixture.lines() {
-            let rec: Value = serde_json::from_str(line).expect("fixture line");
+        for rec in records(fixture, Malformed::Panic) {
             let frame = &rec["frame"];
             match rec["dir"].as_str() {
                 Some("out") => {
@@ -5222,9 +5222,8 @@ mod tests {
     const W0_EDIT: &str = include_str!("../../../tests/fixtures/real/codex/ask-edit-decline.jsonl");
 
     fn w0_request(fixture: &str, method: &str) -> String {
-        fixture
-            .lines()
-            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        records(fixture, Malformed::Skip)
+            .into_iter()
             .find(|rec| rec["frame"]["method"] == method)
             .expect("W0 approval frame")["frame"]
             .to_string()
@@ -5393,10 +5392,7 @@ mod tests {
         let mut events = Vec::new();
         let mut rest = Vec::new();
         let mut reached = false;
-        for rec in fixture
-            .lines()
-            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        {
+        for rec in records(fixture, Malformed::Skip) {
             let frame = &rec["frame"];
             if reached {
                 if rec["dir"] == "out" {
@@ -6326,9 +6322,8 @@ mod tests {
     /// action has no path); a `read` action titles `Read <path>`.
     #[test]
     fn w0_command_items_title_through_the_shared_grammar() {
-        let item = W0_SHELL
-            .lines()
-            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        let item = records(W0_SHELL, Malformed::Skip)
+            .into_iter()
             .find_map(|r| {
                 let item = &r["frame"]["params"]["item"];
                 (item["type"] == "commandExecution").then(|| item.clone())
@@ -7057,9 +7052,8 @@ mod tests {
 
     /// A frame of the recorded run, on this test's thread and turn.
     fn mcp_fixture_frame(method: &str, kind: Option<&str>) -> String {
-        MCP_APPROVAL
-            .lines()
-            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        records(MCP_APPROVAL, Malformed::Skip)
+            .into_iter()
             .find(|rec| {
                 rec["frame"]["method"] == method
                     && kind.is_none_or(|k| rec["frame"]["params"]["item"]["type"] == k)

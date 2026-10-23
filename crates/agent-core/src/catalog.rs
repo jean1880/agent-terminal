@@ -415,14 +415,14 @@ pub fn group_for_picker<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{records, Malformed};
 
     const CONTROLS: &str = include_str!("../tests/fixtures/claude-controls-slash.ndjson");
 
     /// The recorded `init-1` frame (`dir: out`), whole.
     fn init_frame() -> Value {
-        CONTROLS
-            .lines()
-            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        records(CONTROLS, Malformed::Skip)
+            .into_iter()
             .find(|r| r.pointer("/frame/response/request_id") == Some(&Value::from("init-1")))
             .expect("init-1 response in the fixture")["frame"]
             .clone()
