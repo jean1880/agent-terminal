@@ -168,6 +168,28 @@ pub fn list_sessions_in(
 /// an index keyed by `conversationId`, kept by the terminal.
 const AGY_HISTORY_WINDOW: u64 = 4 * 1024 * 1024;
 
+/// Reads up to `bytes` bytes of `file` from `start`, lossily decoded (so one corrupt record
+/// cannot hide the ones after it), one line per item. `discard_first` drops the first piece:
+/// callers that start one byte before a tail window set it, since that piece is then always a
+/// partial (or empty) line. `u64::MAX` reads to the end.
+pub(crate) fn read_line_window(
+    file: &mut std::fs::File,
+    start: u64,
+    bytes: u64,
+    discard_first: bool,
+) -> std::io::Result<Vec<String>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    file.seek(SeekFrom::Start(start))?;
+    let mut buf = Vec::new();
+    file.take(bytes).read_to_end(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf)
+        .split('\n')
+        .skip(usize::from(discard_first))
+        .map(str::to_string)
+        .collect())
+}
+
 /// One prompt row from AGY's history log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgyRow {
@@ -183,8 +205,6 @@ pub struct AgyRow {
 /// corrupt line does not hide the ones after it. `Err` means the log itself
 /// could not be read. Blocking: call it off the main thread.
 pub fn read_agy_history(path: &str) -> Result<Vec<AgyRow>, String> {
-    use std::io::{Read, Seek, SeekFrom};
-
     let path = expand_tilde(path);
     let mut file =
         std::fs::File::open(&path).map_err(|err| format!("Could not read {path}: {err}"))?;
@@ -192,16 +212,11 @@ pub fn read_agy_history(path: &str) -> Result<Vec<AgyRow>, String> {
     // As in summarize_session: start one byte early so the first piece is
     // always a partial (or empty) line that is safe to drop.
     let start = len.saturating_sub(AGY_HISTORY_WINDOW + 1);
-    file.seek(SeekFrom::Start(start))
+    let lines = read_line_window(&mut file, start, u64::MAX, start > 0)
         .map_err(|err| format!("Could not read {path}: {err}"))?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|err| format!("Could not read {path}: {err}"))?;
-    let text = String::from_utf8_lossy(&bytes);
 
-    let mut rows: Vec<AgyRow> = text
-        .split('\n')
-        .skip(usize::from(start > 0))
+    let mut rows: Vec<AgyRow> = lines
+        .iter()
         .filter_map(|line| {
             let record: serde_json::Value = serde_json::from_str(line).ok()?;
             let id = record.get("conversationId")?.as_str()?;
@@ -362,7 +377,7 @@ pub(crate) fn summarize_session(
     modified: std::time::SystemTime,
     title_pointer: Option<&str>,
 ) -> SessionSummary {
-    use std::io::{BufRead, Read, Seek, SeekFrom};
+    use std::io::{BufRead, Read};
 
     // A cheap substring test before parsing: most lines are large tool output
     // that mentions neither key, and parsing them all would dominate the scan.
@@ -418,11 +433,9 @@ pub(crate) fn summarize_session(
     // on a newline.
     let mut tail_title = None;
     let tail_start = len.saturating_sub(SUMMARY_WINDOW + 1);
-    if len > SUMMARY_WINDOW && file.seek(SeekFrom::Start(tail_start)).is_ok() {
-        let mut bytes = Vec::new();
-        if file.read_to_end(&mut bytes).is_ok() {
-            let text = String::from_utf8_lossy(&bytes);
-            tail_title = text.split('\n').skip(1).filter_map(title_of).last();
+    if len > SUMMARY_WINDOW {
+        if let Ok(lines) = read_line_window(&mut file, tail_start, u64::MAX, true) {
+            tail_title = lines.iter().rev().find_map(|line| title_of(line));
         }
     }
 
@@ -435,6 +448,30 @@ pub(crate) fn summarize_session(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn a_line_window_is_bounded_lossy_and_drops_its_first_piece_only_when_asked() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        std::fs::write(&path, b"one\ntw\xffo\nthree\n").unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        assert_eq!(
+            read_line_window(&mut file, 0, u64::MAX, false).unwrap(),
+            ["one", "tw\u{fffd}o", "three", ""]
+        );
+        assert_eq!(
+            read_line_window(&mut file, 0, 6, false).unwrap(),
+            ["one", "tw"]
+        );
+        assert_eq!(
+            read_line_window(&mut file, 1, u64::MAX, true).unwrap(),
+            ["tw\u{fffd}o", "three", ""]
+        );
+        assert_eq!(
+            read_line_window(&mut file, 0, u64::MAX, true).unwrap(),
+            ["tw\u{fffd}o", "three", ""]
+        );
+    }
 
     #[test]
     fn session_ids_that_could_escape_are_rejected() {
