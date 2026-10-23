@@ -650,6 +650,21 @@ impl Inner {
     }
 
     fn handle(self: &Rc<Self>, changes: Vec<Change>) {
+        // The shelf reads only approvals, questions and forms: a streamed delta (an assistant,
+        // reasoning or tool item's update) or a new row of another kind never moves it, so
+        // only other changes rescan the transcript for it.
+        let shelf = {
+            let model = self.model.borrow();
+            changes.iter().any(|change| match change {
+                Change::Added(id) | Change::Updated(id) => model.get(id).is_none_or(|item| {
+                    matches!(
+                        item.body,
+                        model::Body::Approval(_) | model::Body::Question(_) | model::Body::Form(_)
+                    )
+                }),
+                _ => true,
+            })
+        };
         // A sub-agent or one of its steps coming or changing moves the explorer: noted here,
         // refreshed with the next flush, once per frame (other items never touch it).
         {
@@ -716,7 +731,9 @@ impl Inner {
         self.refresh_agent_chip();
         self.header
             .set_extra_access(self.model.borrow().extra_access());
-        self.interruption.update(&self.model.borrow());
+        if shelf {
+            self.interruption.update(&self.model.borrow());
+        }
     }
 
     fn queue_flush(self: &Rc<Self>) {
@@ -746,7 +763,8 @@ impl Inner {
     /// updating the `changed` ones), from the model.
     fn refresh_subagents(&self, changed: &[String]) {
         let model = self.model.borrow();
-        let agents = model.subagents_with(self.delegation.borrow().summaries());
+        let own = model.subagents();
+        let agents = Transcript::with_supervised(own.clone(), self.delegation.borrow().summaries());
         // Every sub-agent the thread started: the running ones first, then the finished ones
         // with how they ended (a replayed thread, or one whose sub-agents are all done, still
         // lists them).
@@ -758,7 +776,7 @@ impl Inner {
         }
         drop(model);
         // A background sub-agent's row opens once its item is known.
-        self.refresh_background();
+        self.refresh_background(&own, &agents);
     }
 
     /// Expands every sub-agent card in the thread, or collapses them all when every one is
@@ -877,12 +895,16 @@ impl Inner {
     }
 
     /// Where a background task leads: its sub-agent's panel, or its output (`None`: nothing).
-    fn background_target(&self, task: &BackgroundTask) -> Option<BackgroundTarget> {
+    /// `own`: the model's [`Transcript::subagents`], computed once by the caller.
+    fn background_target(
+        &self,
+        task: &BackgroundTask,
+        own: &[model::SubagentSummary],
+    ) -> Option<BackgroundTarget> {
         if task.kind == BackgroundTaskKind::Agent {
             // Claude's tasks name their `Agent` call; a provider worker is its own item.
             let id = task.tool_use_id.as_deref().unwrap_or(&task.id);
-            let known = self.model.borrow().subagents().iter().any(|a| a.id == id)
-                || self.delegation.borrow().has_worker(id);
+            let known = own.iter().any(|a| a.id == id) || self.delegation.borrow().has_worker(id);
             return known.then(|| BackgroundTarget::Subagent(id.to_owned()));
         }
         self.backend
@@ -892,16 +914,19 @@ impl Inner {
             .then_some(BackgroundTarget::Output)
     }
 
-    /// The strip's background task list, from the model.
-    fn refresh_background(&self) {
-        let tasks = self
-            .model
-            .borrow()
-            .background_tasks_with(self.delegation.borrow().summaries());
+    /// The strip's background task list, from the model. `own` and `agents`: the model's
+    /// [`Transcript::subagents`] and [`Transcript::subagents_with`] the delegation registry's
+    /// workers, which the caller has already computed.
+    fn refresh_background(
+        &self,
+        own: &[model::SubagentSummary],
+        agents: &[model::SubagentSummary],
+    ) {
+        let tasks = self.model.borrow().background_with(agents);
         let listed = tasks
             .into_iter()
             .map(|task| background::ListedTask {
-                openable: self.background_target(&task).is_some(),
+                openable: self.background_target(&task, own).is_some(),
                 task,
             })
             .collect();
@@ -909,7 +934,8 @@ impl Inner {
     }
 
     fn open_background(self: &Rc<Self>, task: &BackgroundTask) {
-        match self.background_target(task) {
+        let own = self.model.borrow().subagents();
+        match self.background_target(task, &own) {
             Some(BackgroundTarget::Subagent(id)) => self.open_subagent(&id),
             Some(BackgroundTarget::Output) => self.open_task_output(task),
             None => {}
@@ -1007,21 +1033,21 @@ impl Inner {
         let running = status.running_turn || self.model.borrow().running;
         // The header counts background work too, delegated workers included; the stop button
         // follows the main turn only.
-        let (activity, sub_agents) = {
+        // Every sub-agent, walked out of the model once for everything below.
+        let (activity, sub_agents, own, agents) = {
             let model = self.model.borrow();
             let workers = self.delegation.borrow();
-            let supervised = workers.summaries();
+            let own = model.subagents();
+            let agents = Transcript::with_supervised(own.clone(), workers.summaries());
             // A worker waiting on the user holds up the thread as the agent's own request would;
             // an approval outranks a question, whoever asks.
-            let activity = match (
-                model.activity_with(running, supervised.clone()),
-                workers.needs_user(),
-            ) {
+            let activity = match (model.activity_among(running, &agents), workers.needs_user()) {
                 (own @ model::Activity::NeedsApproval, _) => own,
                 (_, Some(needs)) => needs,
                 (own, None) => own,
             };
-            (activity, model.running_drivers(supervised))
+            let drivers = Transcript::running_drivers_among(&agents);
+            (activity, drivers, own, agents)
         };
         // The agent's own start, resume or pause shows in the header only: the strip by the
         // composer keeps the turn's own activity.
@@ -1034,7 +1060,7 @@ impl Inner {
             status.driver.info().label,
         );
         self.thinking.set(&activity, status.driver, &sub_agents);
-        self.refresh_background();
+        self.refresh_background(&own, &agents);
         self.composer.set_running(running, stop_note.as_deref());
         self.refresh_agent_chip();
         self.header

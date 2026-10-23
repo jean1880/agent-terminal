@@ -981,8 +981,17 @@ impl Transcript {
     /// Every sub-agent of the thread whatever started it: [`Self::subagents`], plus `supervised`,
     /// the delegation registry's workers. Registry handles are canonical; a linked snapshot of a
     /// supervised worker in this stream must not make a second row for it.
+    #[cfg(test)]
     pub fn subagents_with(&self, supervised: Vec<SubagentSummary>) -> Vec<SubagentSummary> {
-        let mut agents = self.subagents();
+        Self::with_supervised(self.subagents(), supervised)
+    }
+
+    /// `own` ([`Self::subagents`], computed once by a caller that needs it too) with
+    /// `supervised` merged in as [`Self::subagents_with`] does.
+    pub fn with_supervised(
+        mut agents: Vec<SubagentSummary>,
+        supervised: Vec<SubagentSummary>,
+    ) -> Vec<SubagentSummary> {
         agents.retain(|agent| {
             !agent.delegation.as_ref().is_some_and(|delegation| {
                 supervised
@@ -996,8 +1005,13 @@ impl Transcript {
 
     /// The agents the thread's running sub-agents are on (any route: the agent's own, the
     /// provider's workers, the delegation registry's `supervised`), each once, in slot order.
+    #[cfg(test)]
     pub fn running_drivers(&self, supervised: Vec<SubagentSummary>) -> Vec<Driver> {
-        let agents = self.subagents_with(supervised);
+        Self::running_drivers_among(&self.subagents_with(supervised))
+    }
+
+    /// [`Self::running_drivers`] of `agents`, a [`Self::subagents_with`] the caller already has.
+    pub fn running_drivers_among(agents: &[SubagentSummary]) -> Vec<Driver> {
         Driver::ALL
             .into_iter()
             .filter(|&driver| {
@@ -1018,7 +1032,14 @@ impl Transcript {
     /// [`Self::activity`], counting `supervised` (the delegation registry's workers) as the
     /// thread's sub-agents: a parent whose turn is over while a delegated worker runs is waiting
     /// on it, not finished.
+    #[cfg(test)]
     pub fn activity_with(&self, main_running: bool, supervised: Vec<SubagentSummary>) -> Activity {
+        self.activity_among(main_running, &self.subagents_with(supervised))
+    }
+
+    /// [`Self::activity_with`], given `agents`: a [`Self::subagents_with`] the caller already
+    /// has, so a status refresh walks the items once.
+    pub fn activity_among(&self, main_running: bool, agents: &[SubagentSummary]) -> Activity {
         if let Some(pending) = self.pending_interruption() {
             return match pending {
                 PendingInterruption::Approval { .. } => Activity::NeedsApproval,
@@ -1027,7 +1048,6 @@ impl Transcript {
                 }
             };
         }
-        let agents = self.subagents_with(supervised);
         if main_running && !self.waiting_for.is_empty() {
             return Activity::WaitingForWorkers {
                 names: self
@@ -1043,7 +1063,7 @@ impl Transcript {
                     .collect(),
             };
         }
-        let background = self.background_with(&agents);
+        let background = self.background_with(agents);
         if main_running {
             for id in self.order.iter().rev() {
                 match self.items.get(id).map(|item| &item.body) {
@@ -1077,15 +1097,13 @@ impl Transcript {
     /// Everything running in the background: the agent's task list, then the provider's workers
     /// still at work (a worker's id is its sub-agent item's).
     pub fn background_tasks(&self) -> Vec<BackgroundTask> {
-        self.background_tasks_with(Vec::new())
+        self.background_with(&self.subagents())
     }
 
     /// [`Self::background_tasks`], with the delegation registry's workers.
-    pub fn background_tasks_with(&self, supervised: Vec<SubagentSummary>) -> Vec<BackgroundTask> {
-        self.background_with(&self.subagents_with(supervised))
-    }
-
-    fn background_with(&self, agents: &[SubagentSummary]) -> Vec<BackgroundTask> {
+    /// [`Self::background_tasks`], counting `agents` (a [`Self::subagents_with`] the caller
+    /// already has, the delegation registry's workers included).
+    pub fn background_with(&self, agents: &[SubagentSummary]) -> Vec<BackgroundTask> {
         let mut background = self.background.clone();
         for worker in agents
             .iter()
