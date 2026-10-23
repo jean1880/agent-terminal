@@ -728,6 +728,41 @@ impl Supervisor {
         }
         result
     }
+    /// Refuses `worker` if the agy bridge that presented its capability no longer passes the
+    /// process census. A capability not yet presented has no bridge to check.
+    async fn bridge_census_unchanged(&self, worker: &WorkerId) -> Result<(), ToolError> {
+        let peer_info = {
+            let state = self.state.borrow();
+            state
+                .workers
+                .get(worker)
+                .and_then(|w| w.token.as_ref())
+                .and_then(|t| t.pid.zip(t.consumed_by))
+        };
+        let Some((pid, peer)) = peer_info else {
+            return Ok(());
+        };
+        let bridge = self.services.bridge_command.clone();
+        let valid = gio::spawn_blocking(move || {
+            use std::os::unix::fs::MetadataExt;
+            let facts = super::ipc::peer::RealProc;
+            std::fs::metadata(bridge).ok().is_some_and(|m| {
+                agent_core::delegation::agy_guard::census_ok(
+                    &super::ipc::peer::census(&facts, pid, (m.dev(), m.ino())),
+                    peer,
+                )
+            })
+        })
+        .await
+        .unwrap_or(false);
+        if !valid {
+            return Err(error(
+                ErrorCode::WorkspaceUntrusted,
+                "agy bridge process census changed",
+            ));
+        }
+        Ok(())
+    }
     async fn check_agy(&self, worker: &WorkerId) -> Result<(), ToolError> {
         if !self.profile_available(worker) {
             return Err(error(ErrorCode::ProviderUnavailable, "profile unavailable"));
@@ -754,35 +789,7 @@ impl Supervisor {
             ));
         }
         if let Some(actual) = actual {
-            let peer_info = {
-                let state = self.state.borrow();
-                state
-                    .workers
-                    .get(worker)
-                    .and_then(|w| w.token.as_ref())
-                    .and_then(|t| t.pid.zip(t.consumed_by))
-            };
-            if let Some((pid, peer)) = peer_info {
-                let bridge = self.services.bridge_command.clone();
-                let valid = gio::spawn_blocking(move || {
-                    use std::os::unix::fs::MetadataExt;
-                    let facts = super::ipc::peer::RealProc;
-                    std::fs::metadata(bridge).ok().is_some_and(|m| {
-                        agent_core::delegation::agy_guard::census_ok(
-                            &super::ipc::peer::census(&facts, pid, (m.dev(), m.ino())),
-                            peer,
-                        )
-                    })
-                })
-                .await
-                .unwrap_or(false);
-                if !valid {
-                    return Err(error(
-                        ErrorCode::WorkspaceUntrusted,
-                        "agy bridge process census changed",
-                    ));
-                }
-            }
+            self.bridge_census_unchanged(worker).await?;
             return self.check_agy_launch_facts(actual).await;
         }
         let (profile, cwd) = {
@@ -805,35 +812,7 @@ impl Supervisor {
         ))
         .await
         .is_err();
-        let peer_info = {
-            let state = self.state.borrow();
-            state
-                .workers
-                .get(worker)
-                .and_then(|w| w.token.as_ref())
-                .and_then(|t| t.pid.zip(t.consumed_by))
-        };
-        if let Some((pid, peer)) = peer_info {
-            let bridge = self.services.bridge_command.clone();
-            let valid = gio::spawn_blocking(move || {
-                use std::os::unix::fs::MetadataExt;
-                let facts = super::ipc::peer::RealProc;
-                std::fs::metadata(bridge).ok().is_some_and(|m| {
-                    agent_core::delegation::agy_guard::census_ok(
-                        &super::ipc::peer::census(&facts, pid, (m.dev(), m.ino())),
-                        peer,
-                    )
-                })
-            })
-            .await
-            .unwrap_or(false);
-            if !valid {
-                return Err(error(
-                    ErrorCode::WorkspaceUntrusted,
-                    "agy bridge process census changed",
-                ));
-            }
-        }
+        self.bridge_census_unchanged(worker).await?;
         let limits = self.limits;
         let bridge_command = self.services.bridge_command.clone();
         gio::spawn_blocking(move || {
