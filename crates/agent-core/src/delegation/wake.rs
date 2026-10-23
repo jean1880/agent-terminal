@@ -92,6 +92,8 @@ pub struct Queue {
     fresh: usize,
     /// Why the last offer was held, so a hold is logged once per reason rather than per retry.
     held_for: Option<&'static str>,
+    /// Bumped by every [`Self::clear`]: news taken before it is never put back after it.
+    cleared: u64,
 }
 
 impl Queue {
@@ -164,6 +166,24 @@ impl Queue {
         self.dropped = 0;
         self.fresh = 0;
         self.held_for = None;
+        self.cleared = self.cleared.wrapping_add(1);
+    }
+
+    /// Which clearing the queue is at: taken items carry it, and are put back only with
+    /// [`Self::restore_taken`] while it holds.
+    pub fn generation(&self) -> u64 {
+        self.cleared
+    }
+
+    /// [`Self::restore`], unless the queue was cleared (the parent stopped or closed) since
+    /// the items were taken at `generation`: what a stop discarded stays discarded. True when
+    /// they were put back.
+    pub fn restore_taken(&mut self, generation: u64, items: Vec<Item>, dropped: usize) -> bool {
+        if generation != self.cleared {
+            return false;
+        }
+        self.restore(items, dropped);
+        true
     }
 
     /// How many of the waiting items arrived since the parent's thread was last told of them.
@@ -490,6 +510,25 @@ mod tests {
         let sent = with_user_prompt("news", "carry on");
         assert!(sent.starts_with("news\n\n[agent-terminal] The user's message follows."));
         assert!(sent.ends_with("\n\ncarry on"));
+    }
+
+    /// Items taken before a clear (the parent was stopped or closed) are never put back after
+    /// it; taken after it, they are.
+    #[test]
+    fn a_clear_since_the_take_keeps_taken_items_discarded() {
+        let mut q = Queue::default();
+        q.push(item('a', Outcome::Completed, "r", Shown::Event(1)));
+        let generation = q.generation();
+        let (taken, dropped) = q.take();
+        q.clear();
+        assert!(!q.restore_taken(generation, taken, dropped));
+        assert_eq!(q.pending(), 0, "what the stop discarded stays discarded");
+
+        q.push(item('b', Outcome::Completed, "r", Shown::Event(2)));
+        let generation = q.generation();
+        let (taken, dropped) = q.take();
+        assert!(q.restore_taken(generation, taken, dropped));
+        assert_eq!(q.pending(), 1);
     }
 
     /// The thread is told of new items once: a restore, a take or a repeat offer does not make

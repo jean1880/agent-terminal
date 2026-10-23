@@ -580,3 +580,42 @@ fn leaving_dangerous_permissive_mode_wakes_the_root_with_the_held_news() {
         stop(&sup).await;
     });
 }
+
+/// News taken for a user's message that the user then stops is discarded with the stop: the
+/// message's teardown giving it back does not bring it back, and the user's next message does
+/// not carry it.
+#[test]
+fn held_news_taken_before_a_stop_is_never_put_back() {
+    in_context(async {
+        let (dir, sup, root) = harness();
+        let r = root_session(&sup, dir.path(), &root).await;
+        r.session.confirm_mode(Mode::Bypass);
+        let worker = worker_of(
+            &sup.spawn_worker(&root, spawn_request("wake-bypass-stop"))
+                .await
+                .unwrap(),
+        );
+        completed(&sup, &worker).await;
+        pump_until(|| held_notices(&r) == 1).await;
+        let taken = sup.take_held_news(&root).expect("held news");
+        assert_eq!(pending(&sup, &root), 0);
+        sup.root_stop(&r.thread);
+        // The stopped start's teardown drops what rode on it.
+        drop(taken);
+        assert_eq!(
+            pending(&sup, &root),
+            0,
+            "what the stop discarded stays discarded"
+        );
+
+        r.session.send_prompt("start over");
+        pump_until(|| r.prompts().contains("start over")).await;
+        assert!(
+            !r.prompts().contains(&format!("{worker}) finished")),
+            "{}",
+            r.prompts()
+        );
+        r.session.shutdown(false);
+        stop(&sup).await;
+    });
+}

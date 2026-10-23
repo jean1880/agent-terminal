@@ -198,7 +198,9 @@ Architectural mandates, standards, and workflows for this codebase.
   waits, nothing retries it on a timer, and it goes, framed the same way, with the user's next
   message, a live one mid-turn included (never a slash command, never beside a handoff), or as
   an ordinary wake once the mode is left. It is spent, and its notice posted, only once that
-  message reaches a process; a message that never does gives it back, exactly once.
+  message reaches a process (for Codex, only once its thread is up: never into the adapter's
+  own queue); a message that never does gives it back, exactly once, unless a stop or close
+  discarded it meanwhile.
 - **A folder grant is session-only and never wider than its card**: "Allow for session" on an
   edit keeps the file's folder (`always_allow::session_folder`): inside the workspace, or at
   least two levels inside home outside it; never `/`, home or above, and nothing when home is

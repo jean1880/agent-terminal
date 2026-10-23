@@ -342,12 +342,18 @@ impl Inner {
     /// The sub-agent news held for the user ([`WakeOutcome::HeldForUser`]) that rides on the
     /// user's own prompt `text`, in dangerous permissive mode only: never on a slash command (it
     /// would stop being one) nor beside a `handoff`, which frames what rides with it as the
-    /// user's message. It waits for the next prompt then.
+    /// user's message, nor while a prompt could wait inside the adapter, out of the session's
+    /// sight: Codex keeps prompts in its own queue until its thread has started or resumed, and
+    /// drops them if that fails, so news is attached only once this process reported its
+    /// session. It waits for the next prompt then.
     pub(super) fn news_for_prompt(&self, text: &str, handoff: bool) -> Option<TakenNews> {
+        let adapter_may_queue =
+            self.adapter.borrow().driver() == Driver::Codex && !self.provider_session_up.get();
         if handoff
             || self.child.is_some()
             || self.state.borrow().mode != Mode::Bypass
             || Self::is_slash_command(text)
+            || adapter_may_queue
         {
             return None;
         }

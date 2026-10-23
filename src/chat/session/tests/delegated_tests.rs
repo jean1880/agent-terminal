@@ -2111,6 +2111,49 @@ fn held_news_in_a_refused_launch_is_given_back_once_and_goes_with_the_resend() {
     });
 }
 
+/// Codex holds a prompt in its own queue until its thread has started or resumed, and drops it
+/// if that fails: held news is never attached to a prompt sent before then (it stays held, no
+/// notice), and is once the thread is up.
+#[test]
+fn held_news_waits_until_the_codex_thread_is_up() {
+    in_loop(|ctx| {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let thread = fresh(&store, &dir.path().to_string_lossy());
+        let (sink, seen) = make_sink();
+        let session = ChatSession::with_env(
+            Box::new(CodexAdapter::new()),
+            codex_open(dir.path(), Mode::Ask),
+            store,
+            thread,
+            sink,
+            Err(None),
+            bare_env(dir.path()),
+        );
+        let started = || has(&seen, |e| matches!(e, Event::SessionStarted { .. }));
+        assert!(!started(), "the thread answers only once the loop runs");
+        session.confirm_mode(Mode::Bypass);
+        let news = Rc::new(FakeNews::default());
+        *news.text.borrow_mut() = Some("[agent-terminal] held news".into());
+        session.hold_news_for_user(news.clone());
+
+        session.send_prompt("before the thread is up");
+        assert_eq!(news.taken.get(), 0, "never into the adapter's own queue");
+        assert!(!has(&seen, |e| matches!(
+            e,
+            Event::Notice { text } if text.contains("held news")
+        )));
+
+        assert!(pump_until(ctx, 10, started));
+        let taken = session.inner.news_for_prompt("now", false);
+        assert!(taken.is_some(), "attached once the thread is up");
+        assert_eq!(news.taken.get(), 1);
+        drop(taken);
+        assert_eq!(news.given_back.get(), 1, "an unsent take is given back");
+        session.shutdown(false);
+    });
+}
+
 /// A message the user writes while a turn runs (live input) carries held news like any other:
 /// framed ahead of it, shown as the app's notice, and taken from the supervisor.
 #[test]

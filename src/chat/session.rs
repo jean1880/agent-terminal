@@ -433,6 +433,10 @@ struct Inner {
     /// Sub-agent news the supervisor holds for the user while this root is in dangerous
     /// permissive mode ([`delegated::HeldNews`]).
     held_news: RefCell<Option<Rc<dyn delegated::HeldNews>>>,
+    /// The current process reported its native session (`Event::SessionStarted`): a Codex
+    /// prompt is written at once from then on, never held in the adapter's own queue. Reset by
+    /// every start.
+    provider_session_up: Cell<bool>,
 }
 
 /// What the session decided about one Codex permission request, keyed by the id the view knows
@@ -828,6 +832,7 @@ impl ChatSession {
             auto_wakes: Cell::new(0),
             wakes_held: Cell::new(false),
             held_news: RefCell::new(None),
+            provider_session_up: Cell::new(false),
         });
         *inner.weak_self.borrow_mut() = Some(Rc::downgrade(&inner));
         inner.attach_approval();
@@ -1093,6 +1098,7 @@ impl Inner {
             } => {
                 // The agent is up: a switch to it can no longer roll back.
                 *self.rollback.borrow_mut() = None;
+                self.provider_session_up.set(true);
                 self.confirm_carried();
                 self.mark_up();
                 if !native_id.is_empty() {
@@ -1499,6 +1505,7 @@ impl Inner {
         self.generation.set(generation);
         self.resuming.set(self.suspended.replace(false));
         self.reported.set(false);
+        self.provider_session_up.set(false);
         // A fresh native session (no resume: a new thread, a switch) has nothing to resume yet,
         // whatever the previous one had.
         self.has_conversation

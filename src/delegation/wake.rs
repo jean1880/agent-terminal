@@ -172,12 +172,12 @@ impl Supervisor {
             self.schedule_wake(root, WAKE_RETRY);
             return;
         }
-        let Some((items, dropped)) = self
+        let Some((generation, (items, dropped))) = self
             .state
             .borrow_mut()
             .wakes
             .get_mut(root)
-            .map(|q| q.take())
+            .map(|q| (q.generation(), q.take()))
         else {
             return;
         };
@@ -196,7 +196,7 @@ impl Supervisor {
             WakeOutcome::Busy => {
                 let count = items.len();
                 if let Some(queue) = self.state.borrow_mut().wakes.get_mut(root) {
-                    queue.restore(items, dropped);
+                    queue.restore_taken(generation, items, dropped);
                 }
                 let reason = session.wake_blocker().unwrap_or("its root is busy");
                 self.note_hold(root, reason, count);
@@ -206,7 +206,7 @@ impl Supervisor {
                 let fresh = {
                     let mut state = self.state.borrow_mut();
                     state.wakes.get_mut(root).map_or(0, |queue| {
-                        queue.restore(items, dropped);
+                        queue.restore_taken(generation, items, dropped);
                         let fresh = queue.unannounced();
                         queue.announced();
                         fresh
@@ -247,8 +247,8 @@ impl Supervisor {
 
     /// Takes `root`'s news for the user's prompt ([`HeldNews::take`]): nothing while its tree is
     /// closed or being rebound, which the normal wake waits out.
-    fn take_held_news(self: &Rc<Self>, root: &WorkerId) -> Option<TakenNews> {
-        let (items, dropped) = {
+    pub(super) fn take_held_news(self: &Rc<Self>, root: &WorkerId) -> Option<TakenNews> {
+        let (generation, (items, dropped)) = {
             let mut state = self.state.borrow_mut();
             let r = state.roots.get(root);
             if state.shutting_down
@@ -262,7 +262,7 @@ impl Supervisor {
                 return None;
             }
             queue.delivered();
-            queue.take()
+            (queue.generation(), queue.take())
         };
         info!(%root, items = items.len(), "sub-agent news taken for the user's message");
         let text = wake::frame(&items, dropped, wake::WAKE_BUDGET);
@@ -280,11 +280,21 @@ impl Supervisor {
                     warn!(%root, items = count, "sub-agent news could not be put back; it stays in the mailbox");
                     return;
                 };
-                if let Some(queue) = state.wakes.get_mut(&root) {
-                    queue.restore(items, dropped);
-                }
+                // A stop or close since it was taken discarded it (the queue was cleared): it
+                // stays discarded, in the mailbox only.
+                let open =
+                    !state.shutting_down && state.roots.get(&root).is_some_and(|r| !r.closed);
+                let restored = open
+                    && state
+                        .wakes
+                        .get_mut(&root)
+                        .is_some_and(|queue| queue.restore_taken(generation, items, dropped));
                 drop(state);
-                info!(%root, items = count, "sub-agent news put back: the user's message was not sent");
+                if restored {
+                    info!(%root, items = count, "sub-agent news put back: the user's message was not sent");
+                } else {
+                    info!(%root, items = count, "sub-agent news not put back: its root was stopped or closed since");
+                }
             }),
         ))
     }
