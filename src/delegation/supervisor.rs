@@ -89,12 +89,8 @@ mod tests {
         static TEST_CATALOG: RefCell<Option<super::super::services::CatalogServices>> =
             const { RefCell::new(None) };
     }
-    fn caps_call(id: u64, refresh: bool) -> agent_core::delegation::ipc::Call {
-        let request =
-            ToolRequest::Capabilities(agent_core::delegation::wire::CapabilitiesRequest {
-                profile_id: None,
-                refresh,
-            });
+    /// `request` as the bridge sends it, with call id `id`.
+    fn call(id: u64, request: ToolRequest) -> agent_core::delegation::ipc::Call {
         agent_core::delegation::ipc::Call {
             id,
             tool: request.tool(),
@@ -102,6 +98,15 @@ mod tests {
             timeout_ms: 1000,
             invocation: None,
         }
+    }
+    fn caps_call(id: u64, refresh: bool) -> agent_core::delegation::ipc::Call {
+        call(
+            id,
+            ToolRequest::Capabilities(agent_core::delegation::wire::CapabilitiesRequest {
+                profile_id: None,
+                refresh,
+            }),
+        )
     }
     /// Capabilities lists the catalogue's models with their tags and effort per tier, each
     /// profile's usage (never its account), the vocabulary and the effort policy.
@@ -234,9 +239,6 @@ mod tests {
             std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         let store = Rc::new(Store::open_in_memory().expect("store"));
-        let thread = store
-            .create_thread(&dir.path().to_string_lossy(), Some("root"))
-            .expect("thread");
         let profile = Profile {
             id: "fixture".into(),
             name: "Fixture".into(),
@@ -314,20 +316,6 @@ mod tests {
                 .with(|c| c.borrow_mut().take())
                 .unwrap_or_default(),
         };
-        let root = store
-            .create_delegation_root(&NewRoot {
-                thread: thread.clone(),
-                driver: Driver::Claude,
-                profile_id: ProfileId::parse("fixture").unwrap(),
-                name: "root".into(),
-                policy_json: "{}".into(),
-            })
-            .expect("root");
-        let row = store.delegation_root(&root.root).unwrap().unwrap();
-        let worker = store
-            .delegation_worker(root.worker.as_str())
-            .unwrap()
-            .unwrap();
         let runtime_dir = RuntimeDir::from_verified(dir.path().to_owned());
         let sup = Rc::new_cyclic(|weak| Supervisor {
             services,
@@ -340,37 +328,32 @@ mod tests {
             salt: [8; 16],
             weak: weak.clone(),
         });
-        let mut rt = sup.worker_rt(worker, root.worker.clone(), dir.path().to_owned());
-        rt.mode = Mode::Ask;
-        {
-            let mut state = sup.state.borrow_mut();
-            state.roots.insert(
-                root.worker.clone(),
-                RootRt {
-                    row,
-                    revoking: false,
-                    revision: 0,
-                    closed: false,
-                    transferring: false,
-                },
-            );
-            state.threads.insert(thread, root.worker.clone());
-            state.workers.insert(root.worker.clone(), rt);
-        }
-        (dir, sup, root.worker)
+        let (_, root) = insert_root(&sup, dir.path(), "root", "root", Some(Mode::Ask));
+        (dir, sup, root)
     }
     /// Another thread with its own delegation root, beside the harness's: (thread, root).
     fn add_root(sup: &Rc<Supervisor>, dir: &std::path::Path) -> (String, WorkerId) {
+        insert_root(sup, dir, "second root", "second root", Some(Mode::Ask))
+    }
+    /// A new thread titled `title` with a delegation root `name` in `dir`, registered with the
+    /// supervisor: (thread, root). `mode` is the root's runtime mode, if one is set.
+    fn insert_root(
+        sup: &Rc<Supervisor>,
+        dir: &std::path::Path,
+        title: &str,
+        name: &str,
+        mode: Option<Mode>,
+    ) -> (String, WorkerId) {
         let store = sup.services.handle.reader();
         let thread = store
-            .create_thread(&dir.to_string_lossy(), Some("second root"))
+            .create_thread(&dir.to_string_lossy(), Some(title))
             .expect("thread");
         let root = store
             .create_delegation_root(&NewRoot {
                 thread: thread.clone(),
                 driver: Driver::Claude,
                 profile_id: ProfileId::parse("fixture").unwrap(),
-                name: "second root".into(),
+                name: name.into(),
                 policy_json: "{}".into(),
             })
             .expect("root");
@@ -380,7 +363,9 @@ mod tests {
             .unwrap()
             .unwrap();
         let mut rt = sup.worker_rt(worker, root.worker.clone(), dir.to_owned());
-        rt.mode = Mode::Ask;
+        if let Some(mode) = mode {
+            rt.mode = mode;
+        }
         let mut state = sup.state.borrow_mut();
         state.roots.insert(
             root.worker.clone(),
@@ -476,16 +461,91 @@ mod tests {
         .unwrap();
     }
     async fn tool(sup: &Rc<Supervisor>, conn: ConnId, id: u64, request: ToolRequest) -> Value {
-        let call = agent_core::delegation::ipc::Call {
-            id,
-            tool: request.tool(),
-            args: request.args_value(),
-            timeout_ms: 1000,
-            invocation: None,
-        };
-        match sup.call(conn, call).await {
+        match sup.call(conn, call(id, request)).await {
             agent_core::delegation::ipc::CallOutcome::Ok(v) => v,
             agent_core::delegation::ipc::CallOutcome::Err(e) => panic!("tool failed: {e:?}"),
+        }
+    }
+    /// The error a call that must fail returns.
+    async fn call_err(
+        sup: &Rc<Supervisor>,
+        conn: ConnId,
+        id: u64,
+        request: ToolRequest,
+    ) -> ToolError {
+        match sup.call(conn, call(id, request)).await {
+            agent_core::delegation::ipc::CallOutcome::Ok(v) => panic!("tool succeeded: {v}"),
+            agent_core::delegation::ipc::CallOutcome::Err(e) => e,
+        }
+    }
+    /// The worker a spawn receipt names.
+    fn spawned(receipt: &Value) -> WorkerId {
+        WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap()
+    }
+    /// Registers the agent-terminal bridge with agy under `home`, as Settings does.
+    fn configure_agy(sup: &Rc<Supervisor>, home: &std::path::Path) {
+        let state = home.join(".config/agent-terminal/delegation");
+        let preview = agent_kit::delegation_config::preview(
+            home,
+            &state,
+            &sup.services.bridge_command,
+            agent_kit::delegation_config::Action::Configure,
+        )
+        .unwrap();
+        agent_kit::delegation_config::apply(preview).unwrap();
+    }
+    /// A run's stored state, `None` before its row exists.
+    fn run_state(sup: &Rc<Supervisor>, run: &str) -> Option<String> {
+        sup.services
+            .handle
+            .reader()
+            .delegation_run(run)
+            .unwrap()
+            .map(|r| r.state)
+    }
+    /// A message to `target` with no run or epoch expectation.
+    fn send_request(
+        target: Target,
+        text: &str,
+        kind: agent_core::delegation::mailbox::MessageKind,
+        key: &str,
+    ) -> SendRequest {
+        SendRequest {
+            target,
+            text: text.into(),
+            kind,
+            reply_to: None,
+            delivery: Delivery::NextTurn,
+            expected_run_id: None,
+            expected_authority_epoch: None,
+            idempotency_key: IdempotencyKey::parse(key).unwrap(),
+        }
+    }
+    /// An instruction to `worker` for its next turn.
+    fn instruction(worker: &WorkerId, text: &str, key: &str) -> SendRequest {
+        send_request(
+            Target::Worker(worker.clone()),
+            text,
+            agent_core::delegation::mailbox::MessageKind::Instruction,
+            key,
+        )
+    }
+    /// A child's report to its parent.
+    fn report_to_parent(text: &str, key: &str) -> SendRequest {
+        send_request(
+            Target::Parent,
+            text,
+            agent_core::delegation::mailbox::MessageKind::Report,
+            key,
+        )
+    }
+    /// A cancel of `worker` with no run or epoch expectation.
+    fn cancel_request(worker: &WorkerId, key: &str) -> CancelRequest {
+        CancelRequest {
+            worker_id: worker.clone(),
+            expected_run_id: None,
+            expected_authority_epoch: None,
+            idempotency_key: IdempotencyKey::parse(key).unwrap(),
         }
     }
     #[test]
@@ -508,7 +568,7 @@ mod tests {
                 ToolRequest::Spawn(spawn_request("tools-spawn")),
             )
             .await;
-            let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            let worker = spawned(&receipt);
             pump_until(|| sup.state.borrow().workers[&worker].run.is_none()).await;
             let listed = tool(&sup, ConnId(11), 3, ToolRequest::List(Default::default())).await;
             assert!(listed.to_string().contains(worker.as_str()));
@@ -540,16 +600,7 @@ mod tests {
                 &sup,
                 ConnId(12),
                 6,
-                ToolRequest::Send(SendRequest {
-                    target: Target::Parent,
-                    text: "status report".into(),
-                    kind: agent_core::delegation::mailbox::MessageKind::Report,
-                    reply_to: None,
-                    delivery: Delivery::NextTurn,
-                    expected_run_id: None,
-                    expected_authority_epoch: None,
-                    idempotency_key: IdempotencyKey::parse("child-report").unwrap(),
-                }),
+                ToolRequest::Send(report_to_parent("status report", "child-report")),
             )
             .await;
             let inbox = tool(&sup, ConnId(11), 7, ToolRequest::Read(Default::default())).await;
@@ -567,12 +618,7 @@ mod tests {
                 &sup,
                 ConnId(11),
                 9,
-                ToolRequest::Cancel(CancelRequest {
-                    worker_id: worker.clone(),
-                    expected_run_id: None,
-                    expected_authority_epoch: None,
-                    idempotency_key: IdempotencyKey::parse("idle-cancel").unwrap(),
-                }),
+                ToolRequest::Cancel(cancel_request(&worker, "idle-cancel")),
             )
             .await;
             assert_eq!(cancel["state"], "idle");
@@ -601,7 +647,7 @@ mod tests {
                 .spawn_worker(&root, spawn_request("first"))
                 .await
                 .expect("spawn");
-            let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            let worker = spawned(&receipt);
             pump_until(|| {
                 let state = sup.state.borrow();
                 let w = &state.workers[&worker];
@@ -672,27 +718,15 @@ mod tests {
                 .unwrap()
                 .clone();
             assert!(sup.state.borrow().workers[&worker].session.is_none());
-            sup.cancel_worker_call(
-                &root,
-                CancelRequest {
-                    worker_id: worker.clone(),
-                    expected_run_id: None,
-                    expected_authority_epoch: None,
-                    idempotency_key: IdempotencyKey::parse("cancel-reserved").unwrap(),
-                },
-            )
-            .await
-            .unwrap();
+            sup.cancel_worker_call(&root, cancel_request(&worker, "cancel-reserved"))
+                .await
+                .unwrap();
             let receipt = spawn.await.unwrap();
             assert!(sup.state.borrow().workers[&worker].session.is_none());
             assert!(!dir.path().join("frames.ndjson").exists());
             pump_until(|| {
-                sup.services
-                    .handle
-                    .reader()
-                    .delegation_run(receipt["run_id"].as_str().unwrap())
-                    .unwrap()
-                    .is_some_and(|r| matches!(r.state.as_str(), "failed" | "interrupted"))
+                run_state(&sup, receipt["run_id"].as_str().unwrap())
+                    .is_some_and(|s| matches!(s.as_str(), "failed" | "interrupted"))
             })
             .await;
             stop(&sup).await;
@@ -706,7 +740,7 @@ mod tests {
                 .spawn_worker(&root, spawn_request("old-terminal"))
                 .await
                 .unwrap();
-            let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            let worker = spawned(&receipt);
             pump_until(|| sup.state.borrow().workers[&worker].run.is_none()).await;
             let old = sup.scope(&worker).unwrap();
             let replacement = RunId::from_suffix(&"b".repeat(32)).unwrap();
@@ -747,17 +781,12 @@ mod tests {
                 .spawn_worker(&root, spawn_request("resolve-failure"))
                 .await
                 .unwrap();
-            let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            let worker = spawned(&receipt);
             assert_eq!(sup.state.borrow().workers[&worker].row.state, "failed");
             assert!(sup.state.borrow().workers[&worker].generations.is_empty());
             assert!(!dir.path().join("frames.ndjson").exists());
             pump_until(|| {
-                sup.services
-                    .handle
-                    .reader()
-                    .delegation_run(receipt["run_id"].as_str().unwrap())
-                    .unwrap()
-                    .is_some_and(|r| r.state == "failed")
+                run_state(&sup, receipt["run_id"].as_str().unwrap()).is_some_and(|s| s == "failed")
             })
             .await;
             stop(&sup).await;
@@ -773,7 +802,7 @@ mod tests {
                 .spawn_worker(&root, spawn_request("reported-model-canary"))
                 .await
                 .unwrap();
-            let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            let worker = spawned(&receipt);
             pump_until(|| sup.state.borrow().workers[&worker].run.is_none()).await;
             let row = sup
                 .services
@@ -814,7 +843,7 @@ mod tests {
             let mut request = spawn_request("ignore-stop");
             request.task = "hold".into();
             let receipt = sup.spawn_worker(&root, request).await.unwrap();
-            let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            let worker = spawned(&receipt);
             pump_until(|| {
                 sup.state.borrow().workers[&worker].pending.is_none()
                     && sup.state.borrow().workers[&worker].row.state == "running"
@@ -827,17 +856,9 @@ mod tests {
                 .unwrap()
                 .watch
                 .clone();
-            sup.cancel_worker_call(
-                &root,
-                CancelRequest {
-                    worker_id: worker.clone(),
-                    expected_run_id: None,
-                    expected_authority_epoch: None,
-                    idempotency_key: IdempotencyKey::parse("cancel-ignore").unwrap(),
-                },
-            )
-            .await
-            .unwrap();
+            sup.cancel_worker_call(&root, cancel_request(&worker, "cancel-ignore"))
+                .await
+                .unwrap();
             assert_ne!(watch.phase(), crate::agent_proc::StopPhase::Exited);
             pump_until(|| watch.phase() == crate::agent_proc::StopPhase::Exited).await;
             // The exit is observed in the same notification that reports it.
@@ -857,7 +878,7 @@ mod tests {
                 .spawn_worker(&root, spawn_request("violated"))
                 .await
                 .unwrap();
-            let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            let worker = spawned(&receipt);
             pump_until(|| sup.state.borrow().workers[&worker].row.state == "failed").await;
             let text = std::fs::read_to_string(dir.path().join("frames.ndjson")).unwrap();
             assert!(!text
@@ -879,7 +900,7 @@ mod tests {
                 .spawn_worker(&root, spawn_request("optout-boundary"))
                 .await
                 .unwrap();
-            let child = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            let child = spawned(&receipt);
             pump_until(|| sup.state.borrow().workers[&child].run.is_none()).await;
             let facts = super::super::seam::DelegationLaunchFacts {
                 generation: ProcessGeneration(1),
@@ -1011,17 +1032,7 @@ mod tests {
             assert!(!sup.profile_available(&root));
             assert!(hooks.before_spawn(facts).await.is_ok());
             assert!(hooks.before_root_prompt());
-            let recovery = dir.path().join(".config/agent-terminal/delegation");
-            agent_kit::delegation_config::apply(
-                agent_kit::delegation_config::preview(
-                    dir.path(),
-                    &recovery,
-                    &sup.services.bridge_command,
-                    agent_kit::delegation_config::Action::Configure,
-                )
-                .unwrap(),
-            )
-            .unwrap();
+            configure_agy(&sup, dir.path());
             assert_eq!(sup.agy_root_problem(&profile, Driver::Agy).await, None);
             stop(&sup).await;
         });
@@ -1030,17 +1041,7 @@ mod tests {
     fn agy_live_checks_use_successful_actual_launch_facts_after_profile_resolution_changes() {
         in_context(async {
             let (dir, sup, root) = harness();
-            let recovery = dir.path().join(".config/agent-terminal/delegation");
-            agent_kit::delegation_config::apply(
-                agent_kit::delegation_config::preview(
-                    dir.path(),
-                    &recovery,
-                    &sup.services.bridge_command,
-                    agent_kit::delegation_config::Action::Configure,
-                )
-                .unwrap(),
-            )
-            .unwrap();
+            configure_agy(&sup, dir.path());
             let thread = sup.state.borrow().roots[&root].row.root_thread_id.clone();
             let profile = (sup.services.profiles)().remove(0);
             let resolved = (sup.services.resolve)(&profile).unwrap();
@@ -1111,20 +1112,12 @@ mod tests {
     fn agy_live_generation_without_successful_launch_facts_is_refused() {
         in_context(async {
             let (dir, sup, root) = harness();
-            let state = dir.path().join(".config/agent-terminal/delegation");
-            let preview = agent_kit::delegation_config::preview(
-                dir.path(),
-                &state,
-                &sup.services.bridge_command,
-                agent_kit::delegation_config::Action::Configure,
-            )
-            .unwrap();
-            agent_kit::delegation_config::apply(preview).unwrap();
+            configure_agy(&sup, dir.path());
             let receipt = sup
                 .spawn_worker(&root, spawn_request("agy-poststart-policy"))
                 .await
                 .unwrap();
-            let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            let worker = spawned(&receipt);
             pump_until(|| sup.state.borrow().workers[&worker].run.is_none()).await;
             assert_eq!(
                 sup.recheck_agy(&worker).await.unwrap_err().code,
@@ -1147,7 +1140,7 @@ mod tests {
                 .spawn_worker(&root, spawn_request("hello-expiry"))
                 .await
                 .unwrap();
-            let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            let worker = spawned(&receipt);
             pump_until(|| sup.state.borrow().workers[&worker].run.is_none()).await;
             let generation = sup.state.borrow().workers[&worker].generation;
             let old = sup.state.borrow().workers[&worker]
@@ -1253,7 +1246,7 @@ mod tests {
                 .spawn_worker(&root, spawn_request("agy-unregistered"))
                 .await
                 .unwrap();
-            let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            let worker = spawned(&receipt);
             pump_until(|| sup.state.borrow().workers[&worker].row.state == "failed").await;
             assert_eq!(
                 sup.state.borrow().workers[&worker].row.delegation_status,
@@ -1283,15 +1276,7 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("registration"));
-            let state = dir.path().join(".config/agent-terminal/delegation");
-            let preview = agent_kit::delegation_config::preview(
-                dir.path(),
-                &state,
-                &sup.services.bridge_command,
-                agent_kit::delegation_config::Action::Configure,
-            )
-            .unwrap();
-            agent_kit::delegation_config::apply(preview).unwrap();
+            configure_agy(&sup, dir.path());
             let caps = tool(
                 &sup,
                 ConnId(22),
@@ -1361,7 +1346,7 @@ mod tests {
                 .spawn_worker(&root, spawn_request("rebind-initial"))
                 .await
                 .unwrap();
-            let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            let worker = spawned(&receipt);
             pump_until(|| sup.state.borrow().workers[&worker].run.is_none()).await;
             let epoch = sup.epoch(&root).unwrap();
             let generation = sup.state.borrow().workers[&worker].generation;
@@ -1373,14 +1358,8 @@ mod tests {
                 .clone();
             sup.set_status(&worker, "rebind_required", "fixture lost IPC");
             let request = SendRequest {
-                target: Target::Worker(worker.clone()),
-                text: "after rebind".into(),
-                kind: agent_core::delegation::mailbox::MessageKind::Instruction,
-                reply_to: None,
-                delivery: Delivery::NextTurn,
-                expected_run_id: None,
                 expected_authority_epoch: Some(epoch.0),
-                idempotency_key: IdempotencyKey::parse("rebind-followup").unwrap(),
+                ..instruction(&worker, "after rebind", "rebind-followup")
             };
             let send = sup.send_worker(&root, request).await.unwrap();
             pump_until(|| {
@@ -1412,18 +1391,9 @@ mod tests {
                 .spawn_worker(&root, spawn_request("start-followup"))
                 .await
                 .unwrap();
-            let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            let worker = spawned(&receipt);
             pump_until(|| sup.state.borrow().workers[&worker].row.state == "completed").await;
-            let request = SendRequest {
-                target: Target::Worker(worker.clone()),
-                text: "follow-up".into(),
-                kind: agent_core::delegation::mailbox::MessageKind::Instruction,
-                reply_to: None,
-                delivery: Delivery::NextTurn,
-                expected_run_id: None,
-                expected_authority_epoch: None,
-                idempotency_key: IdempotencyKey::parse("followup").unwrap(),
-            };
+            let request = instruction(&worker, "follow-up", "followup");
             let first = sup.send_worker(&root, request.clone()).await.unwrap();
             pump_until(|| {
                 sup.services
@@ -1456,18 +1426,9 @@ mod tests {
             let mut req = spawn_request("hold-start");
             req.task = "hold".into();
             let receipt = sup.spawn_worker(&root, req).await.unwrap();
-            let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            let worker = spawned(&receipt);
             pump_until(|| sup.state.borrow().workers[&worker].row.state == "running").await;
-            let request = SendRequest {
-                target: Target::Worker(worker.clone()),
-                text: "MUST_NOT_RUN".into(),
-                kind: agent_core::delegation::mailbox::MessageKind::Instruction,
-                reply_to: None,
-                delivery: Delivery::NextTurn,
-                expected_run_id: None,
-                expected_authority_epoch: None,
-                idempotency_key: IdempotencyKey::parse("queued-before-stop").unwrap(),
-            };
+            let request = instruction(&worker, "MUST_NOT_RUN", "queued-before-stop");
             let send = sup.send_worker(&root, request).await.unwrap();
             let thread = sup.state.borrow().roots[&root].row.root_thread_id.clone();
             sup.root_stop(&thread);
@@ -1543,7 +1504,7 @@ mod tests {
                 .spawn_worker(&root, spawn_request("reentrant"))
                 .await
                 .unwrap();
-            let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            let worker = spawned(&receipt);
             pump_until(|| sup.state.borrow().workers[&worker].row.state == "completed").await;
             assert!(subscriber.count.get() > 2);
             stop(&sup).await;
@@ -1577,7 +1538,7 @@ mod tests {
                 .spawn_worker(&root, spawn_request("stored"))
                 .await
                 .unwrap();
-            let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            let worker = spawned(&receipt);
             pump_until(|| sup.state.borrow().workers[&worker].row.state == "completed").await;
             // As after a restart, before the thread's agent is prepared again: the in-memory
             // registry knows no workers for this thread.
@@ -1613,7 +1574,7 @@ mod tests {
                         .spawn_worker(&root, spawn_request("shutdown"))
                         .await
                         .unwrap();
-                    let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+                    let worker = spawned(&receipt);
                     pump_until(|| sup.state.borrow().workers[&worker].run.is_none()).await;
                     (dir, sup, root)
                 });
@@ -1662,7 +1623,7 @@ mod tests {
             let mut request = spawn_request("crash-persisted");
             request.task = "hold".into();
             let receipt = old.spawn_worker(&root, request.clone()).await.unwrap();
-            let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            let worker = spawned(&receipt);
             pump_until(|| old.state.borrow().workers[&worker].pending.is_none()).await;
             // The restart reconciles an operation still being dispatched to `unknown`, so
             // the crash is simulated only once the spawn is durably confirmed.
@@ -1685,20 +1646,7 @@ mod tests {
                 .watch
                 .clone();
             let before = std::fs::read(dir.path().join("frames.ndjson")).unwrap();
-            let s = &old.services;
-            let services = AppServices {
-                handle: s.handle.clone(),
-                store_path: s.store_path.clone(),
-                app_pid: s.app_pid,
-                bridge_command: s.bridge_command.clone(),
-                profiles: s.profiles.clone(),
-                resolve: s.resolve.clone(),
-                make_adapter: s.make_adapter.clone(),
-                hook_check: s.hook_check.clone(),
-                tab_open_in: s.tab_open_in.clone(),
-                report: s.report.clone(),
-                catalog: s.catalog.clone(),
-            };
+            let services = old.services.clone();
             let recovered = Supervisor::start(services, Limits::default(), Rc::new(Verified))
                 .await
                 .unwrap();
@@ -1771,7 +1719,7 @@ mod tests {
             let mut request = spawn_request("profile-stop");
             request.task = "hold".into();
             let receipt = sup.spawn_worker(&root, request).await.unwrap();
-            let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            let worker = spawned(&receipt);
             pump_until(|| sup.state.borrow().workers[&worker].pending.is_none()).await;
             sup.state
                 .borrow_mut()
@@ -1784,16 +1732,7 @@ mod tests {
             assert!(sup.state.borrow().workers[&worker].token.is_none());
             pump_until(|| sup.state.borrow().workers[&worker].generations.is_empty()).await;
             pump_until(|| !sup.state.borrow().roots[&root].revoking).await;
-            let request = SendRequest {
-                target: Target::Worker(worker.clone()),
-                text: "must not execute".into(),
-                kind: agent_core::delegation::mailbox::MessageKind::Instruction,
-                reply_to: None,
-                delivery: Delivery::NextTurn,
-                expected_run_id: None,
-                expected_authority_epoch: None,
-                idempotency_key: IdempotencyKey::parse("after-profile-removal").unwrap(),
-            };
+            let request = instruction(&worker, "must not execute", "after-profile-removal");
             assert!(sup.send_worker(&root, request).await.is_err());
             assert_eq!(sup.state.borrow().workers[&worker].row.state, "closed");
             stop(&sup).await;
@@ -1807,12 +1746,12 @@ mod tests {
                 .spawn_worker(&root, spawn_request("failure-parent"))
                 .await
                 .unwrap();
-            let parent = WorkerId::parse(parent_receipt["worker_id"].as_str().unwrap()).unwrap();
+            let parent = spawned(&parent_receipt);
             pump_until(|| sup.state.borrow().workers[&parent].run.is_none()).await;
             let mut request = spawn_request("failure-grandchild");
             request.task = "hold".into();
             let receipt = sup.spawn_worker(&parent, request).await.unwrap();
-            let child = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            let child = spawned(&receipt);
             pump_until(|| sup.state.borrow().workers[&child].pending.is_none()).await;
             sup.fail_worker(
                 &parent,
@@ -1833,14 +1772,8 @@ mod tests {
             })
             .await;
             pump_until(|| {
-                sup.services
-                    .handle
-                    .reader()
-                    .delegation_run(receipt["run_id"].as_str().unwrap())
-                    .unwrap()
-                    .is_some_and(|r| {
-                        matches!(r.state.as_str(), "failed" | "interrupted" | "unknown")
-                    })
+                run_state(&sup, receipt["run_id"].as_str().unwrap())
+                    .is_some_and(|s| matches!(s.as_str(), "failed" | "interrupted" | "unknown"))
             })
             .await;
             stop(&sup).await;
@@ -1856,14 +1789,14 @@ mod tests {
                 .spawn_worker(&root, spawn_request("silent-parent"))
                 .await
                 .unwrap();
-            let parent = WorkerId::parse(parent_receipt["worker_id"].as_str().unwrap()).unwrap();
+            let parent = spawned(&parent_receipt);
             pump_until(|| sup.state.borrow().workers[&parent].run.is_none()).await;
             std::fs::write(dir.path().join("silent-task"), "").unwrap();
             let receipt = sup
                 .spawn_worker(&parent, spawn_request("silent-grandchild"))
                 .await
                 .unwrap();
-            let child = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            let child = spawned(&receipt);
             let run = receipt["run_id"].as_str().unwrap().to_owned();
             pump_until(|| sup.state.borrow().workers[&child].pending.is_none()).await;
             // Let the write reach the child, whose turn then never opens.
@@ -1878,12 +1811,8 @@ mod tests {
             );
             pump_until(|| sup.state.borrow().workers[&child].generations.is_empty()).await;
             pump_until(|| {
-                sup.services
-                    .handle
-                    .reader()
-                    .delegation_run(&run)
-                    .unwrap()
-                    .is_some_and(|r| matches!(r.state.as_str(), "interrupted" | "failed"))
+                run_state(&sup, &run)
+                    .is_some_and(|s| matches!(s.as_str(), "interrupted" | "failed"))
             })
             .await;
             assert!(sup.state.borrow().workers[&child].run.is_none());
@@ -1906,8 +1835,7 @@ mod tests {
             };
             let receipt_a = sup.spawn_worker(&root_a, hold("isolated-a")).await.unwrap();
             let receipt_b = sup.spawn_worker(&root_b, hold("isolated-b")).await.unwrap();
-            let child = |r: &Value| WorkerId::parse(r["worker_id"].as_str().unwrap()).unwrap();
-            let (child_a, child_b) = (child(&receipt_a), child(&receipt_b));
+            let (child_a, child_b) = (spawned(&receipt_a), spawned(&receipt_b));
             pump_until(|| {
                 let state = sup.state.borrow();
                 [&child_a, &child_b].iter().all(|c| {
@@ -1962,7 +1890,7 @@ mod tests {
                 .spawn_worker(&root, spawn_request("idle-child"))
                 .await
                 .unwrap();
-            let child = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            let child = spawned(&receipt);
             pump_until(|| sup.state.borrow().workers[&child].run.is_none()).await;
             assert!(!sup.state.borrow().workers[&child].generations.is_empty());
             assert!(!sup.root_busy(&thread));
@@ -1980,7 +1908,7 @@ mod tests {
                 .spawn_worker(&root, spawn_request("silent-child"))
                 .await
                 .unwrap();
-            let child = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            let child = spawned(&receipt);
             let run = receipt["run_id"].as_str().unwrap().to_owned();
             pump_until(|| {
                 std::fs::read_to_string(dir.path().join("frames.ndjson"))
@@ -1990,15 +1918,7 @@ mod tests {
             let thread = sup.state.borrow().roots[&root].row.root_thread_id.clone();
             sup.root_stop(&thread);
             pump_until(|| sup.state.borrow().workers[&child].generations.is_empty()).await;
-            pump_until(|| {
-                sup.services
-                    .handle
-                    .reader()
-                    .delegation_run(&run)
-                    .unwrap()
-                    .is_some_and(|r| r.state == "interrupted")
-            })
-            .await;
+            pump_until(|| run_state(&sup, &run).is_some_and(|s| s == "interrupted")).await;
             stop(&sup).await;
         });
     }
@@ -2044,52 +1964,19 @@ mod tests {
     fn unrelated_root_cannot_read_send_cancel_or_close_a_child() {
         in_context(async {
             let (dir, sup, root) = harness();
-            let store = sup.services.handle.reader();
-            let thread = store
-                .create_thread(&dir.path().to_string_lossy(), Some("other root"))
-                .unwrap();
-            let other = store
-                .create_delegation_root(&NewRoot {
-                    thread: thread.clone(),
-                    driver: Driver::Claude,
-                    profile_id: ProfileId::parse("fixture").unwrap(),
-                    name: "other".into(),
-                    policy_json: "{}".into(),
-                })
-                .unwrap();
-            let row = store.delegation_root(&other.root).unwrap().unwrap();
-            let w = store
-                .delegation_worker(other.worker.as_str())
-                .unwrap()
-                .unwrap();
-            let rt = sup.worker_rt(w, other.worker.clone(), dir.path().to_owned());
-            {
-                let mut state = sup.state.borrow_mut();
-                state.roots.insert(
-                    other.worker.clone(),
-                    RootRt {
-                        row,
-                        revoking: false,
-                        revision: 0,
-                        closed: false,
-                        transferring: false,
-                    },
-                );
-                state.threads.insert(thread, other.worker.clone());
-                state.workers.insert(other.worker.clone(), rt);
-            }
+            let (_, other) = insert_root(&sup, dir.path(), "other root", "other", None);
             let receipt = sup
                 .spawn_worker(&root, spawn_request("isolated"))
                 .await
                 .unwrap();
-            let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
-            assert!(!sup.visible(&other.worker, &worker, true));
+            let worker = spawned(&receipt);
+            assert!(!sup.visible(&other, &worker, true));
             let close = CloseRequest {
                 worker_id: worker,
                 expected_authority_epoch: None,
                 idempotency_key: IdempotencyKey::parse("foreign-close").unwrap(),
             };
-            assert!(sup.close_worker_call(&other.worker, close).await.is_err());
+            assert!(sup.close_worker_call(&other, close).await.is_err());
             stop(&sup).await;
         });
     }
