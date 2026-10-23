@@ -3700,22 +3700,19 @@ impl AgentTerminalWindow {
         if self.close_prompt_open.replace(true) {
             return true; // one question at a time
         }
-        let dialog = adw::AlertDialog::new(Some(&heading), Some(&body));
-        dialog.add_responses(&[("cancel", "Cancel"), ("stop", confirm)]);
-        dialog.set_response_appearance("stop", adw::ResponseAppearance::Destructive);
-        dialog.set_default_response(Some("cancel"));
-        dialog.set_close_response("cancel");
-        let obj = self.obj().downgrade();
-        glib::MainContext::default().spawn_local(async move {
-            let Some(window) = obj.upgrade() else { return };
-            let response = dialog
-                .choose_future(Some(window.upcast_ref::<gtk4::Widget>()))
-                .await;
-            let imp = window.imp();
+        let dialog = confirm_dialog(
+            &heading,
+            &body,
+            ("cancel", "Cancel"),
+            ("stop", confirm),
+            adw::ResponseAppearance::Destructive,
+            false,
+        );
+        self.ask(dialog, "stop", |imp, stop| {
             imp.close_prompt_open.set(false);
-            if response == "stop" {
+            if stop {
                 imp.close_confirmed.set(true);
-                window.close();
+                imp.obj().close();
                 // Still here: the close was refused somewhere else. Ask again next time.
                 imp.close_confirmed.set(false);
             }
@@ -3742,23 +3739,20 @@ impl AgentTerminalWindow {
             return;
         }
         let (heading, body, confirm) = close_question(&self.thread_title_of(thread), reasons);
-        let dialog = adw::AlertDialog::new(Some(&heading), Some(&body));
-        dialog.add_responses(&[("cancel", "Cancel"), ("stop", confirm)]);
-        dialog.set_response_appearance("stop", adw::ResponseAppearance::Destructive);
-        dialog.set_default_response(Some("cancel"));
-        dialog.set_close_response("cancel");
-        let (obj, thread) = (self.obj().downgrade(), thread.to_owned());
-        glib::MainContext::default().spawn_local(async move {
-            let Some(window) = obj.upgrade() else { return };
-            let response = dialog
-                .choose_future(Some(window.upcast_ref::<gtk4::Widget>()))
-                .await;
+        let dialog = confirm_dialog(
+            &heading,
+            &body,
+            ("cancel", "Cancel"),
+            ("stop", confirm),
+            adw::ResponseAppearance::Destructive,
+            false,
+        );
+        let thread = thread.to_owned();
+        self.ask(dialog, "stop", move |imp, stop| {
             // Reopened for a later close; the tab may be gone already.
-            window
-                .imp()
-                .with_chat_mut(&thread, |c| c.confirming_close = false);
-            if response == "stop" {
-                then(window.imp());
+            imp.with_chat_mut(&thread, |c| c.confirming_close = false);
+            if stop {
+                then(imp);
             }
         });
     }
@@ -3797,25 +3791,22 @@ impl AgentTerminalWindow {
             return;
         }
         let (heading, body) = switch_warning(&self.thread_title_of(thread), driver);
-        let dialog = adw::AlertDialog::new(Some(&heading), Some(&body));
-        dialog.add_responses(&[("cancel", "Cancel"), ("stop", "Stop and Switch")]);
-        dialog.set_response_appearance("stop", adw::ResponseAppearance::Destructive);
-        dialog.set_default_response(Some("cancel"));
-        dialog.set_close_response("cancel");
-        let (obj, thread) = (self.obj().downgrade(), thread.to_owned());
-        glib::MainContext::default().spawn_local(async move {
-            let Some(window) = obj.upgrade() else { return };
-            let response = dialog
-                .choose_future(Some(window.upcast_ref::<gtk4::Widget>()))
-                .await;
-            window
-                .imp()
-                .with_chat_mut(&thread, |c| c.confirming_switch = false);
-            if response != "stop" {
+        let dialog = confirm_dialog(
+            &heading,
+            &body,
+            ("cancel", "Cancel"),
+            ("stop", "Stop and Switch"),
+            adw::ResponseAppearance::Destructive,
+            false,
+        );
+        let thread = thread.to_owned();
+        self.ask(dialog, "stop", move |imp, stop| {
+            imp.with_chat_mut(&thread, |c| c.confirming_switch = false);
+            if !stop {
                 return;
             }
             // The slot again: the page may have closed while the question was open.
-            if let Some(slot) = window.imp().slot_of(&thread) {
+            if let Some(slot) = imp.slot_of(&thread) {
                 slot.interrupt();
                 delegation::switch(&slot, driver, model, effort);
             }
@@ -6089,30 +6080,21 @@ impl AgentTerminalWindow {
             self.show_toast("Answer the open question first");
             return;
         }
-        let dialog = adw::AlertDialog::new(
-            Some("Switch agents now?"),
-            Some(&format!(
+        let dialog = confirm_dialog(
+            "Switch agents now?",
+            &format!(
                 "{} has unfinished work. {why} Switching continues with the selected agent; \
                  the new turn can ask again.",
                 driver_label(from),
-            )),
-        );
-        dialog.add_responses(&[
+            ),
             ("cancel", "Keep Waiting"),
             ("switch", "Switch and Continue"),
-        ]);
-        dialog.set_response_appearance("switch", adw::ResponseAppearance::Destructive);
-        dialog.set_default_response(Some("cancel"));
-        dialog.set_close_response("cancel");
-        let obj = self.obj().downgrade();
-        glib::MainContext::default().spawn_local(async move {
-            let Some(window) = obj.upgrade() else { return };
-            let response = dialog
-                .choose_future(Some(window.upcast_ref::<gtk4::Widget>()))
-                .await;
-            let imp = window.imp();
+            adw::ResponseAppearance::Destructive,
+            false,
+        );
+        self.ask(dialog, "switch", move |imp, switch| {
             imp.unasked_prompt_open.set(false);
-            if response == "switch" && !imp.is_closing() {
+            if switch && !imp.is_closing() {
                 then(imp);
             }
         });
@@ -6125,28 +6107,23 @@ impl AgentTerminalWindow {
             return;
         }
         let label = driver_label(target);
-        let dialog = adw::AlertDialog::new(
-            Some(&format!("Continue in {label}?")),
-            Some(&format!(
+        let dialog = confirm_dialog(
+            &format!("Continue in {label}?"),
+            &format!(
                 "This thread does not allow edits you have not approved, but {label} cannot ask: \
                  its approval hook is not installed (or not checked yet). It refuses shell \
                  commands, but will edit files without asking, in every mode, Plan included."
-            )),
+            ),
+            ("cancel", "Cancel"),
+            ("continue", "Continue Anyway"),
+            adw::ResponseAppearance::Destructive,
+            false,
         );
-        dialog.add_responses(&[("cancel", "Cancel"), ("continue", "Continue Anyway")]);
-        dialog.set_response_appearance("continue", adw::ResponseAppearance::Destructive);
-        dialog.set_default_response(Some("cancel"));
-        dialog.set_close_response("cancel");
-        let obj = self.obj().downgrade();
         let thread = thread.to_owned();
-        glib::MainContext::default().spawn_local(async move {
-            let Some(window) = obj.upgrade() else { return };
-            let response = dialog
-                .choose_future(Some(window.upcast_ref::<gtk4::Widget>()))
-                .await;
-            window.imp().unasked_prompt_open.set(false);
-            if response == "continue" {
-                window.imp().switch_in_place(&thread, target);
+        self.ask(dialog, "continue", move |imp, go| {
+            imp.unasked_prompt_open.set(false);
+            if go {
+                imp.switch_in_place(&thread, target);
             }
         });
     }

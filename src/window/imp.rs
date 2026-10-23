@@ -17,6 +17,7 @@ pub(crate) use threads::{close_store_writer, flush_store_for_panic};
 use super::diff_panel::DiffPanel;
 use super::loading;
 use crate::config::{Profile, SessionFormat};
+use crate::dialogs::confirm_dialog;
 use crate::handoff::QuotaState;
 use crate::theme::Theme;
 use crate::utils::{get_startup_command, resolve_profile, resolve_working_directory, Launch};
@@ -1435,6 +1436,23 @@ impl AgentTerminalWindow {
             .map(f)
     }
 
+    /// Asks `dialog` over this window, then runs `answered` with whether it was answered
+    /// `accept_id`, whichever the answer. The window is held while the question is open;
+    /// nothing is asked once it is gone.
+    fn ask(
+        &self,
+        dialog: adw::AlertDialog,
+        accept_id: &'static str,
+        answered: impl FnOnce(&Self, bool) + 'static,
+    ) {
+        let obj = self.obj().downgrade();
+        glib::MainContext::default().spawn_local(async move {
+            let Some(window) = obj.upgrade() else { return };
+            let yes = crate::dialogs::confirmed(&dialog, &window, accept_id).await;
+            answered(window.imp(), yes);
+        });
+    }
+
     /// Tells the user, once, that their settings file could not be used.
     /// Deferred to idle so the dialog has a presented window to attach to.
     fn report_config_problem(&self) {
@@ -2270,12 +2288,14 @@ impl AgentTerminalWindow {
         // SendToTerminal types content into a live agent's stdin. That was a
         // default affordance when the only source was one hard-coded file; with
         // user-configurable sources it has to be an explicit, previewed choice.
-        let dialog = adw::AlertDialog::new(Some(&indicator.label), Some(&body));
-        dialog.add_response("close", "Close");
-        dialog.add_response("send", "Send to Session");
-        dialog.set_response_appearance("send", adw::ResponseAppearance::Suggested);
-        dialog.set_default_response(Some("close"));
-        dialog.set_close_response("close");
+        let dialog = confirm_dialog(
+            &indicator.label,
+            &body,
+            ("close", "Close"),
+            ("send", "Send to Session"),
+            adw::ResponseAppearance::Suggested,
+            false,
+        );
 
         let detail = detail.to_string();
         dialog.connect_response(
@@ -3051,13 +3071,17 @@ impl AgentTerminalWindow {
         let dialog = match result {
             Ok(release) if agent_kit::update::is_newer(current, &release.tag) => {
                 let version = release.tag.trim_start_matches('v');
-                let dialog = adw::AlertDialog::builder()
-                    .heading(format!("Agent Terminal {version} is available"))
-                    .body(format!(
+                let dialog = confirm_dialog(
+                    &format!("Agent Terminal {version} is available"),
+                    &format!(
                         "You have {current}. Installed from a package repository (apt, dnf, \
                          pacman)? Update it there instead."
-                    ))
-                    .build();
+                    ),
+                    ("close", "Not Now"),
+                    ("download", "Download"),
+                    adw::ResponseAppearance::Suggested,
+                    true,
+                );
                 if !release.notes.trim().is_empty() {
                     let notes = Label::builder()
                         .use_markup(true)
@@ -3076,9 +3100,6 @@ impl AgentTerminalWindow {
                         .build();
                     dialog.set_extra_child(Some(&scroll));
                 }
-                dialog.add_responses(&[("close", "Not Now"), ("download", "Download")]);
-                dialog.set_response_appearance("download", adw::ResponseAppearance::Suggested);
-                dialog.set_default_response(Some("download"));
                 let url = release.url;
                 let window = self.obj().downgrade();
                 dialog.connect_response(None, move |_, response| {
@@ -5274,17 +5295,16 @@ impl AgentTerminalWindow {
             Some(name) => format!("Resume {name} Session"),
             None => "Resume Session".to_string(),
         };
-        let dialog = adw::AlertDialog::new(
-            Some(&heading),
-            Some("Opens a new tab that resumes the session with this ID."),
+        let dialog = confirm_dialog(
+            &heading,
+            "Opens a new tab that resumes the session with this ID.",
+            ("cancel", "Cancel"),
+            ("resume", "Resume"),
+            adw::ResponseAppearance::Suggested,
+            true,
         );
         dialog.set_extra_child(Some(&entry));
-        dialog.add_response("cancel", "Cancel");
-        dialog.add_response("resume", "Resume");
-        dialog.set_response_appearance("resume", adw::ResponseAppearance::Suggested);
         dialog.set_response_enabled("resume", false);
-        dialog.set_default_response(Some("resume"));
-        dialog.set_close_response("cancel");
 
         entry.connect_changed(glib::clone!(
             #[weak]
@@ -6345,17 +6365,15 @@ impl AgentTerminalWindow {
         form.append(&problem);
         form.append(&note);
 
-        let dialog = adw::AlertDialog::new(
-            Some("New Thread in Isolated Git Worktree"),
-            Some(
-                "Creates a new Git branch and an isolated checkout folder so the agent \
-                 can experiment without modifying your current branch or uncommitted work.",
-            ),
+        let dialog = confirm_dialog(
+            "New Thread in Isolated Git Worktree",
+            "Creates a new Git branch and an isolated checkout folder so the agent can \
+             experiment without modifying your current branch or uncommitted work.",
+            ("cancel", "Cancel"),
+            ("create", "Create"),
+            adw::ResponseAppearance::Suggested,
+            true,
         );
-        dialog.add_responses(&[("cancel", "Cancel"), ("create", "Create")]);
-        dialog.set_response_appearance("create", adw::ResponseAppearance::Suggested);
-        dialog.set_default_response(Some("create"));
-        dialog.set_close_response("cancel");
         dialog.set_response_enabled("create", false);
         dialog.set_extra_child(Some(&form));
 
@@ -6717,7 +6735,14 @@ impl AgentTerminalWindow {
                     return;
                 }
 
-                let dialog = adw::AlertDialog::new(Some("Undo These Changes?"), None);
+                let dialog = confirm_dialog(
+                    "Undo These Changes?",
+                    "",
+                    ("cancel", "Cancel"),
+                    ("restore", "Undo Changes"),
+                    adw::ResponseAppearance::Destructive,
+                    false,
+                );
                 let text = Label::builder()
                     .label(crate::restore::summary(&plan, to, mid_turn))
                     .wrap(true)
@@ -6733,14 +6758,7 @@ impl AgentTerminalWindow {
                     .child(&text)
                     .build();
                 dialog.set_extra_child(Some(&scroll));
-                dialog.add_responses(&[("cancel", "Cancel"), ("restore", "Undo Changes")]);
-                dialog.set_response_appearance("restore", adw::ResponseAppearance::Destructive);
-                dialog.set_default_response(Some("cancel"));
-                dialog.set_close_response("cancel");
-                let response = dialog
-                    .choose_future(Some(obj.upcast_ref::<gtk4::Widget>()))
-                    .await;
-                if response != "restore" {
+                if !crate::dialogs::confirmed(&dialog, &obj, "restore").await {
                     // Cancelled: the undo point is not needed.
                     gtk4::gio::spawn_blocking(move || crate::restore::discard(&repo, &plan.pinned));
                     return;

@@ -1473,17 +1473,7 @@ impl AgentTerminalWindow {
                         });
                     }
                     "export" => {
-                        let confirm = adw::AlertDialog::new(
-                            Some("Export rules outside agent-terminal?"),
-                            Some(&warning),
-                        );
-                        confirm.add_responses(&[("cancel", "Cancel"), ("export", "Export")]);
-                        confirm.set_response_appearance(
-                            "export",
-                            adw::ResponseAppearance::Destructive,
-                        );
-                        confirm.set_default_response(Some("cancel"));
-                        confirm.set_close_response("cancel");
+                        let confirm = export_confirmation(&warning);
                         if confirm.choose_future(root.as_ref()).await == "export" {
                             // Refreshed once the export has finished.
                             imp.export_rules(&p, move || {
@@ -2230,6 +2220,19 @@ fn mark_synced(button: &glib::WeakRef<Button>, refresh: impl Fn() + 'static) {
     });
 }
 
+/// The question an export asks first: `warning` ([`crate::always_allow::export_warning`]),
+/// answered `export` or `cancel`.
+fn export_confirmation(warning: &str) -> adw::AlertDialog {
+    confirm_dialog(
+        "Export rules outside agent-terminal?",
+        warning,
+        ("cancel", "Cancel"),
+        ("export", "Export"),
+        adw::ResponseAppearance::Destructive,
+        false,
+    )
+}
+
 /// The widget name a confirmed export click carries (see [`confirm_export_first`]).
 const EXPORT_CONFIRMED: &str = "export-confirmed";
 
@@ -2241,11 +2244,7 @@ fn confirm_export_first(button: &Button, warning: &str) -> bool {
         button.set_widget_name("");
         return true;
     }
-    let dialog = adw::AlertDialog::new(Some("Export rules outside agent-terminal?"), Some(warning));
-    dialog.add_responses(&[("cancel", "Cancel"), ("export", "Export")]);
-    dialog.set_response_appearance("export", adw::ResponseAppearance::Destructive);
-    dialog.set_default_response(Some("cancel"));
-    dialog.set_close_response("cancel");
+    let dialog = export_confirmation(warning);
     let weak = button.downgrade();
     dialog.connect_response(None, move |_, response| {
         if response == "export" {

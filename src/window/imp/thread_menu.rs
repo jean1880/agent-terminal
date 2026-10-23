@@ -428,24 +428,23 @@ impl AgentTerminalWindow {
             .text(&current)
             .activates_default(true)
             .build();
-        let dialog = adw::AlertDialog::new(Some("Rename Thread"), None);
+        let dialog = confirm_dialog(
+            "Rename Thread",
+            "",
+            ("cancel", "Cancel"),
+            ("rename", "Rename"),
+            adw::ResponseAppearance::Suggested,
+            true,
+        );
         dialog.set_extra_child(Some(&entry));
-        dialog.add_responses(&[("cancel", "Cancel"), ("rename", "Rename")]);
-        dialog.set_response_appearance("rename", adw::ResponseAppearance::Suggested);
-        dialog.set_default_response(Some("rename"));
-        dialog.set_close_response("cancel");
-        let (obj, thread) = (self.obj().downgrade(), thread.to_owned());
-        glib::MainContext::default().spawn_local(async move {
-            let Some(window) = obj.upgrade() else { return };
-            let response = dialog
-                .choose_future(Some(window.upcast_ref::<gtk4::Widget>()))
-                .await;
-            if response != "rename" {
+        let thread = thread.to_owned();
+        self.ask(dialog, "rename", move |imp, rename| {
+            if !rename {
                 return;
             }
             let title = entry.text().trim().to_owned();
             if !title.is_empty() {
-                window.imp().rename_thread_to(&thread, &title);
+                imp.rename_thread_to(&thread, &title);
             }
         });
     }
@@ -548,25 +547,21 @@ impl AgentTerminalWindow {
     /// Asks before deleting: this removes the thread's history from Agent Terminal.
     pub(super) fn confirm_delete(&self, thread: &str) {
         let title = self.thread_title_of(thread);
-        let dialog = adw::AlertDialog::new(
-            Some("Delete This Thread?"),
-            Some(&format!(
+        let dialog = confirm_dialog(
+            "Delete This Thread?",
+            &format!(
                 "“{title}” and its history in Agent Terminal will be deleted. The agent's own \
                  session files are not touched. This cannot be undone."
-            )),
+            ),
+            ("cancel", "Cancel"),
+            ("delete", "Delete"),
+            adw::ResponseAppearance::Destructive,
+            false,
         );
-        dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Delete")]);
-        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
-        dialog.set_default_response(Some("cancel"));
-        dialog.set_close_response("cancel");
-        let (obj, thread) = (self.obj().downgrade(), thread.to_owned());
-        glib::MainContext::default().spawn_local(async move {
-            let Some(window) = obj.upgrade() else { return };
-            let response = dialog
-                .choose_future(Some(window.upcast_ref::<gtk4::Widget>()))
-                .await;
-            if response == "delete" {
-                window.imp().delete_thread_now(&thread);
+        let thread = thread.to_owned();
+        self.ask(dialog, "delete", move |imp, delete| {
+            if delete {
+                imp.delete_thread_now(&thread);
             }
         });
     }

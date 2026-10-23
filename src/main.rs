@@ -25,6 +25,7 @@ mod codex_probe;
 pub mod config;
 mod cross_agent_mcp;
 mod delegation;
+mod dialogs;
 mod diff_tool;
 mod environment_review;
 mod freshness;

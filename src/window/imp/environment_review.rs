@@ -30,9 +30,9 @@ impl AgentTerminalWindow {
                 "Wait for agent detection to finish, or enable an installed agent in Settings → Agents.");
             return;
         };
-        let dialog = adw::AlertDialog::new(
-            Some("Review Multi-Agent Environment?"),
-            Some(&format!(
+        let dialog = confirm_dialog(
+            "Review Multi-Agent Environment?",
+            &format!(
                 "Open a new {} session to review this folder:\n\n{}\n\n\
                  The agent will inspect project instructions and relevant agent configuration, \
                  then produce a scored report with skill and MCP recommendations. Review \
@@ -40,19 +40,16 @@ impl AgentTerminalWindow {
                  agent under its usual permissions and may use its quota.",
                 driver_label(driver),
                 dir
-            )),
+            ),
+            ("cancel", "Cancel"),
+            ("review", "Start Review"),
+            adw::ResponseAppearance::Suggested,
+            false,
         );
-        dialog.add_responses(&[("cancel", "Cancel"), ("review", "Start Review")]);
-        dialog.set_response_appearance("review", adw::ResponseAppearance::Suggested);
-        dialog.set_default_response(Some("cancel"));
-        dialog.set_close_response("cancel");
         let obj = self.obj().downgrade();
         glib::MainContext::default().spawn_local(async move {
             let Some(window) = obj.upgrade() else { return };
-            let response = dialog
-                .choose_future(Some(window.upcast_ref::<gtk4::Widget>()))
-                .await;
-            if response != "review" {
+            if !crate::dialogs::confirmed(&dialog, &window, "review").await {
                 return;
             }
             let checked = gtk4::gio::spawn_blocking({
