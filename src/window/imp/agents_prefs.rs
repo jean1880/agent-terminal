@@ -373,7 +373,7 @@ impl AgentTerminalWindow {
         let codex_inputs = self.codex_inputs();
         glib::spawn_future_local(async move {
             let codex = codex_target(codex_inputs).await.ok();
-            Self::store_job(
+            Self::rules_job(
                 move || {
                     crate::always_allow::AlwaysRules::import_into(&target, &sources, codex.as_ref())
                 },
@@ -407,7 +407,7 @@ impl AgentTerminalWindow {
             let codex = codex_target(codex_inputs).await;
             let unresolved = codex.as_ref().err().cloned();
             let codex = codex.ok();
-            Self::store_job(
+            Self::rules_job(
                 move || {
                     crate::always_allow::AlwaysRules::export_from(&target, &sources, codex.as_ref())
                 },
@@ -452,7 +452,7 @@ impl AgentTerminalWindow {
     /// Runs a rules-store `job` on a worker thread (it may wait for the store lock) and
     /// `finish` on the main thread with its result (`None`: the worker failed). Nothing that
     /// depends on the job's outcome (a toast, the sync indicator) runs before `finish`.
-    fn store_job<T: Send + 'static>(
+    fn rules_job<T: Send + 'static>(
         job: impl FnOnce() -> T + Send + 'static,
         finish: impl FnOnce(Option<T>) + 'static,
     ) {
@@ -469,15 +469,13 @@ impl AgentTerminalWindow {
         done: impl FnOnce(Result<bool, crate::always_allow::StoreError>) + 'static,
     ) {
         glib::spawn_future_local(async move {
-            let result = gtk4::gio::spawn_blocking(move || {
-                crate::always_allow::AlwaysRules::forget(&path, &rule)
-            })
-            .await
-            .unwrap_or_else(|_| {
+            let result = blocking_or(
+                move || crate::always_allow::AlwaysRules::forget(&path, &rule),
                 Err(crate::always_allow::StoreError::Write(
                     "the removal did not finish".to_owned(),
-                ))
-            });
+                )),
+            )
+            .await;
             done(result);
         });
     }
@@ -1756,9 +1754,7 @@ impl AgentTerminalWindow {
                 status.set_subtitle("Checking…");
                 let generation = generation.clone();
                 glib::MainContext::default().spawn_local(async move {
-                    let found = gtk4::gio::spawn_blocking(move || detect_agent(&command))
-                        .await
-                        .unwrap_or_else(|_| Err("the check panicked".to_owned()));
+                    let found = off_main("the check", move || detect_agent(&command)).await;
                     if generation.get() != current {
                         return;
                     }
@@ -2150,21 +2146,21 @@ impl AgentTerminalWindow {
             async move {
                 // Settings checks the home-level installation, never a thread's launch proof.
                 let target = super::threads::agy_hook_target(None).await;
-                let (probe, bound) = gtk4::gio::spawn_blocking(move || {
-                    (
-                        crate::hook_config::probe_settings(&target),
-                        crate::approval_server::socket_bindable(),
-                    )
-                })
-                .await
-                .unwrap_or_else(|_| {
+                let (probe, bound) = blocking_or(
+                    move || {
+                        (
+                            crate::hook_config::probe_settings(&target),
+                            crate::approval_server::socket_bindable(),
+                        )
+                    },
                     (
                         crate::hook_config::HookProbe::Unreadable(
                             "the hooks check panicked".into(),
                         ),
                         false,
-                    )
-                });
+                    ),
+                )
+                .await;
                 let badge = crate::hook_config::badge(&probe, bound);
                 crate::hook_config::log_verdict(badge, &probe, bound);
                 let (text, class) = match badge {
@@ -2992,7 +2988,7 @@ pub(super) mod tests {
             let finished: Rc<std::cell::Cell<Option<usize>>> = Rc::default();
             let seen = finished.clone();
             let target = path.clone();
-            AgentTerminalWindow::store_job(
+            AgentTerminalWindow::rules_job(
                 move || AlwaysRules::import_into(&target, &[source], None),
                 move |result| seen.set(Some(result.and_then(Result::ok).map_or(0, |i| i.added))),
             );

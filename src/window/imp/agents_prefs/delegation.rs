@@ -280,11 +280,13 @@ impl AgentTerminalWindow {
                 let weak_row = weak_row.clone();
                 glib::MainContext::default().spawn_local(async move {
                     let result = match registration_context(profile, clear).await {
-                        Ok((home, state, _, _)) => gtk4::gio::spawn_blocking(move || {
-                            delegation_config::undo(&home, &state)
-                        })
-                        .await
-                        .unwrap_or_else(|_| Err("Registration worker failed".into())),
+                        Ok((home, state, _, _)) => {
+                            blocking_or(
+                                move || delegation_config::undo(&home, &state),
+                                Err("Registration worker failed".into()),
+                            )
+                            .await
+                        }
                         Err(error) => Err(error),
                     };
                     let text = match result {
@@ -359,16 +361,20 @@ impl AgentTerminalWindow {
         let clear = self.config.borrow().clear_env.clone();
         glib::MainContext::default().spawn_local(async move {
             let text = match registration_context(profile, clear).await {
-                Ok((home, state, command, _)) => gtk4::gio::spawn_blocking(move || {
-                    registration_status(&delegation_config::preview(
-                        &home,
-                        &state,
-                        &command,
-                        Action::Configure,
-                    ))
-                })
-                .await
-                .unwrap_or_else(|_| "Registration worker failed".to_owned()),
+                Ok((home, state, command, _)) => {
+                    blocking_or(
+                        move || {
+                            registration_status(&delegation_config::preview(
+                                &home,
+                                &state,
+                                &command,
+                                Action::Configure,
+                            ))
+                        },
+                        "Registration worker failed".to_owned(),
+                    )
+                    .await
+                }
                 Err(error) => error,
             };
             if let Some(row) = row.upgrade() {
@@ -396,11 +402,15 @@ impl AgentTerminalWindow {
         }
         glib::MainContext::default().spawn_local(async move {
             let result = match registration_context(profile, clear).await {
-                Ok((home, state, command, _)) => gtk4::gio::spawn_blocking(move || {
-                    delegation_config::preview_repairing(&home, &state, &command, action)
-                })
-                .await
-                .unwrap_or_else(|_| Err("Registration worker failed".to_owned())),
+                Ok((home, state, command, _)) => {
+                    blocking_or(
+                        move || {
+                            delegation_config::preview_repairing(&home, &state, &command, action)
+                        },
+                        Err("Registration worker failed".to_owned()),
+                    )
+                    .await
+                }
                 Err(error) => Err(error),
             };
             let finish = |row: &glib::WeakRef<adw::ActionRow>, text: &str| {
@@ -437,9 +447,11 @@ impl AgentTerminalWindow {
                 done(Review::Cancelled);
                 return;
             }
-            let result = gtk4::gio::spawn_blocking(move || delegation_config::apply(plan))
-                .await
-                .unwrap_or_else(|_| Err("Registration worker failed".into()));
+            let result = blocking_or(
+                move || delegation_config::apply(plan),
+                Err("Registration worker failed".into()),
+            )
+            .await;
             let (text, review) = match result {
                 Ok(()) => (
                     "Registration saved. Reopen enabled threads to use the new configuration."

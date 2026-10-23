@@ -1215,6 +1215,24 @@ pub(super) fn app_handle() -> StoreHandle {
     }
 }
 
+/// Runs `job` off the main thread and returns its answer, or `panicked` if it panicked.
+pub(super) async fn blocking_or<T: Send + 'static>(
+    job: impl FnOnce() -> T + Send + 'static,
+    panicked: T,
+) -> T {
+    gtk4::gio::spawn_blocking(job).await.unwrap_or(panicked)
+}
+
+/// [`blocking_or`] for a job that can fail: a panic is the error "`what` panicked".
+pub(super) async fn off_main<T: Send + 'static>(
+    what: &'static str,
+    job: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    gtk4::gio::spawn_blocking(job)
+        .await
+        .unwrap_or_else(|_| Err(format!("{what} panicked")))
+}
+
 /// Runs `job` against the thread store off the main thread, on a connection of its own (SQLite
 /// connections are not `Send`; WAL lets it run beside the main one), and returns its result.
 /// It first waits (on the worker) for every write queued before it to be committed, so it reads
@@ -2264,9 +2282,10 @@ thread_local! {
 /// awaits this; a switch to agy (which cannot wait) uses [`cached_hook_verdict`].
 pub(super) async fn check_hook(target: crate::hook_config::HookTarget) -> Result<(), String> {
     let checked = target.clone();
-    let verdict = gtk4::gio::spawn_blocking(move || crate::hook_config::check_target(&target))
-        .await
-        .unwrap_or_else(|_| Err("the hooks check panicked".to_owned()));
+    let verdict = off_main("the hooks check", move || {
+        crate::hook_config::check_target(&target)
+    })
+    .await;
     HOOK_VERDICTS.with(|cache| cache.borrow_mut().remember(&checked, verdict.clone()));
     verdict
 }
@@ -6340,15 +6359,14 @@ impl AgentTerminalWindow {
             #[weak]
             obj,
             async move {
-                let diff = gtk4::gio::spawn_blocking(move || {
+                let diff = off_main("the diff thread", move || {
                     crate::git::tab_diff(
                         std::path::Path::new(&dir),
                         key,
                         crate::diff::DiffBase::LastTurn,
                     )
                 })
-                .await
-                .unwrap_or_else(|_| Err("the diff thread panicked".to_string()));
+                .await;
                 match diff {
                     Ok(crate::git::DiffOutcome::Ready(d)) => match d.undo_to {
                         Some(target) => obj.imp().confirm_restore(

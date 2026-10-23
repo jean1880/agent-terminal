@@ -12,6 +12,8 @@ mod thread_menu;
 mod threads;
 mod uninstall_prefs;
 
+use threads::{blocking_or, off_main};
+
 pub(crate) use threads::{close_store_writer, flush_store_for_panic};
 
 use super::diff_panel::DiffPanel;
@@ -2194,12 +2196,13 @@ impl AgentTerminalWindow {
                 let source = indicator.source.clone();
                 // A configured command is arbitrary and may block; it never runs
                 // on the main thread.
-                let state =
-                    gtk4::gio::spawn_blocking(move || crate::utils::read_indicator(&source))
-                        .await
-                        .unwrap_or_else(|_| crate::utils::IndicatorState::Unknown {
-                            reason: "Indicator check panicked".to_string(),
-                        });
+                let state = blocking_or(
+                    move || crate::utils::read_indicator(&source),
+                    crate::utils::IndicatorState::Unknown {
+                        reason: "Indicator check panicked".to_string(),
+                    },
+                )
+                .await;
                 in_flight.set(false);
 
                 let (icon, css, tooltip) = match &state {
@@ -2966,14 +2969,16 @@ impl AgentTerminalWindow {
         let obj = self.obj().downgrade();
         glib::MainContext::default().spawn_local(async move {
             glib::timeout_future_seconds(STARTUP_UPDATE_DELAY_SECS).await;
-            let result = gtk4::gio::spawn_blocking(move || {
-                agent_kit::update::fetch_latest(
-                    &slug,
-                    concat!("agent-terminal/", env!("CARGO_PKG_VERSION")),
-                )
-            })
-            .await
-            .unwrap_or_else(|_| Err("the update check stopped unexpectedly".to_owned()));
+            let result = blocking_or(
+                move || {
+                    agent_kit::update::fetch_latest(
+                        &slug,
+                        concat!("agent-terminal/", env!("CARGO_PKG_VERSION")),
+                    )
+                },
+                Err("the update check stopped unexpectedly".to_owned()),
+            )
+            .await;
             let newer = match result {
                 Ok(release)
                     if agent_kit::update::is_newer(env!("CARGO_PKG_VERSION"), &release.tag) =>
@@ -3037,14 +3042,18 @@ impl AgentTerminalWindow {
         self.add_toast(checking.clone());
         glib::MainContext::default().spawn_local(async move {
             let result = match slug {
-                Some(slug) => gtk4::gio::spawn_blocking(move || {
-                    agent_kit::update::fetch_latest(
-                        &slug,
-                        concat!("agent-terminal/", env!("CARGO_PKG_VERSION")),
+                Some(slug) => {
+                    blocking_or(
+                        move || {
+                            agent_kit::update::fetch_latest(
+                                &slug,
+                                concat!("agent-terminal/", env!("CARGO_PKG_VERSION")),
+                            )
+                        },
+                        Err("The update check stopped unexpectedly.".to_owned()),
                     )
-                })
-                .await
-                .unwrap_or_else(|_| Err("The update check stopped unexpectedly.".to_owned())),
+                    .await
+                }
                 None => Err("This build names no GitHub repository to check.".to_owned()),
             };
             checking.dismiss();
@@ -5213,11 +5222,10 @@ impl AgentTerminalWindow {
             #[weak]
             empty,
             async move {
-                let listing = gtk4::gio::spawn_blocking(move || {
+                let listing = off_main("Listing sessions", move || {
                     crate::utils::list_sessions_in(format, &store, title_pointer.as_deref())
                 })
-                .await
-                .unwrap_or_else(|_| Err("Listing sessions panicked".to_string()));
+                .await;
 
                 let found = match listing {
                     Ok(found) => found,
@@ -5496,7 +5504,7 @@ impl AgentTerminalWindow {
                 let to = target.name.clone();
                 let from_for_brief = from.clone();
                 let tab_dir = dir.clone();
-                let written = gtk4::gio::spawn_blocking(move || {
+                let written = off_main("Writing the brief", move || {
                     use crate::handoff::*;
                     // An AGY tab's ID is AGY's own choice; find the session it
                     // recorded in this directory since the tab opened.
@@ -5526,8 +5534,7 @@ impl AgentTerminalWindow {
                         &render_brief(&input),
                     )
                 })
-                .await
-                .unwrap_or_else(|_| Err("Writing the brief panicked".to_string()));
+                .await;
 
                 match written {
                     Ok(path) => {
@@ -5666,11 +5673,11 @@ impl AgentTerminalWindow {
         };
         let child = page.child();
         glib::MainContext::default().spawn_local(async move {
-            let result = gtk4::gio::spawn_blocking(move || run_checkpoint(&dir, key, &label))
-                .await
-                .unwrap_or_else(|_| {
-                    CheckpointResult::Failed("the checkpoint thread panicked".to_string())
-                });
+            let result = blocking_or(
+                move || run_checkpoint(&dir, key, &label),
+                CheckpointResult::Failed("the checkpoint thread panicked".to_string()),
+            )
+            .await;
             // Looked up afterwards, not captured: the tab may have been
             // dragged to another window meanwhile, or closed.
             let Some(obj) = window_of(&child) else {
@@ -5942,22 +5949,20 @@ impl AgentTerminalWindow {
         let obj = self.obj().downgrade();
         let page = page.clone();
         glib::MainContext::default().spawn_local(async move {
-            let initial = gtk4::gio::spawn_blocking({
+            let initial = off_main("the diff thread", {
                 let dir = dir.clone();
                 move || crate::git::tab_diff(std::path::Path::new(&dir), key, base)
             })
-            .await
-            .unwrap_or_else(|_| Err("the diff thread panicked".to_string()));
+            .await;
 
             let (result, repo_dir) = match (initial, thread_id) {
                 (Ok(crate::git::DiffOutcome::NotRepo), Some(tid)) => {
                     if let Some(Some(repo_dir)) = thread_enclosing_repo(tid).await {
                         let diffed = repo_dir.clone();
-                        let result = gtk4::gio::spawn_blocking(move || {
+                        let result = off_main("the diff thread", move || {
                             crate::git::tab_diff(&diffed, key, base)
                         })
-                        .await
-                        .unwrap_or_else(|_| Err("the diff thread panicked".to_string()));
+                        .await;
                         (result, repo_dir)
                     } else {
                         (Ok(crate::git::DiffOutcome::NotRepo), dir.into())
@@ -5975,9 +5980,10 @@ impl AgentTerminalWindow {
             // only; it never fetches).
             let pr = if in_repo {
                 Some(
-                    gtk4::gio::spawn_blocking(move || agent_kit::github::pr_state(&repo_dir))
-                        .await
-                        .unwrap_or_else(|_| Err("reading the branch panicked".to_string())),
+                    off_main("reading the branch", move || {
+                        agent_kit::github::pr_state(&repo_dir)
+                    })
+                    .await,
                 )
             } else {
                 None
@@ -6066,11 +6072,10 @@ impl AgentTerminalWindow {
         let obj = self.obj().downgrade();
         let page = page.clone();
         glib::MainContext::default().spawn_local(async move {
-            let read = gtk4::gio::spawn_blocking(move || {
+            let read = off_main("reading the branch", move || {
                 agent_kit::github::pr_state(std::path::Path::new(&dir))
             })
-            .await
-            .unwrap_or_else(|_| Err("reading the branch panicked".to_string()));
+            .await;
             if let Some(obj) = obj.upgrade() {
                 obj.imp().show_branch(&page, Some(&read));
             }
@@ -6185,11 +6190,10 @@ impl AgentTerminalWindow {
                 panel.set_pushing(true);
                 glib::MainContext::default().spawn_local(async move {
                     let branch = state.branch.clone();
-                    let pushed = gtk4::gio::spawn_blocking(move || {
+                    let pushed = off_main("the push", move || {
                         agent_kit::github::push_branch(std::path::Path::new(&dir), &state)
                     })
-                    .await
-                    .unwrap_or_else(|_| Err("the push panicked".to_string()));
+                    .await;
                     panel.set_pushing(false);
                     let Some(obj) = obj.upgrade() else { return };
                     match pushed {
@@ -6227,12 +6231,14 @@ impl AgentTerminalWindow {
         };
         let obj = self.obj().downgrade();
         glib::MainContext::default().spawn_local(async move {
-            let working_dir = gtk4::gio::spawn_blocking({
-                let (dir, path) = (dir.clone(), file.path.clone());
-                move || diff_tool_working_dir(&dir, &path)
-            })
-            .await
-            .unwrap_or_else(|_| std::path::PathBuf::from(dir));
+            let working_dir = blocking_or(
+                {
+                    let (dir, path) = (dir.clone(), file.path.clone());
+                    move || diff_tool_working_dir(&dir, &path)
+                },
+                std::path::PathBuf::from(dir),
+            )
+            .await;
             let result =
                 crate::diff_tool::open_from_dir(tool, working_dir, file.path, file.from, new_side)
                     .await;
@@ -6425,12 +6431,11 @@ impl AgentTerminalWindow {
                                 return;
                             }
                             glib::MainContext::default().spawn_local(async move {
-                                let checked = gtk4::gio::spawn_blocking(move || {
+                                let checked = off_main("the check", move || {
                                     crate::worktree::check_new_branch(&main, &name)?;
                                     crate::worktree::resolve_base(&main, &start).map(|_| ())
                                 })
-                                .await
-                                .unwrap_or_else(|_| Err("the check panicked".to_string()));
+                                .await;
                                 if generation.get() != current {
                                     return;
                                 }
@@ -6491,9 +6496,8 @@ impl AgentTerminalWindow {
                         let Some(path) = picked.ok().and_then(|f| f.path()) else {
                             return;
                         };
-                        let found = gtk4::gio::spawn_blocking(move || worktree_repo(&path))
-                            .await
-                            .unwrap_or_else(|_| Err("the repository check panicked".to_string()));
+                        let found =
+                            off_main("the repository check", move || worktree_repo(&path)).await;
                         match found {
                             Ok((main, current)) => {
                                 repo_problem.set_text("");
@@ -6538,13 +6542,12 @@ impl AgentTerminalWindow {
                     main_toplevel: main.clone(),
                 };
                 // Checked again: the repository may have moved on since.
-                let created = gtk4::gio::spawn_blocking(move || {
+                let created = off_main("creating the worktree", move || {
                     crate::worktree::check_new_branch(&main, &name)?;
                     let commit = crate::worktree::resolve_base(&main, &start)?;
                     crate::worktree::add(&main, &name, &path, &commit)
                 })
-                .await
-                .unwrap_or_else(|_| Err("creating the worktree panicked".to_string()));
+                .await;
                 match created {
                     Ok(()) => {
                         info!(
@@ -6611,14 +6614,13 @@ impl AgentTerminalWindow {
                 // The worktree may have come back from the store (a reopened thread): it is
                 // offered only while git still has it, at that path and on that branch.
                 let checked = info.clone();
-                let clean = gtk4::gio::spawn_blocking(move || {
+                let clean = off_main("the status check", move || {
                     if !crate::worktree::is_registered(&checked)? {
                         return Err("it is no longer a registered worktree on its branch".into());
                     }
                     crate::worktree::is_clean(&checked.path)
                 })
-                .await
-                .unwrap_or_else(|_| Err("the status check panicked".to_string()));
+                .await;
                 match clean {
                     Ok(true) => {}
                     Ok(false) => {
@@ -6680,10 +6682,10 @@ impl AgentTerminalWindow {
             obj,
             async move {
                 let (main, path) = (info.main_toplevel.clone(), info.path.clone());
-                let removed =
-                    gtk4::gio::spawn_blocking(move || crate::worktree::remove(&main, &path))
-                        .await
-                        .unwrap_or_else(|_| Err("removing the worktree panicked".to_string()));
+                let removed = off_main("removing the worktree", move || {
+                    crate::worktree::remove(&main, &path)
+                })
+                .await;
                 match removed {
                     Ok(()) => {
                         info!("Removed worktree {}", info.path.display());
@@ -6714,14 +6716,13 @@ impl AgentTerminalWindow {
             #[weak]
             obj,
             async move {
-                let prepared = gtk4::gio::spawn_blocking(move || {
+                let prepared = off_main("preparing the undo", move || {
                     let repo = crate::git::discover(std::path::Path::new(&dir))?
                         .ok_or_else(|| "This tab's folder is not in a repository".to_string())?;
                     let plan = crate::restore::prepare(&repo, key, &target)?;
                     Ok::<_, String>((repo, plan))
                 })
-                .await
-                .unwrap_or_else(|_| Err("preparing the undo panicked".to_string()));
+                .await;
                 let (repo, plan) = match prepared {
                     Ok(prepared) => prepared,
                     Err(err) => {
@@ -6771,9 +6772,7 @@ impl AgentTerminalWindow {
                     .timeout(0)
                     .build();
                 obj.imp().add_toast(undoing.clone());
-                let done = gtk4::gio::spawn_blocking(move || crate::restore::apply(&repo, &plan))
-                    .await
-                    .unwrap_or_else(|_| Err("the undo panicked".to_string()));
+                let done = off_main("the undo", move || crate::restore::apply(&repo, &plan)).await;
                 undoing.dismiss();
                 let imp = obj.imp();
                 match done {
