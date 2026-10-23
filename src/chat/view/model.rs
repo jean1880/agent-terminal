@@ -1503,6 +1503,46 @@ impl Transcript {
         changed
     }
 
+    /// A sub-agent that finished cannot finish its own steps any more: one still Running (its
+    /// completion was lost) becomes Interrupted, as [`Self::settle_stale`] settles them, so its
+    /// spinner stops. Only its direct tool steps: a nested sub-agent still running keeps its own
+    /// steps. A background sub-agent (its call returns while it works on) and a worker with its
+    /// own lifecycle are left alone. The changed steps.
+    fn settle_finished_subagent(&mut self, id: &str) -> Vec<Change> {
+        let Some(item) = self.items.get(id) else {
+            return Vec::new();
+        };
+        let Body::Tool(tool) = &item.body else {
+            return Vec::new();
+        };
+        if tool.kind != ItemKind::Subagent || tool.status == ToolStatus::Running {
+            return Vec::new();
+        }
+        let input: Option<Value> = tool
+            .input
+            .clone()
+            .or_else(|| serde_json::from_str(&tool.input_text).ok());
+        let field = |key: &str| input.as_ref().and_then(|i| i.get(key));
+        let in_background = field("run_in_background").and_then(Value::as_bool) == Some(true)
+            || self
+                .background
+                .iter()
+                .any(|task| task.id == id || task.tool_use_id.as_deref() == Some(id));
+        if in_background || field("worker_state").is_some() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for child in item.children.clone() {
+            if let Some(Body::Tool(step)) = self.items.get_mut(&child).map(|c| &mut c.body) {
+                if step.status == ToolStatus::Running && step.kind != ItemKind::Subagent {
+                    step.status = ToolStatus::Interrupted;
+                    out.push(Change::Updated(child));
+                }
+            }
+        }
+        out
+    }
+
     /// Expires every approval, question and form still waiting on the user (or sent and not yet
     /// acknowledged): nothing can take the answer any more, because the turn that asked ended
     /// (stopped or failed) or no agent is alive. Returns the items changed.
@@ -1902,7 +1942,8 @@ impl Transcript {
                     }
                     _ => {}
                 }
-                out.push(Change::Updated(id));
+                out.push(Change::Updated(id.clone()));
+                out.extend(self.settle_finished_subagent(&id));
             }
             Event::Reasoning { state, label } => {
                 let Some(id) = env.item.clone() else {
@@ -3317,6 +3358,64 @@ mod tests {
             Some(id) => e.item(id),
             None => e,
         }
+    }
+
+    /// A finished sub-agent's steps still running stop (their completions were lost); those of
+    /// a sub-agent still at work, of a nested sub-agent still running, and of a background
+    /// sub-agent keep running.
+    #[test]
+    fn a_finished_subagent_settles_its_steps_left_running() {
+        let status = |t: &Transcript, id: &str| match t.get(id).map(|i| &i.body) {
+            Some(Body::Tool(tool)) => tool.status,
+            other => panic!("{id}: {other:?}"),
+        };
+        let done = |id: &str| Envelope::item_completed(id, ItemStatus::Completed, None, None);
+        let mut t = Transcript::new();
+        for env in [
+            started("agent", ItemKind::Subagent, None),
+            started("lost", ItemKind::Command, Some("agent")),
+            started("ok", ItemKind::Command, Some("agent")),
+            done("ok"),
+            started("nested", ItemKind::Subagent, Some("agent")),
+            started("deep", ItemKind::Command, Some("nested")),
+        ] {
+            t.apply(&env, Driver::Claude);
+        }
+        assert_eq!(
+            status(&t, "lost"),
+            ToolStatus::Running,
+            "its agent still works"
+        );
+        let changes = t.apply(&done("agent"), Driver::Claude);
+        assert!(changes.contains(&Change::Updated("lost".into())));
+        assert_eq!(status(&t, "lost"), ToolStatus::Interrupted);
+        assert_eq!(status(&t, "ok"), ToolStatus::Completed);
+        assert_eq!(status(&t, "nested"), ToolStatus::Running);
+        assert_eq!(
+            status(&t, "deep"),
+            ToolStatus::Running,
+            "its own agent runs"
+        );
+
+        let mut t = Transcript::new();
+        let background = Envelope::item_started(
+            "bg",
+            ItemKind::Subagent,
+            "Agent",
+            Some(serde_json::json!({ "run_in_background": true })),
+            None,
+        );
+        t.apply(&background, Driver::Claude);
+        t.apply(
+            &started("step", ItemKind::Command, Some("bg")),
+            Driver::Claude,
+        );
+        t.apply(&done("bg"), Driver::Claude);
+        assert_eq!(
+            status(&t, "step"),
+            ToolStatus::Running,
+            "a background sub-agent works on after its call returns"
+        );
     }
 
     #[test]
