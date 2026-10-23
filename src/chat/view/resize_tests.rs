@@ -300,6 +300,19 @@ fn feed(ctx: &glib::MainContext, view: &ChatView, envs: &[Envelope]) -> f64 {
     spent.as_secs_f64() * 1000.0
 }
 
+/// What a live session costs a resize, against a replay of the same envelopes.
+///
+/// Measured 2026-10-23 (Xvfb, measure profile), M = steps per sub-agent, rows nested included,
+/// layout / layout+snapshot ms at narrow widths, before and after bounding the live transcript:
+///
+/// | M   | live rows   | live resize        | jumped +300 rows | jumped resize       |
+/// |-----|-------------|--------------------|------------------|---------------------|
+/// | 0   | 205 → 205   | 1.9 / 1.8 → 1.5 / 1.8 | 460 → 460     | 3.0 / 4.1 → 2.7 / 4.3 |
+/// | 50  | 449 → 405   | 2.5 / 5.5 → 2.3 / 4.8 | 1009 → 600    | 4.8 / 13.8 → 2.3 / 7.4 |
+/// | 300 | 1449 → 365  | 6.2 / 21.1 → 2.0 / 3.9 | 3259 → 600   | 21.9 / 57.7 → 2.4 / 6.7 |
+///
+/// At M = 300, applying the 7775 envelopes took 7.1 s → 5.3 s, and the 300 items after the jump
+/// 7.2 s → 2.7 s; a replay builds 1083 → 270 rows.
 #[test]
 #[ignore = "a measurement: prints costs, asserts nothing (make bench T=resize_cost_of_live_sessions)"]
 fn resize_cost_of_live_sessions() {
