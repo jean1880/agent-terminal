@@ -451,14 +451,21 @@ async fn repo_present(dir: String, thread: Option<String>) -> Option<bool> {
     let Some(tid) = thread else {
         return Some(false);
     };
-    let envelopes = threads::store_job(move |s| s.events(&tid, None, 500))
+    thread_enclosing_repo(tid).await.map(|repo| repo.is_some())
+}
+
+/// The repository the files `thread`'s edits touched are in, read from the store and
+/// discovered off the main thread. A store that does not answer gives no rows, so no
+/// repository; `None`: the discovery thread panicked.
+async fn thread_enclosing_repo(thread: String) -> Option<Option<std::path::PathBuf>> {
+    let envelopes = threads::store_job(move |s| s.events(&thread, None, 500))
         .await
         .and_then(Result::ok)
         .unwrap_or_default();
     let paths = crate::diff::touched_paths_from_envelopes(
         &envelopes.into_iter().map(|(_, e)| e).collect::<Vec<_>>(),
     );
-    gtk4::gio::spawn_blocking(move || crate::diff::discover_enclosing_repo(&paths).is_some())
+    gtk4::gio::spawn_blocking(move || crate::diff::discover_enclosing_repo(&paths))
         .await
         .ok()
 }
@@ -5955,14 +5962,7 @@ impl AgentTerminalWindow {
 
             let (result, repo_dir) = match (initial, thread_id) {
                 (Ok(crate::git::DiffOutcome::NotRepo), Some(tid)) => {
-                    let envelopes = threads::store_job(move |s| s.events(&tid, None, 500))
-                        .await
-                        .and_then(Result::ok)
-                        .unwrap_or_default();
-                    let paths = crate::diff::touched_paths_from_envelopes(
-                        &envelopes.into_iter().map(|(_, e)| e).collect::<Vec<_>>(),
-                    );
-                    if let Some(repo_dir) = crate::diff::discover_enclosing_repo(&paths) {
+                    if let Some(Some(repo_dir)) = thread_enclosing_repo(tid).await {
                         let diffed = repo_dir.clone();
                         let result = gtk4::gio::spawn_blocking(move || {
                             crate::git::tab_diff(&diffed, key, base)
@@ -7273,6 +7273,48 @@ mod tests {
         assert!(indicator_log_at_info(Some(Ok), Problem));
         assert!(indicator_log_at_info(Some(Problem), Unreadable));
         assert!(indicator_log_at_info(Some(Unreadable), Ok));
+    }
+
+    #[test]
+    fn a_thread_outside_a_repository_finds_the_one_its_session_ran_in() {
+        let repo = tempfile::tempdir().unwrap();
+        let ran = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(repo.path())
+            .status();
+        if !ran.is_ok_and(|s| s.success()) {
+            eprintln!("git is not available; skipping");
+            return;
+        }
+        let inside = repo.path().join("src");
+        std::fs::create_dir(&inside).unwrap();
+        let store = threads::app_store();
+        let thread = store.create_thread("/", None).unwrap();
+        store
+            .append_event(
+                &thread,
+                None,
+                &agent_core::event::Envelope::new(agent_core::event::Event::SessionStarted {
+                    native_id: "s-1".into(),
+                    model: None,
+                    cwd: Some(inside.to_string_lossy().into_owned()),
+                }),
+            )
+            .unwrap();
+        let ctx = glib::MainContext::default();
+        let found = ctx
+            .block_on(thread_enclosing_repo(thread.to_string()))
+            .expect("the discovery thread answered")
+            .expect("the session's repository");
+        assert_eq!(
+            found.canonicalize().unwrap(),
+            repo.path().canonicalize().unwrap()
+        );
+        // A thread with no rows has nothing to search.
+        assert_eq!(
+            ctx.block_on(thread_enclosing_repo("absent".into())),
+            Some(None)
+        );
     }
 
     fn init_gtk() {
