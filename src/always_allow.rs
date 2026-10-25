@@ -416,6 +416,90 @@ fn unrestricted_traversal(argv: &[String]) -> bool {
     }
 }
 
+/// grep's short options a session read pattern covers: flags with no value, and ones whose value
+/// ends the cluster or is the next word (`e f m A B C`, digits), which is then judged as a path.
+/// Not `r`/`R` (recursion), `d`/`D` (directory and device actions).
+const GREP_SHORT_FLAGS: &str = "EFGPiyvwxcLloqsbHhnTZzaIU0123456789";
+const GREP_SHORT_VALUE: &str = "efmABC";
+
+/// grep's long options a session read pattern covers, by full name only: GNU grep takes any
+/// unambiguous prefix, so `--rec` is `--recursive` and an unknown word may be one.
+const GREP_LONG_FLAGS: &[&str] = &[
+    "extended-regexp",
+    "fixed-strings",
+    "basic-regexp",
+    "perl-regexp",
+    "ignore-case",
+    "no-ignore-case",
+    "word-regexp",
+    "line-regexp",
+    "null-data",
+    "no-messages",
+    "invert-match",
+    "count",
+    "files-without-match",
+    "files-with-matches",
+    "only-matching",
+    "quiet",
+    "silent",
+    "byte-offset",
+    "with-filename",
+    "no-filename",
+    "line-buffered",
+    "line-number",
+    "initial-tab",
+    "null",
+    "text",
+];
+
+/// grep's long options that take a value (`=value` or the next word, judged as a path).
+const GREP_LONG_VALUE: &[&str] = &[
+    "regexp",
+    "file",
+    "max-count",
+    "label",
+    "after-context",
+    "before-context",
+    "context",
+    "color",
+    "colour",
+    "binary-files",
+];
+
+/// Whether a `grep` call has an option outside [`GREP_SHORT_FLAGS`], [`GREP_SHORT_VALUE`],
+/// [`GREP_LONG_FLAGS`] and [`GREP_LONG_VALUE`]: recursion (`-r`, `--rec…`), directory or device
+/// actions, or an option this does not know. Such a call is never covered by a session read
+/// pattern ([`Context::args_contained`]).
+fn grep_option_unlisted(argv: &[String]) -> bool {
+    if argv.first().map(|w| basename(w)) != Some("grep") {
+        return false;
+    }
+    for word in argv.iter().skip(1) {
+        if word == "--" {
+            break;
+        }
+        if let Some(long) = word.strip_prefix("--") {
+            let listed = match long.split_once('=') {
+                Some((name, _)) => GREP_LONG_VALUE.contains(&name),
+                None => GREP_LONG_FLAGS.contains(&long) || GREP_LONG_VALUE.contains(&long),
+            };
+            if !listed {
+                return true;
+            }
+        } else if let Some(short) = word.strip_prefix('-').filter(|s| !s.is_empty()) {
+            for letter in short.chars() {
+                if GREP_SHORT_VALUE.contains(letter) {
+                    break;
+                }
+                if !GREP_SHORT_FLAGS.contains(letter) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// rg's short flags that take no value and neither widen the search (`-u`, `-L`, `-.`) nor run
 /// anything (`-z`): [`rg_searches_a_folder`]'s allowlist.
 const RG_FLAGS_SHORT: &str = "nNisSwxvclFHIoqbUPa0";
@@ -589,6 +673,18 @@ pub fn session_folder(action: &Action, ctx: &Context) -> Option<PathBuf> {
     crate::approval_server::folder_auto_matchable(&full, &folder, Some(home)).then_some(folder)
 }
 
+/// The device and inode of `folder`, when it is a real directory whose path resolves to itself
+/// (no component a symlink); `None` otherwise. A folder grant keeps it and matches only while it
+/// is unchanged ([`Target::Dir`]).
+fn folder_identity(folder: &Path) -> Option<[u64; 2]> {
+    use std::os::unix::fs::MetadataExt;
+    if std::fs::canonicalize(folder).ok()? != folder {
+        return None;
+    }
+    let meta = std::fs::symlink_metadata(folder).ok()?;
+    meta.is_dir().then(|| [meta.dev(), meta.ino()])
+}
+
 /// `/`, the home folder, or a folder above it: never a folder grant, typed or not.
 fn folder_too_broad(folder: &Path, home: &Path) -> bool {
     let real_home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_owned());
@@ -747,13 +843,16 @@ pub fn exec_option(argv: &[String]) -> Option<&str> {
                     .any(|a| word.starts_with(a))
                     .then_some(word);
             }
+            // GNU getopt_long and git's parse-options take any unambiguous prefix of a long
+            // option (`--outp=x` is `--output=x`), so a word naming a prefix of one counts too.
+            let name = word.split_once('=').map_or(word, |(name, _)| name);
             let long = word.starts_with("--")
                 && EXEC_LONG.iter().any(|(p, opt)| {
                     *p == program
-                        && match opt.strip_suffix('*') {
+                        && (match opt.strip_suffix('*') {
                             Some(prefix) => word.starts_with(prefix),
                             None => word == *opt || word.starts_with(&format!("{opt}=")),
-                        }
+                        } || (name.len() > 2 && opt.trim_end_matches('*').starts_with(name)))
                 });
             // tar's old style takes its first argument as a cluster with no dash (`tar tIfoo`).
             let cluster = if let Some(rest) = word.strip_prefix('-').filter(|r| !r.starts_with('-'))
@@ -1063,6 +1162,7 @@ impl Context<'_> {
         readable(cwd)
             && !unrestricted_traversal(argv)
             && !rg_searches_a_folder(argv, is_file)
+            && !grep_option_unlisted(argv)
             && argv.iter().skip(1).all(|arg| {
                 if let Some(long) = arg.strip_prefix("--") {
                     !arg.contains('~') && long.split_once('=').is_none_or(|(_, v)| path_ok(v))
@@ -1132,7 +1232,15 @@ pub enum Target {
     /// keeps the file's folder ([`session_folder`]); a typed edit pattern ending in `/` is one.
     /// Session only ([`Rule::check`]); matched through
     /// [`crate::approval_server::folder_auto_matchable`] (no `..`, no link out, not sensitive).
-    Dir { dir: String },
+    ///
+    /// `identity` is the folder's device and inode when the grant was made ([`folder_identity`]);
+    /// a rule matches only while `dir` still resolves to itself and is that same folder, so a
+    /// folder replaced by a link or another folder grants nothing. `None` matches nothing.
+    Dir {
+        dir: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        identity: Option<[u64; 2]>,
+    },
     /// One MCP server's tool (`*`: any tool of that server).
     Mcp { server: String, tool: String },
 }
@@ -1210,6 +1318,7 @@ impl Rule {
                 }
                 Target::Dir {
                     dir: dir.to_owned(),
+                    identity: None,
                 }
             }
             ActionKind::Edit | ActionKind::Read => {
@@ -1335,6 +1444,7 @@ impl Rule {
     fn into_folder(mut self, folder: &Path) -> Self {
         self.target = Target::Dir {
             dir: folder.to_string_lossy().into_owned(),
+            identity: folder_identity(folder),
         };
         self
     }
@@ -1350,14 +1460,17 @@ impl Rule {
                 self.cwd = ctx.cwd.map(canonical_or_raw);
             }
         }
-        if let Target::Path { path: p } | Target::Dir { dir: p } = &mut self.target {
+        if let Target::Path { path: p } | Target::Dir { dir: p, .. } = &mut self.target {
             // Outside the workspace or sensitive is the user's call ([`Self::warnings`]).
             let canonical = crate::approval_server::canonical_target(Path::new(p));
             *p = canonical.to_string_lossy().into_owned();
         }
+        if let Target::Dir { dir, identity } = &mut self.target {
+            *identity = folder_identity(Path::new(dir));
+        }
         // A typed folder is the user's choice, but never `/`, home or above it, and never without
         // the home folder known (the dotfile protections need it).
-        if let Target::Dir { dir } = &self.target {
+        if let Target::Dir { dir, .. } = &self.target {
             let home = ctx
                 .home
                 .ok_or("a folder rule needs the home folder known; keep the one file instead")?;
@@ -1440,7 +1553,7 @@ impl Rule {
                      instructions that change what runs next)"
                 ));
             }
-            Target::Dir { dir }
+            Target::Dir { dir, .. }
                 if ctx.is_some_and(|ctx| !folder_in_workspace(Path::new(dir), ctx)) =>
             {
                 out.push(format!(
@@ -1495,12 +1608,18 @@ impl Rule {
                 probe.path.as_deref() == Some(Path::new(path))
             }
             // No home known: the home-dotfile protections cannot apply, so nothing matches.
-            (Target::Dir { dir }, Action::Edit { .. }) => match (&probe.named_path, &probe.home) {
-                (Some(p), Some(home)) => {
-                    crate::approval_server::folder_auto_matchable(p, Path::new(dir), Some(home))
+            // The folder granted, still the same folder at the same canonical path.
+            (Target::Dir { dir, identity }, Action::Edit { .. }) => {
+                match (&probe.named_path, &probe.home) {
+                    (Some(p), Some(home)) => {
+                        let dir = Path::new(dir);
+                        identity.is_some()
+                            && folder_identity(dir) == *identity
+                            && crate::approval_server::folder_auto_matchable(p, dir, Some(home))
+                    }
+                    _ => false,
                 }
-                _ => false,
-            },
+            }
             (Target::Mcp { server, tool }, Action::Mcp { server: s, tool: t }) => {
                 server == s && (tool == "*" || tool == t)
             }
@@ -1528,7 +1647,7 @@ impl Rule {
                 }
             }
             Target::Path { path } => path.clone(),
-            Target::Dir { dir } => format!("{dir}/"),
+            Target::Dir { dir, .. } => format!("{dir}/"),
             Target::Mcp { server, tool } => format!("{server}/{tool}"),
         }
     }
@@ -4434,6 +4553,101 @@ mod tests {
     /// A session folder rule is judged on the path the agent named as well as on the file it
     /// reaches: a `.claude` that is a symlink inside the folder still asks.
     #[test]
+    fn a_session_folder_grant_does_not_follow_a_replaced_folder() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = std::fs::canonicalize(tmp.path()).expect("canon");
+        let ws = root.join("ws");
+        let src = ws.join("src");
+        let home = root.join("home");
+        let outside = root.join("outside");
+        for d in [&src, &home, &outside] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        let ws_s = ws.to_string_lossy().into_owned();
+        let c = Context {
+            driver: "claude",
+            workspace: &ws,
+            cwd: Some(&ws_s),
+            home: Some(&home),
+        };
+        let edit = |p: &Path| Action::Edit {
+            path: p.to_string_lossy().into_owned(),
+        };
+        let rule =
+            decide(Some(&edit(&src.join("a.rs"))), None, Scope::Session, &c).expect("session rule");
+        assert!(rule.matches(&edit(&src.join("b.rs")), &c));
+        // The granted folder becomes a link out: neither name reaches the new target.
+        std::fs::rename(&src, ws.join("src-old")).expect("move away");
+        std::os::unix::fs::symlink(&outside, &src).expect("link in its place");
+        let mut covered = Vec::new();
+        for path in [outside.join("a.rs"), src.join("a.rs")] {
+            if rule.matches(&edit(&path), &c) {
+                covered.push(path);
+            }
+        }
+        // A new folder at the same path is not the one granted either.
+        std::fs::remove_file(&src).expect("remove link");
+        std::fs::create_dir(&src).expect("new folder");
+        if rule.matches(&edit(&src.join("a.rs")), &c) {
+            covered.push(src.join("a.rs (new folder)"));
+        }
+        assert!(covered.is_empty(), "covered unasked: {covered:?}");
+    }
+
+    /// GNU grep and git take any unambiguous prefix of a long option, so an abbreviation is the
+    /// option itself: `grep --rec` recurses, `git diff --ext` runs the external diff.
+    #[test]
+    fn a_session_read_pattern_asks_for_abbreviated_options() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let ws = std::fs::canonicalize(tmp.path()).expect("canon");
+        std::fs::write(ws.join("README.md"), "needle").expect("readme");
+        let root = ws.to_string_lossy().into_owned();
+        let c = ctx("codex", &ws, Some(&root));
+        let pattern = |head: &[&str]| Rule {
+            workspace: c.workspace_key(),
+            cwd: None,
+            origin: "codex".into(),
+            kind: ActionKind::Shell,
+            target: Target::Argv {
+                argv: argv(head),
+                prefix: true,
+            },
+        };
+        let (grep, diff, log) = (
+            pattern(&["grep"]),
+            pattern(&["git", "diff"]),
+            pattern(&["git", "log"]),
+        );
+        for (rule, ok) in [
+            (&grep, "grep -n needle README.md"),
+            (&grep, "grep -inw -A 3 needle README.md"),
+            (&grep, "grep --ignore-case --max-count=5 needle README.md"),
+            (&grep, "grep -e needle -- README.md"),
+            (&diff, "git diff --stat"),
+            (&log, "git log --oneline -5"),
+        ] {
+            assert!(rule.matches(&shell(ok), &c), "{ok}");
+        }
+        let matched: Vec<&str> = [
+            (&grep, "grep --rec needle ."),
+            (&grep, "grep --dereference-recurs needle ."),
+            (&grep, "grep --direc=recurse needle ."),
+            (&grep, "grep --directories=recurse needle ."),
+            (&grep, "grep --devices=read needle README.md"),
+            (&grep, "grep --no-such-option needle README.md"),
+            (&diff, "git diff --ext"),
+            (&diff, "git diff --textc"),
+            (&log, "git log --outp=x"),
+            (&log, "git log --show-sig"),
+        ]
+        .into_iter()
+        .filter(|(rule, call)| rule.matches(&shell(call), &c))
+        .map(|(_, call)| call)
+        .collect();
+        assert!(matched.is_empty(), "covered unasked: {matched:?}");
+    }
+
+    #[test]
     fn a_session_folder_asks_for_a_symlinked_claude_settings_file() {
         let tmp = tempfile::tempdir().expect("tmp");
         let root = std::fs::canonicalize(tmp.path()).expect("canon");
@@ -4680,9 +4894,11 @@ mod tests {
         assert_eq!(
             rule.target,
             Target::Dir {
-                dir: src.to_string_lossy().into_owned()
+                dir: src.to_string_lossy().into_owned(),
+                identity: folder_identity(&src),
             }
         );
+        assert!(folder_identity(&src).is_some());
         assert_eq!(rule.detail(), format!("{}/", src.display()));
         assert!(rule.matches(&a, &c), "the call that made it");
         assert!(rule.matches(&edit(&src.join("b.rs")), &c), "a sibling file");

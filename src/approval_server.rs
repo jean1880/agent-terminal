@@ -1469,8 +1469,11 @@ pub(crate) fn folder_auto_matchable(target: &Path, folder: &Path, home: Option<&
             }
         })
     };
+    // The folder itself must still be where it was: a granted folder replaced by a link would
+    // otherwise lend `contained` the link's target as its root.
     target.is_absolute()
         && !has_parent_dir(target)
+        && std::fs::canonicalize(folder).is_ok_and(|resolved| resolved == folder)
         && contained(&real, folder)
         && judged(&real)
         && (real == target || (judged(target) && !links_inside()))
