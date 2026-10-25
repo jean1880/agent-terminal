@@ -416,6 +416,46 @@ fn unrestricted_traversal(argv: &[String]) -> bool {
     }
 }
 
+/// Whether an `rg` call may search a folder: rg recurses into every directory it is given, and
+/// into the working directory when it is given no path, reading secret-named files that are not
+/// hidden or ignored (`credentials.json`, `prod.key`). Such a call is never covered by a session
+/// read pattern ([`Context::args_contained`]); only a search of named regular files is.
+///
+/// Positional words are those that do not start with `-`, and every word after `--`. The first
+/// is the pattern, unless one comes from an option (`-e`/`--regexp`, `-f`/`--file`, or a short
+/// cluster holding `e` or `f`); every other one must name a regular file (`is_file`). An option's
+/// separate value (`-g '*.rs'`, `-t rust`, `-e needle`) is read as a positional word, and so
+/// fails closed; consuming it instead would trust a parse of every value-taking option (rg takes
+/// `-g -e` as the glob `-e`).
+fn rg_searches_a_folder(argv: &[String], is_file: impl Fn(&str) -> bool) -> bool {
+    if argv.first().map(|w| basename(w)) != Some("rg") {
+        return false;
+    }
+    let mut positional = Vec::new();
+    let mut pattern_from_option = false;
+    let mut words = argv.iter().skip(1);
+    for word in words.by_ref() {
+        if word == "--" {
+            break;
+        }
+        if let Some(long) = word.strip_prefix("--") {
+            let name = long.split_once('=').map_or(long, |(name, _)| name);
+            pattern_from_option |= matches!(name, "regexp" | "file");
+        } else if let Some(short) = word.strip_prefix('-').filter(|s| !s.is_empty()) {
+            pattern_from_option |= short.contains(['e', 'f']);
+        } else {
+            positional.push(word.as_str());
+        }
+    }
+    positional.extend(words.map(String::as_str));
+    let paths = if pattern_from_option {
+        &positional[..]
+    } else {
+        positional.get(1..).unwrap_or_default()
+    };
+    paths.is_empty() || !paths.iter().all(|p| is_file(p))
+}
+
 /// The pattern a plain "Allow for session" keeps for a read-only command [`prefix_extends`]
 /// allows: its program (`cat`), or `git` and its subcommand (`git diff`), as a prefix. Such a
 /// rule holds anywhere in the workspace, but only for a call whose working directory and every
@@ -490,7 +530,7 @@ pub fn session_folder(action: &Action, ctx: &Context) -> Option<PathBuf> {
             return None;
         }
     }
-    crate::approval_server::folder_auto_matchable(&file, &folder, Some(home)).then_some(folder)
+    crate::approval_server::folder_auto_matchable(&full, &folder, Some(home)).then_some(folder)
 }
 
 /// `/`, the home folder, or a folder above it: never a folder grant, typed or not.
@@ -895,7 +935,10 @@ struct Probe {
     workspace_key: String,
     cwd_key: Option<String>,
     argv: Option<Vec<String>>,
+    /// The edited or read file, canonical: what path rules compare.
     path: Option<PathBuf>,
+    /// The same file as the call named it (absolute): a folder rule judges both.
+    named_path: Option<PathBuf>,
     /// The user's home, for the folder rule's sensitivity check.
     home: Option<PathBuf>,
     /// The command carries no secret and no exec-capable option, and its working directory and
@@ -929,11 +972,11 @@ impl Context<'_> {
     /// (inside, no `..`, no symlink, not a secret, not under `.git`, not a home dotfile). A path
     /// is a plain argument, the value of `--opt=value`, the rest of a short option cluster
     /// (`-f.env`), and the path part of a git `<rev>:<path>` (no hidden part at all there).
-    /// Fails closed on what the shell would expand (`~…`) and on [`unrestricted_traversal`].
+    /// Fails closed on what the shell would expand (`~…`), on [`unrestricted_traversal`] and on
+    /// an `rg` that may search a folder ([`rg_searches_a_folder`]).
     ///
-    /// Ceiling: what a program selects by itself is not a word here. `rg` on a folder reads the
-    /// files it finds (it skips hidden and git-ignored ones by default), and `git diff`/`show`/
-    /// `log -p` print the files git tracks.
+    /// Ceiling: what a program selects by itself is not a word here. `git diff`/`show`/`log -p`
+    /// print the files git tracks.
     fn args_contained(&self, argv: &[String]) -> bool {
         let Some(cwd) = self.cwd else {
             return false;
@@ -956,8 +999,14 @@ impl Context<'_> {
             })
         };
         let path_ok = |word: &str| word.is_empty() || (revision_path_ok(word) && readable(word));
+        let is_file = |word: &str| {
+            self.absolute(word)
+                .and_then(|p| std::fs::symlink_metadata(p).ok())
+                .is_some_and(|meta| meta.is_file())
+        };
         readable(cwd)
             && !unrestricted_traversal(argv)
+            && !rg_searches_a_folder(argv, is_file)
             && argv.iter().skip(1).all(|arg| {
                 if let Some(long) = arg.strip_prefix("--") {
                     !arg.contains('~') && long.split_once('=').is_none_or(|(_, v)| path_ok(v))
@@ -992,17 +1041,19 @@ impl Context<'_> {
         // The app's own session read pattern is the only rule that judges the call: a plain
         // read that stays in the workspace. A user's rule matches as written.
         let args_contained = plain && argv.as_ref().is_some_and(|argv| self.args_contained(argv));
-        let path = match action {
-            Action::Edit { path } | Action::Read { path } => self
-                .absolute(path)
-                .map(|full| crate::approval_server::canonical_target(&full)),
+        let named_path = match action {
+            Action::Edit { path } | Action::Read { path } => self.absolute(path),
             _ => None,
         };
+        let path = named_path
+            .as_deref()
+            .map(crate::approval_server::canonical_target);
         Probe {
             workspace_key: self.workspace_key(),
             cwd_key: self.cwd.map(canonical_or_raw),
             argv,
             path,
+            named_path,
             home: self.home.map(Path::to_owned),
             args_contained,
         }
@@ -1388,7 +1439,7 @@ impl Rule {
                 probe.path.as_deref() == Some(Path::new(path))
             }
             // No home known: the home-dotfile protections cannot apply, so nothing matches.
-            (Target::Dir { dir }, Action::Edit { .. }) => match (&probe.path, &probe.home) {
+            (Target::Dir { dir }, Action::Edit { .. }) => match (&probe.named_path, &probe.home) {
                 (Some(p), Some(home)) => {
                     crate::approval_server::folder_auto_matchable(p, Path::new(dir), Some(home))
                 }
@@ -4208,8 +4259,6 @@ mod tests {
         for (rule, ok) in [
             (&grep, "grep -n needle README.md"),
             (&grep, "grep --max-count=5 needle README.md"),
-            (&rg, "rg -n needle src"),
-            (&rg, "rg --glob=src needle"),
             (&git, "git show HEAD:src/a.rs"),
         ] {
             assert!(rule.matches(&shell(ok), &c), "{ok}");
@@ -4232,6 +4281,9 @@ mod tests {
             (&rg, "rg --no-ignore needle"),
             (&rg, "rg --follow needle"),
             (&rg, "rg -L needle"),
+            // Any rg recursion: a folder, or no path at all.
+            (&rg, "rg -n needle src"),
+            (&rg, "rg --glob=src needle"),
             // A hidden file in a revision (#3).
             (&git, "git show HEAD:.bashrc"),
             (&git, "git show HEAD:.github/workflows/ci.yml"),
@@ -4239,6 +4291,99 @@ mod tests {
         ] {
             assert!(!rule.matches(&shell(refused), &c), "{refused}");
         }
+    }
+
+    /// rg searches a folder recursively, secret-named files included (`.env` is skipped only when
+    /// it is hidden or ignored; `credentials.json`, `id_ed25519` and `prod.key` are not). A
+    /// session `rg` pattern therefore covers only a search of named files, never `rg x .`.
+    #[test]
+    fn a_session_rg_pattern_never_covers_a_recursive_search() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let ws = std::fs::canonicalize(tmp.path()).expect("canon");
+        std::fs::create_dir_all(ws.join("src")).expect("src");
+        std::fs::write(ws.join("README.md"), "needle").expect("readme");
+        std::fs::write(ws.join("src/a.rs"), "needle").expect("a.rs");
+        std::fs::write(ws.join("src/credentials.json"), "needle").expect("secret");
+        let root = ws.to_string_lossy().into_owned();
+        let c = ctx("codex", &ws, Some(&root));
+        let rg = Rule {
+            workspace: c.workspace_key(),
+            cwd: None,
+            origin: "codex".into(),
+            kind: ActionKind::Shell,
+            target: Target::Argv {
+                argv: argv(&["rg"]),
+                prefix: true,
+            },
+        };
+        for ok in [
+            "rg needle README.md",
+            "rg -n needle README.md src/a.rs",
+            "rg -eneedle README.md",
+            "rg --regexp=needle -- README.md",
+        ] {
+            assert!(rg.matches(&shell(ok), &c), "{ok}");
+        }
+        for refused in [
+            "rg x .",
+            "rg needle",
+            "rg -n needle src",
+            "rg needle README.md src",
+            "rg --glob=src needle",
+            "rg -e needle",
+            "rg -e needle src",
+            // A separate option value is read as a path, so it fails closed.
+            "rg -e needle README.md",
+            "rg -g -e src -e x README.md",
+            "rg -eneedle src README.md",
+            "rg -ie needle src README.md",
+            "rg --regexp needle src",
+            "rg -f README.md src",
+            "rg -e x -- src",
+            "rg -t rust needle",
+            "rg needle missing.rs",
+        ] {
+            assert!(!rg.matches(&shell(refused), &c), "{refused}");
+        }
+        // Answered for the session, a recursive search keeps the exact call, not `rg …`.
+        let exact = decide(Some(&shell("rg x .")), None, Scope::Session, &c).expect("exact");
+        assert!(matches!(&exact.target, Target::Argv { prefix: false, .. }));
+        let widened =
+            decide(Some(&shell("rg x README.md")), None, Scope::Session, &c).expect("widened");
+        assert!(matches!(&widened.target, Target::Argv { prefix: true, .. }));
+    }
+
+    /// A session folder rule is judged on the path the agent named as well as on the file it
+    /// reaches: a `.claude` that is a symlink inside the folder still asks.
+    #[test]
+    fn a_session_folder_asks_for_a_symlinked_claude_settings_file() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = std::fs::canonicalize(tmp.path()).expect("canon");
+        let ws = root.join("ws");
+        let src = ws.join("src");
+        let home = root.join("home");
+        let cfg = src.join("cfg");
+        for d in [&cfg, &home] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        std::os::unix::fs::symlink(&cfg, src.join(".claude")).expect("dir link");
+        let ws_s = ws.to_string_lossy().into_owned();
+        let c = Context {
+            driver: "claude",
+            workspace: &ws,
+            cwd: Some(&ws_s),
+            home: Some(&home),
+        };
+        let edit = |p: &Path| Action::Edit {
+            path: p.to_string_lossy().into_owned(),
+        };
+        let rule =
+            decide(Some(&edit(&src.join("a.rs"))), None, Scope::Session, &c).expect("session rule");
+        assert!(matches!(rule.target, Target::Dir { .. }));
+        let linked = edit(&src.join(".claude/settings.json"));
+        assert!(!rule.matches(&linked, &c), "the symlinked .claude asks");
+        assert_eq!(session_folder(&linked, &c), None, "and keeps no folder");
+        assert!(rule.matches(&edit(&cfg.join("settings.json")), &c));
     }
 
     /// Codex wraps commands in the user's own login shell, wherever it lives (Linuxbrew, Nix,
