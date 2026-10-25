@@ -10,6 +10,11 @@
 //! - The pull request opens on the repository of the branch's push remote. A fork workflow
 //!   (push to `origin`, open against `upstream`) gets the fork's own compare page, where GitHub
 //!   offers to switch the base repository.
+//! - The base is read from remote-tracking refs, never from the network. When a remote has no
+//!   `HEAD` and no `main`/`master` ref, it stays unknown and only the destination rules (never a
+//!   differently named branch) protect it. A repository reached by two different SSH host aliases
+//!   reads as two repositories, so its push state is `Unknown` and a default-named branch is
+//!   refused.
 //! - Only `github.com`, GitHub Enterprise Cloud (`*.ghe.com`) and hosts named `github.*` are
 //!   recognised. An SSH host alias (`github-work:o/r`) is not read through `~/.ssh/config`.
 
@@ -126,6 +131,25 @@ pub enum PushState {
     UpToDate,
     /// This many commits are not on the upstream yet.
     Ahead(u32),
+    /// What the push target holds cannot be read from here (a different push repository, or a
+    /// target never fetched): it may need pushing.
+    Unknown,
+}
+
+/// A remote setting shown to the user, without the user, password or token of a URL.
+fn without_userinfo(value: &str) -> String {
+    match value.split_once("://") {
+        Some((scheme, rest)) => {
+            let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+            let host = authority.rsplit('@').next().unwrap_or(authority);
+            if path.is_empty() {
+                format!("{scheme}://{host}")
+            } else {
+                format!("{scheme}://{host}/{path}")
+            }
+        }
+        None => value.rsplit('@').next().unwrap_or(value).to_owned(),
+    }
 }
 
 /// What opening a pull request for a tab's repository would involve.
@@ -159,7 +183,9 @@ impl PrState {
         self.push != PushState::UpToDate
     }
 
-    /// Whether this is the branch pull requests go into.
+    /// Whether the push destination is the branch pull requests go into. The base is read from
+    /// the push remote's repository (and is unknown when that differs from the fetch one), so
+    /// equal names are the same branch of the same repository.
     pub fn on_base(&self) -> bool {
         self.base.as_deref() == Some(self.remote_branch.as_str())
     }
@@ -201,12 +227,33 @@ pub fn pr_state(dir: &Path) -> Result<PrOutcome, String> {
     let remotes: Vec<String> = line(top, &["remote"])
         .map(|r| r.lines().map(str::to_owned).collect())
         .unwrap_or_default();
-    let configured = line(
+    // git's own order: branch.<b>.pushRemote, remote.pushDefault, branch.<b>.remote, origin.
+    // A configured push remote that is not a remote's name (a URL, say) is never replaced by
+    // another repository.
+    // Only the setting that wins is checked: an invalid default does not disable a valid branch one.
+    let configured_push = [
+        format!("branch.{branch}.pushRemote"),
+        "remote.pushDefault".to_owned(),
+    ]
+    .into_iter()
+    .find_map(|key| line(top, &["config", "--get", &key]).map(|name| (key, name)));
+    if let Some((key, name)) = &configured_push {
+        if !remotes.contains(name) {
+            let shown = agent_core::redact::redact(&without_userinfo(name));
+            return Ok(PrOutcome::Unavailable(format!(
+                "{key} is set to \"{shown}\", which is not one of this repository's remotes"
+            )));
+        }
+    }
+    let in_remotes = |r: String| remotes.contains(&r).then_some(r);
+    let tracked_remote = line(
         top,
         &["config", "--get", &format!("branch.{branch}.remote")],
     )
-    .filter(|r| remotes.contains(r));
-    let remote = configured
+    .and_then(in_remotes);
+    let remote = configured_push
+        .map(|(_, name)| name)
+        .or_else(|| tracked_remote.clone())
         .or_else(|| remotes.iter().find(|r| *r == "origin").cloned())
         .or_else(|| remotes.first().cloned());
     let Some(remote) = remote else {
@@ -214,35 +261,34 @@ pub fn pr_state(dir: &Path) -> Result<PrOutcome, String> {
             "This repository has no remote to open a pull request on".to_owned(),
         ));
     };
-    let url = line(top, &["remote", "get-url", "--push", "--", &remote])
-        .or_else(|| line(top, &["remote", "get-url", "--", &remote]))
-        .unwrap_or_default();
-    let github = parse_remote(&url);
-
-    let upstream = line(
+    let fetch_url = line(top, &["remote", "get-url", "--", &remote]);
+    // A push goes to every push URL, so all of them are read.
+    let push_urls: Vec<String> = line(
         top,
-        &[
-            "rev-parse",
-            "--abbrev-ref",
-            "--symbolic-full-name",
-            &format!("{branch}@{{upstream}}"),
-        ],
-    );
-    let remote_branch = upstream
-        .as_deref()
-        .and_then(|u| u.strip_prefix(&format!("{remote}/")))
-        .map(str::to_owned)
-        .unwrap_or_else(|| branch.clone());
-    let push = match &upstream {
-        None => PushState::NoUpstream,
-        Some(up) => match line(top, &["rev-list", "--count", &format!("{up}..{branch}")])
-            .and_then(|n| n.parse::<u32>().ok())
-        {
-            Some(0) => PushState::UpToDate,
-            Some(n) => PushState::Ahead(n),
-            None => PushState::NoUpstream,
-        },
+        &["remote", "get-url", "--push", "--all", "--", &remote],
+    )
+    .map(|u| u.lines().map(str::to_owned).collect())
+    .unwrap_or_default();
+    // Remote-tracking refs describe the fetch repository; they say nothing of a different push
+    // one. The same repository over another scheme (https fetch, ssh push) is not a different one.
+    let fetch_identity = fetch_url.as_deref().map(repo_identity);
+    let push_elsewhere = push_urls.len() > 1
+        || push_urls
+            .first()
+            .is_some_and(|p| Some(repo_identity(p)) != fetch_identity);
+    let github = parse_remote(push_urls.first().or(fetch_url.as_ref()).map_or("", |s| s));
+
+    // The upstream's branch, read from the config exactly (never by splitting `origin/a/b`).
+    let upstream_branch = if tracked_remote.as_deref() == Some(remote.as_str()) {
+        line(top, &["config", "--get", &format!("branch.{branch}.merge")])
+            .and_then(|m| m.strip_prefix("refs/heads/").map(str::to_owned))
+    } else {
+        None
     };
+    let follows_upstream = matches!(
+        line(top, &["config", "--get", "push.default"]).as_deref(),
+        Some("upstream" | "tracking")
+    );
     let base = line(
         top,
         &[
@@ -266,6 +312,51 @@ pub fn pr_state(dir: &Path) -> Result<PrOutcome, String> {
             .is_some()
         })
     });
+    // The remote-tracking refs describe the fetch repository: when the push goes elsewhere, the
+    // base read from them is not the push repository's, so it is unknown.
+    let fetch_base = base.clone();
+    let base = if push_elsewhere { None } else { base };
+    // With the push repository's base unknown, a branch that is, or is named like, a default
+    // branch could be pushed straight onto it. No request is made to find out.
+    if push_elsewhere
+        && (fetch_base.as_deref() == Some(branch.as_str())
+            || ["main", "master", "trunk", "develop"].contains(&branch.as_str()))
+    {
+        return Ok(PrOutcome::Unavailable(
+            "Can't tell this repository's base branch; push from a feature branch".to_owned(),
+        ));
+    }
+    // The upstream names the remote branch only when git's push would follow it, and never when
+    // that is the base branch of a feature branch: `checkout -b feat origin/main` tracks main.
+    let remote_branch = upstream_branch
+        .filter(|u| {
+            // A differently named destination needs a known base that it is not.
+            follows_upstream && (*u == branch || base.as_deref().is_some_and(|b| b != u))
+        })
+        .unwrap_or_else(|| branch.clone());
+    // Whether the push target has every commit, judged by its own remote-tracking ref.
+    // A different push repository, or a tracked branch whose push target was never fetched, cannot
+    // be judged from here: `Unknown`. A branch with neither upstream nor target is `NoUpstream`.
+    let tracked = line(top, &["config", "--get", &format!("branch.{branch}.merge")]).is_some();
+    let push = if push_elsewhere {
+        PushState::Unknown
+    } else {
+        match line(
+            top,
+            &[
+                "rev-list",
+                "--count",
+                &format!("refs/remotes/{remote}/{remote_branch}..{branch}"),
+            ],
+        )
+        .and_then(|n| n.parse::<u32>().ok())
+        {
+            Some(0) => PushState::UpToDate,
+            Some(n) => PushState::Ahead(n),
+            None if tracked => PushState::Unknown,
+            None => PushState::NoUpstream,
+        }
+    };
     let uncommitted = line(top, &["status", "--porcelain", "--untracked-files=no"]).is_some();
     Ok(PrOutcome::Ready(PrState {
         branch,
@@ -276,6 +367,31 @@ pub fn pr_state(dir: &Path) -> Result<PrOutcome, String> {
         push,
         uncommitted,
     }))
+}
+
+/// The arguments of the `git` command [`push_branch`] runs, and the one a confirmation shows:
+/// never forced, with the fully qualified refspec. Only a branch with no upstream gets one
+/// (`pr_state` reports a tracked branch as `Unknown`).
+pub fn push_args(state: &PrState) -> Vec<String> {
+    let mut args = vec!["push".to_owned()];
+    if state.push == PushState::NoUpstream {
+        args.push("--set-upstream".to_owned());
+    }
+    args.push(state.remote.clone());
+    args.push(format!(
+        "refs/heads/{}:refs/heads/{}",
+        state.branch, state.remote_branch
+    ));
+    args
+}
+
+/// A repository's identity from its URL: `host/owner/name` for a GitHub one, whatever the scheme
+/// (https, ssh, scp-style) or `.git` suffix; the trimmed URL otherwise.
+fn repo_identity(url: &str) -> String {
+    match parse_remote(url) {
+        Some(r) => format!("{}/{}", r.host, r.slug()).to_ascii_lowercase(),
+        None => url.trim().to_owned(),
+    }
 }
 
 /// Pushes `state`'s branch to its remote, never forced. A branch with no upstream gets one
@@ -289,15 +405,8 @@ pub fn push_branch(dir: &Path, state: &PrState) -> Result<(), String> {
     ] {
         crate::worktree::precheck_name(name, what)?;
     }
-    let refspec = format!(
-        "refs/heads/{}:refs/heads/{}",
-        state.branch, state.remote_branch
-    );
-    let mut args = vec!["push"];
-    if state.push == PushState::NoUpstream {
-        args.push("--set-upstream");
-    }
-    args.extend([state.remote.as_str(), refspec.as_str()]);
+    let args = push_args(state);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
     git_raw(dir, &args, &[], PUSH_TIMEOUT_SECS)
         .map(|_| ())
         .map_err(|why| agent_core::redact::redact(&why))
@@ -499,8 +608,354 @@ mod tests {
             let s = ready(&work);
             assert_eq!(
                 s.compare_url().as_deref(),
-                Some("https://github.com/o/r/compare/main...feat/y?expand=1")
+                // The fetch repository's base is not this repository's: GitHub picks its default.
+                Some("https://github.com/o/r/compare/feat/y?expand=1")
             );
+        }
+
+        /// Commits a file on the current branch.
+        fn commit_file(work: &Path, name: &str) {
+            fs::write(work.join(name), "x\n").unwrap();
+            sh(work, &["add", "."]);
+            sh(work, &["commit", "-q", "-m", name]);
+        }
+
+        #[test]
+        fn a_branch_cut_from_origin_main_pushes_to_its_own_name() {
+            let Some((_tmp, work)) = new_clone() else {
+                return;
+            };
+            sh(&work, &["checkout", "-q", "-b", "feat", "origin/main"]);
+            commit_file(&work, "b.txt");
+            let s = ready(&work);
+            assert_eq!(s.remote_branch, "feat");
+            assert!(!s.on_base());
+            assert!(s.needs_push());
+            push_branch(&work, &s).expect("push");
+            let bare = work.parent().unwrap().join("remote.git");
+            sh(&bare, &["rev-parse", "--verify", "refs/heads/feat"]);
+            let main = sh(&bare, &["rev-parse", "main"]);
+            let again = ready(&work);
+            assert_eq!(again.push, PushState::UpToDate);
+            assert_eq!(sh(&bare, &["rev-parse", "main"]), main, "main is untouched");
+        }
+
+        #[test]
+        fn the_push_remote_settings_pick_the_remote() {
+            let Some((tmp, work)) = new_clone() else {
+                return;
+            };
+            let fork = tmp.path().join("fork.git");
+            fs::create_dir_all(&fork).unwrap();
+            sh(&fork, &["init", "-q", "--bare"]);
+            sh(&work, &["remote", "add", "fork", fork.to_str().unwrap()]);
+            sh(&work, &["switch", "-q", "-c", "feat/z"]);
+            commit_file(&work, "z.txt");
+            sh(&work, &["config", "branch.feat/z.pushRemote", "fork"]);
+            let s = ready(&work);
+            assert_eq!(s.remote, "fork");
+            push_branch(&work, &s).expect("push");
+            sh(&fork, &["rev-parse", "--verify", "refs/heads/feat/z"]);
+
+            sh(&work, &["config", "--unset", "branch.feat/z.pushRemote"]);
+            sh(&work, &["config", "branch.feat/z.remote", "origin"]);
+            assert_eq!(ready(&work).remote, "origin");
+            sh(&work, &["config", "remote.pushDefault", "fork"]);
+            assert_eq!(ready(&work).remote, "fork");
+        }
+
+        #[test]
+        fn without_origin_head_the_push_never_targets_the_base() {
+            let Some((_tmp, work)) = new_clone() else {
+                return;
+            };
+            sh(&work, &["remote", "set-head", "origin", "-d"]);
+            sh(&work, &["checkout", "-q", "-b", "feat", "origin/main"]);
+            commit_file(&work, "b.txt");
+            sh(&work, &["config", "push.default", "upstream"]);
+            let s = ready(&work);
+            assert_ne!(s.remote_branch, "main");
+            assert_eq!(s.remote_branch, "feat");
+            assert!(!s.on_base());
+        }
+
+        #[test]
+        fn an_unknown_base_never_lets_the_upstream_name_the_destination() {
+            let Some((_tmp, work)) = new_clone() else {
+                return;
+            };
+            sh(&work, &["remote", "set-head", "origin", "-d"]);
+            sh(
+                &work,
+                &["update-ref", "refs/remotes/origin/develop", "HEAD"],
+            );
+            sh(&work, &["update-ref", "-d", "refs/remotes/origin/main"]);
+            sh(&work, &["checkout", "-q", "-b", "feat", "origin/develop"]);
+            commit_file(&work, "b.txt");
+            sh(&work, &["config", "push.default", "upstream"]);
+            let s = ready(&work);
+            assert_eq!(s.base, None);
+            assert_eq!(s.remote_branch, "feat");
+        }
+
+        #[test]
+        fn a_push_remote_that_is_a_url_is_unavailable() {
+            let Some((_tmp, work)) = new_clone() else {
+                return;
+            };
+            sh(&work, &["switch", "-q", "-c", "feat"]);
+            sh(&work, &["config", "branch.feat.remote", "origin"]);
+            sh(
+                &work,
+                &[
+                    "config",
+                    "branch.feat.pushRemote",
+                    "https://github.com/me/fork.git",
+                ],
+            );
+            assert!(matches!(pr_state(&work), Ok(PrOutcome::Unavailable(_))));
+            sh(&work, &["config", "--unset", "branch.feat.pushRemote"]);
+            sh(&work, &["config", "remote.pushDefault", "nowhere"]);
+            assert!(matches!(pr_state(&work), Ok(PrOutcome::Unavailable(_))));
+        }
+
+        #[test]
+        fn the_upstream_is_read_from_config_not_split_from_its_name() {
+            let Some((tmp, work)) = new_clone() else {
+                return;
+            };
+            let other = tmp.path().join("release.git");
+            fs::create_dir_all(&other).unwrap();
+            sh(&other, &["init", "-q", "--bare"]);
+            // `git remote add` refuses the name, but a hand-edited config can hold it.
+            sh(
+                &work,
+                &[
+                    "config",
+                    "remote.origin/release.url",
+                    other.to_str().unwrap(),
+                ],
+            );
+            sh(&work, &["switch", "-q", "-c", "feat"]);
+            commit_file(&work, "b.txt");
+            sh(
+                &work,
+                &[
+                    "config",
+                    "remote.origin/release.fetch",
+                    "+refs/heads/*:refs/remotes/origin/release/*",
+                ],
+            );
+            sh(
+                &work,
+                &["update-ref", "refs/remotes/origin/release/3.4", "HEAD"],
+            );
+            sh(&work, &["config", "branch.feat.remote", "origin/release"]);
+            sh(&work, &["config", "branch.feat.merge", "refs/heads/3.4"]);
+            sh(&work, &["config", "branch.feat.pushRemote", "origin"]);
+            sh(&work, &["config", "push.default", "upstream"]);
+            let s = ready(&work);
+            assert_eq!(s.remote, "origin");
+            assert_eq!(s.remote_branch, "feat", "the upstream is on another remote");
+
+            sh(&work, &["config", "--unset", "branch.feat.pushRemote"]);
+            let s = ready(&work);
+            assert_eq!(s.remote, "origin/release");
+            assert_eq!(s.remote_branch, "feat", "no base is known on that remote");
+        }
+
+        #[test]
+        fn a_different_push_url_is_never_up_to_date() {
+            let Some((tmp, work)) = new_clone() else {
+                return;
+            };
+            sh(&work, &["switch", "-q", "-c", "feat"]);
+            commit_file(&work, "b.txt");
+            sh(&work, &["update-ref", "refs/remotes/origin/feat", "HEAD"]);
+            assert_eq!(ready(&work).push, PushState::UpToDate);
+            let fork = tmp.path().join("fork.git");
+            fs::create_dir_all(&fork).unwrap();
+            sh(&fork, &["init", "-q", "--bare"]);
+            sh(
+                &work,
+                &[
+                    "remote",
+                    "set-url",
+                    "--push",
+                    "origin",
+                    fork.to_str().unwrap(),
+                ],
+            );
+            assert_eq!(ready(&work).push, PushState::Unknown);
+        }
+
+        #[test]
+        fn a_different_push_repository_does_not_lend_its_base_to_the_destination() {
+            let Some((tmp, work)) = new_clone() else {
+                return;
+            };
+            sh(
+                &work,
+                &["update-ref", "refs/remotes/origin/develop", "HEAD"],
+            );
+            sh(&work, &["checkout", "-q", "-b", "feat", "origin/develop"]);
+            commit_file(&work, "b.txt");
+            sh(&work, &["config", "push.default", "upstream"]);
+            let fork = tmp.path().join("fork.git");
+            fs::create_dir_all(&fork).unwrap();
+            sh(&fork, &["init", "-q", "--bare"]);
+            sh(
+                &work,
+                &[
+                    "remote",
+                    "set-url",
+                    "--push",
+                    "origin",
+                    fork.to_str().unwrap(),
+                ],
+            );
+            let s = ready(&work);
+            assert_eq!(s.base, None);
+            assert_eq!(s.remote_branch, "feat");
+        }
+
+        #[test]
+        fn an_invalid_default_does_not_disable_a_valid_branch_push_remote() {
+            let Some((_tmp, work)) = new_clone() else {
+                return;
+            };
+            sh(&work, &["switch", "-q", "-c", "feat"]);
+            sh(&work, &["config", "branch.feat.pushRemote", "origin"]);
+            sh(&work, &["config", "remote.pushDefault", "nowhere"]);
+            assert_eq!(ready(&work).remote, "origin");
+        }
+
+        #[test]
+        fn on_base_reads_the_destination_not_the_local_name() {
+            let Some((tmp, work)) = new_clone() else {
+                return;
+            };
+            let fork = tmp.path().join("fork.git");
+            fs::create_dir_all(&fork).unwrap();
+            sh(&fork, &["init", "-q", "--bare"]);
+            sh(&work, &["remote", "add", "fork", fork.to_str().unwrap()]);
+            sh(&work, &["update-ref", "refs/remotes/fork/main", "HEAD"]);
+            sh(&work, &["config", "branch.main.remote", "fork"]);
+            sh(&work, &["config", "branch.main.merge", "refs/heads/topic"]);
+            sh(&work, &["config", "push.default", "upstream"]);
+            let s = ready(&work);
+            assert_eq!(s.branch, "main");
+            assert_eq!(s.remote_branch, "topic");
+            assert!(!s.on_base());
+        }
+
+        /// Points `origin` at GitHub: fetched over https, pushed over each of `pushes`.
+        fn github_origin(work: &Path, pushes: &[&str]) {
+            sh(
+                work,
+                &["remote", "set-url", "origin", "https://github.com/o/r.git"],
+            );
+            for (i, p) in pushes.iter().enumerate() {
+                let add: &[&str] = if i == 0 {
+                    &["remote", "set-url", "--push", "origin", p]
+                } else {
+                    &["remote", "set-url", "--add", "--push", "origin", p]
+                };
+                sh(work, add);
+            }
+        }
+
+        #[test]
+        fn https_fetch_and_ssh_push_of_one_repository_keep_the_base() {
+            let Some((_tmp, work)) = new_clone() else {
+                return;
+            };
+            github_origin(&work, &["git@github.com:o/r.git"]);
+            let s = ready(&work);
+            assert_eq!(s.base.as_deref(), Some("main"));
+            assert!(s.on_base(), "main is the base, so the action is off");
+        }
+
+        #[test]
+        fn a_different_push_repository_refuses_a_default_named_branch_only() {
+            let Some((tmp, work)) = new_clone() else {
+                return;
+            };
+            let fork = tmp.path().join("fork.git");
+            fs::create_dir_all(&fork).unwrap();
+            sh(&fork, &["init", "-q", "--bare"]);
+            sh(
+                &work,
+                &[
+                    "remote",
+                    "set-url",
+                    "--push",
+                    "origin",
+                    fork.to_str().unwrap(),
+                ],
+            );
+            assert!(matches!(pr_state(&work), Ok(PrOutcome::Unavailable(_))));
+            sh(&work, &["switch", "-q", "-c", "feat"]);
+            assert_eq!(ready(&work).remote_branch, "feat");
+        }
+
+        #[test]
+        fn every_push_url_counts() {
+            let Some((_tmp, work)) = new_clone() else {
+                return;
+            };
+            sh(&work, &["switch", "-q", "-c", "feat"]);
+            commit_file(&work, "b.txt");
+            sh(&work, &["update-ref", "refs/remotes/origin/feat", "HEAD"]);
+            github_origin(
+                &work,
+                &["https://github.com/o/r.git", "git@github.com:o/r.git"],
+            );
+            let s = ready(&work);
+            assert_eq!(s.push, PushState::Unknown);
+            assert_eq!(s.base, None);
+        }
+
+        #[test]
+        fn the_confirmation_and_the_push_share_one_command() {
+            let mut s = super::state(PushState::NoUpstream);
+            s.branch = "feat".into();
+            s.remote_branch = "topic".into();
+            assert_eq!(
+                push_args(&s),
+                [
+                    "push",
+                    "--set-upstream",
+                    "origin",
+                    "refs/heads/feat:refs/heads/topic"
+                ]
+            );
+            s.push = PushState::Unknown;
+            assert_eq!(
+                push_args(&s),
+                ["push", "origin", "refs/heads/feat:refs/heads/topic"]
+            );
+        }
+
+        #[test]
+        fn a_rejected_push_remote_url_is_shown_without_its_credentials() {
+            let Some((_tmp, work)) = new_clone() else {
+                return;
+            };
+            sh(&work, &["switch", "-q", "-c", "feat"]);
+            sh(
+                &work,
+                &[
+                    "config",
+                    "branch.feat.pushRemote",
+                    "https://user:tok@host/x.git",
+                ],
+            );
+            let Ok(PrOutcome::Unavailable(why)) = pr_state(&work) else {
+                panic!("expected Unavailable");
+            };
+            assert!(!why.contains("tok") && !why.contains("user"), "{why}");
+            assert!(why.contains("host/x.git"), "{why}");
         }
 
         #[test]
