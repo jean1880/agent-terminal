@@ -12,6 +12,7 @@ pub fn run_command(
     timeout_secs: u64,
 ) -> Result<std::process::Output, String> {
     use std::io::Read;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -29,17 +30,31 @@ pub fn run_command(
     // a background job the command started (an rc's `foo &`) inherits the
     // pipes and can hold them open long after the command itself exits.
     // Ceiling: such a job is not killed, only no longer waited for.
+    //
+    // Once this function returns (by any path) `StopOnDrop` raises `stop`, and
+    // a drain that wakes up for more output drops its pipe and exits instead
+    // of buffering a surviving job's output without bound.
+    struct StopOnDrop(Arc<AtomicBool>);
+    impl Drop for StopOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let _stop_on_return = StopOnDrop(Arc::clone(&stop));
     type Drained = (Arc<Mutex<Vec<u8>>>, mpsc::Receiver<()>);
     let drain = |pipe: Option<Box<dyn Read + Send>>| -> Drained {
         let buffer = Arc::new(Mutex::new(Vec::new()));
         let (done, finished) = mpsc::channel();
         let sink = Arc::clone(&buffer);
+        let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
             if let Some(mut pipe) = pipe {
                 let mut chunk = [0u8; 8192];
                 loop {
                     match pipe.read(&mut chunk) {
                         Ok(0) | Err(_) => break,
+                        Ok(_) if stop.load(Ordering::Relaxed) => break,
                         Ok(n) => {
                             if let Ok(mut bytes) = sink.lock() {
                                 bytes.extend_from_slice(&chunk[..n]);
@@ -97,4 +112,43 @@ pub fn run_command(
         stdout: collect(stdout),
         stderr: collect(stderr),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A background job outlives the command and keeps writing into its
+    /// stdout. After `run_command` returns, the drain must let go of the pipe
+    /// (the job's next write then fails) instead of buffering the rest forever.
+    #[test]
+    fn a_leftover_background_writer_is_not_drained_after_return() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("pipe-closed");
+        // The writer is bounded by itself: at most 100 x 64 KiB over ~5 s. It
+        // ignores SIGPIPE so a closed pipe shows up as a failed write.
+        let script = format!(
+            "( trap '' PIPE; i=0; while [ $i -lt 100 ]; do \
+               head -c 65536 /dev/zero || {{ touch '{}'; exit 0; }}; \
+               sleep 0.05; i=$((i+1)); done ) & echo hi",
+            marker.display()
+        );
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg(script);
+        let out = run_command(cmd, "sh", 10).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim_start()[..2],
+            *"hi"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !marker.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            marker.exists(),
+            "the drain kept reading after run_command returned"
+        );
+    }
 }
