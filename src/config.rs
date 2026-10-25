@@ -957,12 +957,14 @@ fn keep_copy(path: &Path, tag: &str) -> Option<PathBuf> {
     }
 }
 
-/// Whether a file named as a kept copy may be reused: a regular file (not a symlink, so neither
-/// its contents nor a mode change reach another file) owned by this user.
+/// Whether a file named as a kept copy may be reused: a regular file with one link (not a
+/// symlink or a hard link, so neither its contents nor a mode change reach another path) owned
+/// by this user.
 fn reusable_copy(path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
-    fs::symlink_metadata(path)
-        .is_ok_and(|m| m.file_type().is_file() && m.uid() == agent_kit::fsutil::effective_uid())
+    fs::symlink_metadata(path).is_ok_and(|m| {
+        m.file_type().is_file() && m.uid() == agent_kit::fsutil::effective_uid() && m.nlink() == 1
+    })
 }
 
 /// Narrows a kept copy to `0600` when it is wider, through a handle opened without following a
@@ -979,7 +981,11 @@ fn make_private(path: &Path) -> bool {
     let Ok(meta) = file.metadata() else {
         return false;
     };
-    if !meta.file_type().is_file() || meta.uid() != agent_kit::fsutil::effective_uid() {
+    // A second link is another path to the same inode: its mode is not this copy's to change.
+    if !meta.file_type().is_file()
+        || meta.uid() != agent_kit::fsutil::effective_uid()
+        || meta.nlink() != 1
+    {
         return false;
     }
     meta.permissions().mode() & 0o077 == 0
@@ -2934,6 +2940,29 @@ mod tests {
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
         let mode = std::fs::metadata(&elsewhere).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o644, "the link's target was touched");
+    }
+
+    #[test]
+    fn a_hard_linked_backup_is_not_chmodded_and_a_fresh_copy_is_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let broken = br#"{ "env": {"TOKEN": "s3cret"}, oops }"#;
+        std::fs::write(&path, broken).unwrap();
+        // An identical 0644 backup that is also another path (st_nlink 2).
+        let other = dir.path().join("someone-elses-file");
+        std::fs::write(&other, broken).unwrap();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let linked = dir.path().join("config.json.invalid-1");
+        std::fs::hard_link(&other, &linked).unwrap();
+
+        let kept = keep_copy(&path, "invalid").expect("kept");
+        let mode = std::fs::metadata(&other).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o644, "the shared inode was chmodded");
+        assert_ne!(kept, linked, "a hard-linked backup was reused");
+        let meta = std::fs::symlink_metadata(&kept).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read(&kept).unwrap(), broken);
     }
 
     #[test]
