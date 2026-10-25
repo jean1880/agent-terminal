@@ -7,14 +7,11 @@ fn turn_completed(session: &ChatSession, state: TurnState) {
 fn queued_session(driver: Driver, log: &Log) -> (Rc<Store>, ThreadId, Rc<ChatSession>, Seen) {
     let store = Rc::new(Store::open_in_memory().expect("store"));
     let thread = fresh(&store, "/w");
-    let (sink, seen) = make_sink();
-    let session = ChatSession::new(
+    let (session, seen) = harness(
         FakeAdapter::writing_with_open_turn(driver, log),
         open_on("m1"),
-        store.clone(),
-        thread.clone(),
-        sink,
-        None,
+        &store,
+        &thread,
     );
     let log = log.clone();
     session.set_adapter_factory(Rc::new(move |d| {
@@ -577,14 +574,11 @@ fn a_dead_codex_process_still_answers_cached_context_usage() {
     in_loop(|_| {
         let store = Rc::new(Store::open_in_memory().expect("store"));
         let thread = fresh(&store, "/w");
-        let (sink, seen) = make_sink();
-        let session = ChatSession::new(
+        let (session, seen) = harness(
             Box::new(agent_core::codex::CodexAdapter::new()),
             open_on("m1"),
-            store.clone(),
-            thread.clone(),
-            sink,
-            None,
+            &store,
+            &thread,
         );
         let generation = session.inner.generation.get();
         session.inner.on_line(generation,
@@ -713,14 +707,11 @@ fn a_direct_prompt_store_failure_keeps_unique_ids_after_reopen() {
         let log: Log = Rc::default();
         let mut ids = Vec::new();
         for round in 0..2 {
-            let (sink, seen) = make_sink();
-            let session = ChatSession::new(
+            let (session, seen) = harness(
                 FakeAdapter::writing_with_open_turn(Driver::Agy, &log),
                 open_on("m1"),
-                store.clone(),
-                thread.clone(),
-                sink,
-                None,
+                &store,
+                &thread,
             );
             let provider = session
                 .inner

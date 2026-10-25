@@ -5667,6 +5667,19 @@ mod tests {
         )
     }
 
+    /// A session on `adapter` and `open` for `thread` in `store`, with no approval socket, and
+    /// what it emits.
+    pub(super) fn harness<S: Clone + Into<SessionStore>>(
+        adapter: Box<dyn Adapter>,
+        open: OpenSession,
+        store: &S,
+        thread: &ThreadId,
+    ) -> (Rc<ChatSession>, Seen) {
+        let (sink, seen) = make_sink();
+        let session = ChatSession::new(adapter, open, store.clone(), thread.clone(), sink, None);
+        (session, seen)
+    }
+
     fn has(seen: &Seen, f: impl Fn(&Event) -> bool) -> bool {
         seen.borrow().iter().any(|e| f(&e.event))
     }
@@ -5749,14 +5762,11 @@ mod tests {
             let tmp = tempfile::tempdir().expect("tmp");
             let store = Rc::new(Store::open_in_memory().expect("store"));
             let thread = fresh(&store, &tmp.path().to_string_lossy());
-            let (sink, seen) = make_sink();
-            let session = ChatSession::new(
+            let (session, seen) = harness(
                 Box::new(AgyAdapter::new("agy")),
                 fake_agy(tmp.path()),
-                store.clone(),
-                thread.clone(),
-                sink,
-                None,
+                &store,
+                &thread,
             );
             // Without the hook agy cannot ask: Ask runs as Plan, and the user is told.
             assert!(has(
@@ -5832,14 +5842,11 @@ mod tests {
             let tmp = tempfile::tempdir().expect("tmp");
             let store = Rc::new(Store::open_in_memory().expect("store"));
             let thread = fresh(&store, &tmp.path().to_string_lossy());
-            let (sink, seen) = make_sink();
-            let session = ChatSession::new(
+            let (session, seen) = harness(
                 Box::new(AgyAdapter::new("agy")),
                 fake_agy(tmp.path()),
-                store,
-                thread,
-                sink,
-                None,
+                &store,
+                &thread,
             );
 
             session.send_prompt("remember this conversation");
@@ -5901,14 +5908,11 @@ mod tests {
             let tmp = tempfile::tempdir().expect("tmp");
             let store = Rc::new(Store::open_in_memory().expect("store"));
             let thread = fresh(&store, &tmp.path().to_string_lossy());
-            let (sink, seen) = make_sink();
-            let session = ChatSession::new(
+            let (session, seen) = harness(
                 Box::new(agent_core::claude::ClaudeAdapter::new()),
                 idle_claude(tmp.path()),
-                store.clone(),
-                thread.clone(),
-                sink,
-                None,
+                &store,
+                &thread,
             );
             let turns_done = |seen: &Seen| {
                 seen.borrow()
@@ -6126,17 +6130,14 @@ mod tests {
             let tmp = tempfile::tempdir().expect("tmp");
             let store = Rc::new(Store::open_in_memory().expect("store"));
             let thread = fresh(&store, &tmp.path().to_string_lossy());
-            let (sink, _seen) = make_sink();
-            let session = ChatSession::new(
+            let (session, _seen) = harness(
                 claude(),
                 scripted(
                     tmp.path(),
                     "IFS= read -r handshake\necho ''\necho 'not json'\nexit 3",
                 ),
-                store,
-                thread,
-                sink,
-                None,
+                &store,
+                &thread,
             );
             let told = Rc::new(RefCell::new(Vec::<crate::chat::Lifecycle>::new()));
             let t = told.clone();
@@ -6168,14 +6169,11 @@ mod tests {
             let tmp = tempfile::tempdir().expect("tmp");
             let store = Rc::new(Store::open_in_memory().expect("store"));
             let thread = fresh(&store, &tmp.path().to_string_lossy());
-            let (sink, seen) = make_sink();
-            let session = ChatSession::new(
+            let (session, seen) = harness(
                 Box::new(agent_core::claude::ClaudeAdapter::new()),
                 idle_claude(tmp.path()),
-                store,
-                thread,
-                sink,
-                None,
+                &store,
+                &thread,
             );
             session.reload_session();
             assert!(pump_until(ctx, 10, || has(&seen, |e| matches!(
@@ -6268,14 +6266,11 @@ mod tests {
                 .iter()
                 .any(|e| matches!(&e.event, Event::Notice { text } if text.contains("2 of 3"))));
             let open = || {
-                let (sink, _seen) = make_sink();
-                let session = ChatSession::new(
+                let (session, _seen) = harness(
                     Box::new(agent_core::claude::ClaudeAdapter::new()),
                     answering_claude(tmp.path()),
-                    store.clone(),
-                    thread.clone(),
-                    sink,
-                    None,
+                    &store,
+                    &thread,
                 );
                 let owed = undelivered_handoff(&history()).expect("owed to the new session");
                 session.restore_handoff(owed);
@@ -6366,14 +6361,11 @@ mod tests {
                      exit 0"
                 ),
             );
-            let (sink, seen) = make_sink();
-            let session = ChatSession::new(
+            let (session, seen) = harness(
                 Box::new(agent_core::claude::ClaudeAdapter::new()),
                 open,
-                store.clone(),
-                thread.clone(),
-                sink,
-                None,
+                &store,
+                &thread,
             );
             session.restore_handoff(undelivered_handoff(&history()).expect("owed"));
             if !before.is_empty() {
@@ -6515,14 +6507,11 @@ mod tests {
             let tmp = tempfile::tempdir().expect("tmp");
             let store = Rc::new(Store::open_in_memory().expect("store"));
             let thread = fresh(&store, &tmp.path().to_string_lossy());
-            let (sink, seen) = make_sink();
-            let session = ChatSession::new(
+            let (session, seen) = harness(
                 Box::new(agent_core::claude::ClaudeAdapter::new()),
                 idle_claude(tmp.path()),
-                store,
-                thread,
-                sink,
-                None,
+                &store,
+                &thread,
             );
             assert!(!session.suspend_if_idle(), "nothing is running yet");
             session.reload_session();
@@ -6624,15 +6613,12 @@ mod tests {
         in_loop(|_| {
             let store = Rc::new(Store::open_in_memory().expect("store"));
             let thread = fresh(&store, "/w");
-            let (sink, seen) = make_sink();
             let log: Log = Rc::default();
-            let session = ChatSession::new(
+            let (session, seen) = harness(
                 FakeAdapter::boxed(Driver::Claude, &log),
                 open_on("claude-sonnet-3-7"),
-                store.clone(),
-                thread.clone(),
-                sink,
-                None,
+                &store,
+                &thread,
             );
             session.set_retired(Some(retired("claude-sonnet-3-7", "sonnet")));
             session.send_prompt("hello");
@@ -6666,15 +6652,12 @@ mod tests {
         in_loop(|_| {
             let store = Rc::new(Store::open_in_memory().expect("store"));
             let thread = fresh(&store, "/w");
-            let (sink, seen) = make_sink();
             let log: Log = Rc::default();
-            let session = ChatSession::new(
+            let (session, seen) = harness(
                 FakeAdapter::boxed(Driver::Claude, &log),
                 open_on("old"),
-                store,
-                thread,
-                sink,
-                None,
+                &store,
+                &thread,
             );
             session.set_retired(Some(retired("old", "sonnet")));
             session.switch(Driver::Claude, Some("opus".into()), None);
@@ -7084,14 +7067,11 @@ mod tests {
             let tmp = tempfile::tempdir().expect("tmp");
             let store = Rc::new(Store::open_in_memory().expect("store"));
             let thread = fresh(&store, "/w");
-            let (sink, seen) = make_sink();
-            let session = ChatSession::new(
+            let (session, seen) = harness(
                 Box::new(AgyAdapter::new("agy")),
                 fake_agy(tmp.path()),
-                store,
-                thread,
-                sink,
-                None,
+                &store,
+                &thread,
             );
             session.respond_approval("r1", Decision::Allow);
             assert!(has(
@@ -7151,15 +7131,12 @@ mod tests {
         in_loop(|_| {
             let store = Rc::new(Store::open_in_memory().expect("store"));
             let thread = fresh(&store, "/w");
-            let (sink, seen) = make_sink();
             let log: Log = Rc::default();
-            let session = ChatSession::new(
+            let (session, seen) = harness(
                 FakeAdapter::boxed(Driver::Claude, &log),
                 open_on("opus"),
-                store,
-                thread,
-                sink,
-                None,
+                &store,
+                &thread,
             );
             // No card was seen for "r1", so there is nothing a rule could keep: "Allow for
             // session" resolves as a plain Allow (never a claim of a rule that does not exist).
@@ -7186,14 +7163,11 @@ mod tests {
             let tmp = tempfile::tempdir().expect("tmp");
             let store = Rc::new(Store::open_in_memory().expect("store"));
             let thread = fresh(&store, "/w");
-            let (sink, seen) = make_sink();
-            let session = ChatSession::new(
+            let (session, seen) = harness(
                 Box::new(AgyAdapter::new("agy")),
                 fake_agy(tmp.path()),
-                store,
-                thread,
-                sink,
-                None,
+                &store,
+                &thread,
             );
             session.send_prompt("hi");
             assert!(pump_until(ctx, 15, || exited_count(&seen) >= 1));
@@ -7363,15 +7337,12 @@ mod tests {
         in_loop(|_| {
             let store = Rc::new(Store::open_in_memory().expect("store"));
             let thread = fresh(&store, "/w");
-            let (sink, seen) = make_sink();
             let log: Log = Rc::default();
-            let session = ChatSession::new(
+            let (session, seen) = harness(
                 FakeAdapter::with_open_turn(Driver::Claude, &log),
                 open_on("sonnet"),
-                store.clone(),
-                thread.clone(),
-                sink,
-                None,
+                &store,
+                &thread,
             );
             session.send_prompt("hello");
             session.shutdown(false);
@@ -7402,15 +7373,12 @@ mod tests {
         in_loop(|_| {
             let store = Rc::new(Store::open_in_memory().expect("store"));
             let thread = fresh(&store, "/w");
-            let (sink, _seen) = make_sink();
             let log: Log = Rc::default();
-            let session = ChatSession::new(
+            let (session, _seen) = harness(
                 FakeAdapter::boxed(Driver::Claude, &log),
                 open_on("sonnet"),
-                store.clone(),
-                thread.clone(),
-                sink,
-                None,
+                &store,
+                &thread,
             );
             if read_first {
                 store.mark_read(&thread).expect("read");
@@ -7491,17 +7459,14 @@ mod tests {
         in_loop(|ctx| {
             let store = Rc::new(Store::open_in_memory().expect("store"));
             let thread = fresh(&store, "/w");
-            let (sink, seen) = make_sink();
-            let session = ChatSession::new(
+            let (session, seen) = harness(
                 Box::new(OutboxAdapter {
                     caps: Capabilities::codex(),
                     outbox: agent_core::adapter::Outbox::default(),
                 }),
                 open_session("unused", Vec::new(), "/"),
-                store,
-                thread,
-                sink,
-                None,
+                &store,
+                &thread,
             );
             session.send_prompt("hello");
             let notice = |want: &str| {
@@ -7538,19 +7503,16 @@ mod tests {
         in_loop(|_| {
             let store = Rc::new(Store::open_in_memory().expect("store"));
             let thread = fresh(&store, "/w");
-            let (sink, seen) = make_sink();
             let log: Log = Rc::default();
-            let session = ChatSession::new(
+            let (session, seen) = harness(
                 FakeAdapter::boxed(Driver::Agy, &log),
                 OpenSession {
                     model: Some("gemini-3.1-pro-high".into()),
                     mode: Mode::Plan,
                     ..open_session("/usr/bin/agy", vec!["--agy-only".into()], "/")
                 },
-                store,
-                thread,
-                sink,
-                None,
+                &store,
+                &thread,
             );
             let made: Rc<Cell<usize>> = Rc::default();
             let count = made.clone();
@@ -7617,17 +7579,14 @@ mod tests {
     fn claude_on(mode: Mode, log: &Log) -> (Rc<ChatSession>, Seen) {
         let store = Rc::new(Store::open_in_memory().expect("store"));
         let thread = fresh(&store, "/w");
-        let (sink, seen) = make_sink();
-        let session = ChatSession::new(
+        let (session, seen) = harness(
             FakeAdapter::boxed(Driver::Claude, log),
             OpenSession {
                 mode,
                 ..open_session("unused", Vec::new(), "/")
             },
-            store,
-            thread,
-            sink,
-            None,
+            &store,
+            &thread,
         );
         let log2 = log.clone();
         session.set_adapter_factory(Rc::new(move |d| launch_of(FakeAdapter::boxed(d, &log2))));
@@ -7728,20 +7687,17 @@ mod tests {
                     .expect("event");
             }
 
-            let (sink, seen) = make_sink();
             let log_agy: Log = Rc::default();
             let log_claude: Log = Rc::default();
-            let session = ChatSession::new(
+            let (session, seen) = harness(
                 FakeAdapter::boxed(Driver::Agy, &log_agy),
                 OpenSession {
                     model: Some("gemini-pro".into()),
                     mode: Mode::Plan,
                     ..open_session("unused", vec!["--profile-only".into()], "/")
                 },
-                store.clone(),
-                thread.clone(),
-                sink,
-                None,
+                &store,
+                &thread,
             );
             // Without a factory a cross-agent switch is refused, and nothing changes.
             session.switch(Driver::Claude, Some("opus".into()), None);
@@ -7933,15 +7889,7 @@ mod tests {
             let mut open = session.inner.open.borrow().clone();
             open.mode = chosen().expect("stored choice");
             session.shutdown(false);
-            let (sink, _) = make_sink();
-            let reopened = ChatSession::new(
-                Box::new(AgyAdapter::new("agy")),
-                open,
-                store,
-                thread,
-                sink,
-                None,
-            );
+            let (reopened, _) = harness(Box::new(AgyAdapter::new("agy")), open, &store, &thread);
             assert_eq!(reopened.wanted_mode(), Mode::Ask);
             assert_eq!(
                 reopened.status().mode,
@@ -8154,20 +8102,17 @@ mod tests {
         store
             .append_user_message(&thread, Some(&first), "please list the repo")
             .expect("user");
-        let (sink, seen) = make_sink();
         let log_agy: Log = Rc::default();
         let log_claude: Log = Rc::default();
-        let session = ChatSession::new(
+        let (session, seen) = harness(
             FakeAdapter::boxed(Driver::Agy, &log_agy),
             OpenSession {
                 model: Some("gemini-pro".into()),
                 mode: Mode::Plan,
                 ..open_session("unused", Vec::new(), "/")
             },
-            store.clone(),
-            thread.clone(),
-            sink,
-            None,
+            &store,
+            &thread,
         );
         // agy is up, on its own native session.
         session.inner.emit(Envelope::new(Event::SessionStarted {
@@ -9068,14 +9013,11 @@ mod tests {
             let tmp = tempfile::tempdir().expect("tmp");
             let store = Rc::new(Store::open_in_memory().expect("store"));
             let thread = fresh(&store, "/w");
-            let (sink, seen) = make_sink();
-            let session = ChatSession::new(
+            let (session, seen) = harness(
                 Box::new(AgyAdapter::new("agy")),
                 fake_agy(tmp.path()),
-                store,
-                thread,
-                sink,
-                None,
+                &store,
+                &thread,
             );
             for decision in [
                 Decision::Allow,
@@ -9233,14 +9175,11 @@ mod tests {
             let tmp = tempfile::tempdir().expect("tmp");
             let store = Rc::new(Store::open_in_memory().expect("store"));
             let thread = fresh(&store, "/w");
-            let (sink, seen) = make_sink();
-            let session = ChatSession::new(
+            let (session, seen) = harness(
                 Box::new(AgyAdapter::new("agy")),
                 scripted(tmp.path(), "exec sleep 30"),
-                store,
-                thread,
-                sink,
-                None,
+                &store,
+                &thread,
             );
             // Asked for Ask (the scripted session's mode): Plan, and the user is told why.
             assert_eq!(session.status().mode, Mode::Plan);
@@ -9324,19 +9263,16 @@ mod tests {
         in_loop(|_| {
             let store = Rc::new(Store::open_in_memory().expect("store"));
             let thread = fresh(&store, "/w");
-            let (sink, seen) = make_sink();
             let log: Log = Rc::default();
-            let session = ChatSession::new(
+            let (session, seen) = harness(
                 FakeAdapter::boxed(Driver::Agy, &log),
                 OpenSession {
                     model: Some("gemini-pro".into()),
                     mode: Mode::Plan,
                     ..open_session("unused", Vec::new(), "/")
                 },
-                store.clone(),
-                thread.clone(),
-                sink,
-                None,
+                &store,
+                &thread,
             );
             session.set_adapter_factory(Rc::new(|d| {
                 Err(format!("{} is not available", d.info().long_label))
@@ -9356,9 +9292,8 @@ mod tests {
             let tmp = tempfile::tempdir().expect("tmp");
             let store = Rc::new(Store::open_in_memory().expect("store"));
             let thread = fresh(&store, &tmp.path().to_string_lossy());
-            let (sink, seen) = make_sink();
             let log: Log = Rc::default();
-            let session = ChatSession::new(
+            let (session, seen) = harness(
                 FakeAdapter::refusing_set_model(Driver::Agy, &log),
                 OpenSession {
                     model: Some("gemini-pro".into()),
@@ -9366,10 +9301,8 @@ mod tests {
                     resume: Some("native-1".into()),
                     ..open_session("unused", Vec::new(), "/")
                 },
-                store,
-                thread,
-                sink,
-                None,
+                &store,
+                &thread,
             );
             session.switch(Driver::Agy, Some("gemini-flash".into()), None);
             assert!(has(
@@ -9398,15 +9331,12 @@ mod tests {
         in_loop(|_| {
             let store = Rc::new(Store::open_in_memory().expect("store"));
             let thread = fresh(&store, "/w");
-            let (sink, seen) = make_sink();
             let log: Log = Rc::default();
-            let session = ChatSession::new(
+            let (session, seen) = harness(
                 FakeAdapter::with_open_turn(Driver::Claude, &log),
                 open_on("sonnet"),
-                store,
-                thread,
-                sink,
-                None,
+                &store,
+                &thread,
             );
             session.inner.emit(Envelope::new(Event::SessionStarted {
                 native_id: "native-before-switch".into(),
@@ -9452,15 +9382,12 @@ mod tests {
             for native in [None, Some("native-submitted")] {
                 let store = Rc::new(Store::open_in_memory().expect("store"));
                 let thread = fresh(&store, "/w");
-                let (sink, _) = make_sink();
                 let log: Log = Rc::default();
-                let session = ChatSession::new(
+                let (session, _) = harness(
                     FakeAdapter::boxed(Driver::Claude, &log),
                     open_on("sonnet"),
-                    store,
-                    thread,
-                    sink,
-                    None,
+                    &store,
+                    &thread,
                 );
                 if let Some(native) = native {
                     session.inner.emit(Envelope::new(Event::SessionStarted {
@@ -9492,15 +9419,12 @@ mod tests {
         in_loop(|_| {
             let store = Rc::new(Store::open_in_memory().expect("store"));
             let thread = fresh(&store, "/w");
-            let (sink, _) = make_sink();
             let log: Log = Rc::default();
-            let session = ChatSession::new(
+            let (session, _) = harness(
                 FakeAdapter::boxed(Driver::Claude, &log),
                 open_on("sonnet"),
-                store.clone(),
-                thread.clone(),
-                sink,
-                None,
+                &store,
+                &thread,
             );
             let requested = |model: &str, request: &str| {
                 session.inner.emit(
@@ -10801,17 +10725,14 @@ mod tests {
         in_loop(|ctx| {
             let store = Rc::new(Store::open_in_memory().expect("store"));
             let thread = fresh(&store, "/w");
-            let (sink, seen) = make_sink();
-            let session = ChatSession::new(
+            let (session, seen) = harness(
                 Box::new(agent_core::agy::AgyAdapter::new("agy")),
                 OpenSession {
                     mode: Mode::Plan,
                     ..open_session("unused", Vec::new(), "/")
                 },
-                store,
-                thread,
-                sink,
-                None,
+                &store,
+                &thread,
             );
 
             // AGY stdout frame without thinking
@@ -10937,17 +10858,14 @@ mod tests {
         .expect("write");
         let store = Rc::new(Store::open_in_memory().expect("store"));
         let thread = fresh(&store, "/w");
-        let (sink, seen) = make_sink();
-        let session = ChatSession::new(
+        let (session, seen) = harness(
             Box::new(agent_core::agy::AgyAdapter::new("agy")),
             OpenSession {
                 mode: Mode::Plan,
                 ..open_session("unused", Vec::new(), "/")
             },
-            store,
-            thread,
-            sink,
-            None,
+            &store,
+            &thread,
         );
         let frame = r#"{"event":"step_update","step_update":{"conversation_id":"cv","state":"ACTIVE","step_index":2,"step_type":"tool","tool_name":"view_file"}}"#;
         session
