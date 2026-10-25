@@ -1002,7 +1002,6 @@ impl ChatSession {
     /// Messages written for a switch's new agent that are still unsent: the switch is waiting
     /// for the thread, or did not go ahead and holds them. Closing the thread would lose them,
     /// so the close asks first, as for an unsent draft.
-    #[cfg_attr(not(test), allow(dead_code))] // for the close check, `ChatTab::closing_loses`
     pub(crate) fn has_unsent_held(&self) -> bool {
         self.inner.switch_marked() > 0
     }

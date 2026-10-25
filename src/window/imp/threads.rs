@@ -376,6 +376,12 @@ pub(super) fn close_reasons(busy: bool, draft: bool) -> Option<CloseReasons> {
     (busy || draft).then_some(CloseReasons { busy, draft })
 }
 
+/// Whether a thread has a message the user wrote that no agent got: the composer's draft, or
+/// messages held for a switch (`held`), which an empty composer does not show.
+fn unsent_message(draft: bool, held: bool) -> bool {
+    draft || held
+}
+
 /// `“title”`, or "This thread" for an untitled one.
 fn thread_subject(title: &str) -> String {
     if title.is_empty() {
@@ -662,11 +668,15 @@ impl ChatTab {
     }
 
     /// What closing this thread's page would lose: its work ([`Self::busy`]) or its unsent
-    /// draft. `None`: nothing, so no question is asked.
+    /// draft, which includes messages held for a switch that did not go ahead or still waits
+    /// ([`ChatSession::has_unsent_held`]). `None`: nothing, so no question is asked.
     pub(super) fn closing_loses(&self) -> Option<CloseReasons> {
         close_reasons(
             self.busy(),
-            self.view.as_ref().is_some_and(ChatView::has_draft),
+            unsent_message(
+                self.view.as_ref().is_some_and(ChatView::has_draft),
+                self.slot.get().is_some_and(|s| s.has_unsent_held()),
+            ),
         )
     }
 }
@@ -10500,6 +10510,13 @@ pub(super) mod tests {
         assert_eq!(close_reasons(true, false), Some(only(true, false)));
         assert_eq!(close_reasons(false, true), Some(only(false, true)));
         assert_eq!(close_reasons(true, true), Some(only(true, true)));
+        // Messages held for a switch, with an empty composer, are unsent all the same.
+        assert_eq!(
+            close_reasons(false, unsent_message(false, true)),
+            Some(only(false, true)),
+            "held messages ask before closing"
+        );
+        assert_eq!(close_reasons(false, unsent_message(false, false)), None);
 
         let (heading, body, confirm) = close_question("Fix the build", only(false, true));
         assert_eq!(heading, "Discard the Unsent Message?");
