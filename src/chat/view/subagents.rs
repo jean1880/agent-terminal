@@ -121,11 +121,29 @@ pub fn running_first(agents: &[SubagentSummary]) -> Vec<SubagentSummary> {
     ordered
 }
 
+/// How many of `agents` are active, finished, and neither (status unknown).
+pub(super) fn counts<'a>(
+    agents: impl IntoIterator<Item = &'a SubagentSummary>,
+) -> (usize, usize, usize) {
+    let (mut active, mut finished, mut total) = (0usize, 0usize, 0usize);
+    for agent in agents {
+        total += 1;
+        active += usize::from(agent.active());
+        finished += usize::from(agent.finished());
+    }
+    (active, finished, total.saturating_sub(active + finished))
+}
+
+/// An empty brand mark of `size` pixels, for [`set_brand`] to fill.
+pub(super) fn brand_slot(size: i32) -> gtk4::Image {
+    let image = gtk4::Image::new();
+    image.set_pixel_size(size);
+    image
+}
+
 /// The header button's text: how many sub-agents, and how many of them still run.
 pub fn count_text(agents: &[SubagentSummary]) -> String {
-    let active = agents.iter().filter(|a| a.active()).count();
-    let finished = agents.iter().filter(|a| a.finished()).count();
-    let unknown = agents.len().saturating_sub(active + finished);
+    let (active, finished, unknown) = counts(agents);
     let known = format!("{active} active · {finished} finished");
     if unknown == 0 {
         known
@@ -153,8 +171,7 @@ impl ListRow {
         b.set_margin_start(10);
         b.set_margin_end(10);
         let top = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-        let brand = gtk4::Image::new();
-        brand.set_pixel_size(14);
+        let brand = brand_slot(14);
         top.append(&brand);
         let name = label("", &["subagent-name"]);
         wrapping(&name);
@@ -449,8 +466,7 @@ impl SubagentPanel {
         let status = label("", &["dim-label"]);
         let head = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
         let title_line = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-        let brand = gtk4::Image::new();
-        brand.set_pixel_size(18);
+        let brand = brand_slot(18);
         title_line.append(&brand);
         title_line.append(&title);
         head.append(&title_line);
