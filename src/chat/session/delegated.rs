@@ -14,7 +14,7 @@ use agent_core::event::{Envelope, Event};
 use agent_kit::store::ThreadId;
 use tracing::{info, warn};
 
-use super::{Approval, ChatSession, Inner, LaunchEnv, SessionStore};
+use super::{Approval, ChatSession, InFlight, Inner, LaunchEnv, SessionStore};
 use crate::agent_proc::{ExitWatch, StopPhase};
 use crate::chat::{ChatBackend, EnvelopeSink};
 use crate::delegation::seam::{DelegatedInput, DelegatedOutcome, InputSource, SessionOptions};
@@ -281,12 +281,7 @@ impl Inner {
                 "the agent's input failed",
             ),
             (self.prompt_in_flight.get(), "a prompt is in flight"),
-            (self.starting.borrow().is_some(), "the agent is starting"),
-            (self.stopping.get(), "the agent is stopping"),
-            (self.rebinding.get(), "a rebind is under way"),
-            (self.delivering.get(), "an event is being delivered"),
-            (self.dispatching_queue.get(), "the queue is being sent"),
-            (self.queued_dispatch_pending.get(), "the queue is due"),
+            InFlight::reason(self.work_in_flight(), InFlight::wake_reason),
             (
                 !self.queued_prompts.borrow().is_empty(),
                 "prompts are queued",

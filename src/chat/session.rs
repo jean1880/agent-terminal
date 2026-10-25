@@ -490,6 +490,47 @@ struct Sent {
     handoff: Option<Handoff>,
 }
 
+/// The session's machinery at work ([`Inner::work_in_flight`]), with the words each check
+/// that waits for it uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InFlight {
+    Starting,
+    Stopping,
+    Rebinding,
+    Delivering,
+    SendingQueue,
+    QueueDue,
+}
+
+impl InFlight {
+    /// A blocker-list entry: whether `work` is under way, and its reason in `words`.
+    fn reason(work: Option<Self>, words: fn(Self) -> &'static str) -> (bool, &'static str) {
+        (work.is_some(), work.map_or("", words))
+    }
+
+    fn wake_reason(self) -> &'static str {
+        match self {
+            Self::Starting => "the agent is starting",
+            Self::Stopping => "the agent is stopping",
+            Self::Rebinding => "a rebind is under way",
+            Self::Delivering => "an event is being delivered",
+            Self::SendingQueue => "the queue is being sent",
+            Self::QueueDue => "the queue is due",
+        }
+    }
+
+    fn suspend_reason(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Stopping => "stopping",
+            Self::Rebinding => "rebinding",
+            Self::Delivering => "delivering",
+            Self::SendingQueue => "dispatching the queue",
+            Self::QueueDue => "a queued dispatch",
+        }
+    }
+}
+
 struct ScopedFlag<'a> {
     flag: &'a Cell<bool>,
     previous: bool,
@@ -2875,6 +2916,22 @@ impl Inner {
         self.finish_process(None, true);
     }
 
+    /// The session's own machinery at work (a start, a stop, a rebind, an event or the queue
+    /// going out), the first found: neither a wake ([`Self::wake_blocker`]) nor an idle
+    /// suspension ([`Self::suspend_blocker`]) may cut into it. Each names it in its own words.
+    fn work_in_flight(&self) -> Option<InFlight> {
+        [
+            (self.starting.borrow().is_some(), InFlight::Starting),
+            (self.stopping.get(), InFlight::Stopping),
+            (self.rebinding.get(), InFlight::Rebinding),
+            (self.delivering.get(), InFlight::Delivering),
+            (self.dispatching_queue.get(), InFlight::SendingQueue),
+            (self.queued_dispatch_pending.get(), InFlight::QueueDue),
+        ]
+        .into_iter()
+        .find_map(|(on, what)| on.then_some(what))
+    }
+
     /// What stops [`Self::suspend`] now, if anything (the first reason found). The process can
     /// be stopped and resumed later with nothing lost only when it is alive, has a conversation
     /// to resume (a native id, and a turn on it or a resumed start), and holds no work,
@@ -2902,12 +2959,7 @@ impl Inner {
                 !self.proc.borrow().as_ref().is_some_and(|p| p.is_alive()),
                 "no live process",
             ),
-            (self.starting.borrow().is_some(), "starting"),
-            (self.stopping.get(), "stopping"),
-            (self.rebinding.get(), "rebinding"),
-            (self.delivering.get(), "delivering"),
-            (self.dispatching_queue.get(), "dispatching the queue"),
-            (self.queued_dispatch_pending.get(), "a queued dispatch"),
+            InFlight::reason(self.work_in_flight(), InFlight::suspend_reason),
             (self.prompt_in_flight.get(), "a prompt in flight"),
             (self.handoff_in_flight.get(), "a handoff in flight"),
             (!self.queued_prompts.borrow().is_empty(), "queued prompts"),
