@@ -228,6 +228,30 @@ pub(crate) struct Inner {
     shown_lifecycle: Cell<crate::chat::Lifecycle>,
 }
 
+/// A callback that runs `f` on the view's state while the view lives. It holds the state weakly,
+/// so a widget's handler never keeps the view alive.
+fn on_inner<A>(weak: &Weak<Inner>, f: impl Fn(&Rc<Inner>, A) + 'static) -> impl Fn(A) + 'static {
+    let weak = weak.clone();
+    move |arg| {
+        if let Some(inner) = weak.upgrade() {
+            f(&inner, arg);
+        }
+    }
+}
+
+/// [`on_inner`] for a callback given a reference.
+fn on_inner_ref<T: ?Sized + 'static>(
+    weak: &Weak<Inner>,
+    f: impl Fn(&Rc<Inner>, &T) + 'static,
+) -> impl Fn(&T) + 'static {
+    let weak = weak.clone();
+    move |arg| {
+        if let Some(inner) = weak.upgrade() {
+            f(&inner, arg);
+        }
+    }
+}
+
 impl ChatView {
     pub fn new(backend: Rc<dyn ChatBackend>) -> Self {
         load_style();
@@ -237,44 +261,30 @@ impl ChatView {
         view.add_css_class("chat-view");
 
         let inner = Rc::new_cyclic(|weak: &Weak<Inner>| {
+            let sink: RowSink = Rc::new(on_inner(weak, |inner, e| inner.row_event(e)));
+            let subagent_button =
+                subagents::SubagentButton::new(on_inner_ref(weak, |inner, id: &str| {
+                    inner.open_subagent(id)
+                }));
             let w = weak.clone();
-            let sink: RowSink = Rc::new(move |e| {
-                if let Some(inner) = w.upgrade() {
-                    inner.row_event(e);
-                }
-            });
-            let w = weak.clone();
-            let subagent_button = subagents::SubagentButton::new(move |id| {
-                if let Some(inner) = w.upgrade() {
-                    inner.open_subagent(id);
-                }
-            });
-            let w = weak.clone();
-            let w_cleared = weak.clone();
             let subagent_shelf = subagent_shelf::SubagentShelf::new(
-                move |id| {
-                    if let Some(inner) = w.upgrade() {
-                        inner.open_subagent(id);
-                    }
-                },
+                on_inner_ref(weak, |inner, id: &str| inner.open_subagent(id)),
                 move || {
-                    if let Some(inner) = w_cleared.upgrade() {
+                    if let Some(inner) = w.upgrade() {
                         inner.refresh_subagents(&[]);
                     }
                 },
             );
-            let w = weak.clone();
-            let background_button = background::BackgroundButton::new(move |task| {
-                if let Some(inner) = w.upgrade() {
-                    inner.open_background(task);
-                }
-            });
-            let w = weak.clone();
-            let interruption = interruption::InterruptionShelf::new(sink.clone(), move |id| {
-                if let Some(inner) = w.upgrade() {
+            let background_button = background::BackgroundButton::new(on_inner_ref(
+                weak,
+                |inner, task: &BackgroundTask| inner.open_background(task),
+            ));
+            let interruption = interruption::InterruptionShelf::new(
+                sink.clone(),
+                on_inner(weak, |inner, id: String| {
                     inner.transcript.focus_pending_card(&id);
-                }
-            });
+                }),
+            );
             Inner {
                 backend,
                 model: Rc::new(RefCell::new(Transcript::new())),
@@ -1108,35 +1118,33 @@ impl Inner {
 
     fn connect_header(self: &Rc<Self>) {
         let weak = Rc::downgrade(self);
-        self.header.chip.connect_clicked(move |_| {
-            if let Some(inner) = weak.upgrade() {
-                inner.run_action(BuiltinAction::OpenModelPicker, "");
-            }
-        });
-        let weak = Rc::downgrade(self);
-        self.header.gauge.connect_clicked(move |_| {
-            if let Some(inner) = weak.upgrade() {
-                inner.run_action(BuiltinAction::OpenContext, "");
-            }
-        });
-        let weak = Rc::downgrade(self);
-        self.header.mode.connect_selected_notify(move |dd| {
-            let Some(inner) = weak.upgrade() else {
-                return;
-            };
-            if inner.header.mode_guard.get() {
-                return;
-            }
-            let Some(mode) = MODES.get(dd.selected() as usize).copied() else {
-                return;
-            };
-            // Never offered as a default: session-only, and only once confirmed.
-            if mode == Mode::Bypass {
-                inner.confirm_bypass();
-                return;
-            }
-            inner.set_mode(mode, true);
-        });
+        self.header
+            .chip
+            .connect_clicked(on_inner_ref(&weak, |inner, _: &gtk4::Button| {
+                inner.run_action(BuiltinAction::OpenModelPicker, "")
+            }));
+        self.header
+            .gauge
+            .connect_clicked(on_inner_ref(&weak, |inner, _: &gtk4::Button| {
+                inner.run_action(BuiltinAction::OpenContext, "")
+            }));
+        self.header.mode.connect_selected_notify(on_inner_ref(
+            &weak,
+            |inner, dd: &gtk4::DropDown| {
+                if inner.header.mode_guard.get() {
+                    return;
+                }
+                let Some(mode) = MODES.get(dd.selected() as usize).copied() else {
+                    return;
+                };
+                // Never offered as a default: session-only, and only once confirmed.
+                if mode == Mode::Bypass {
+                    inner.confirm_bypass();
+                    return;
+                }
+                inner.set_mode(mode, true);
+            },
+        ));
     }
 
     /// Asks before dangerous permissive mode, every time it is picked. Until the user agrees, the
