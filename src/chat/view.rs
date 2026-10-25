@@ -650,6 +650,21 @@ impl Inner {
     }
 
     fn handle(self: &Rc<Self>, changes: Vec<Change>) {
+        // The shelf reads only approvals, questions and forms: a streamed delta (an assistant,
+        // reasoning or tool item's update) or a new row of another kind never moves it, so
+        // only other changes rescan the transcript for it.
+        let shelf = {
+            let model = self.model.borrow();
+            changes.iter().any(|change| match change {
+                Change::Added(id) | Change::Updated(id) => model.get(id).is_none_or(|item| {
+                    matches!(
+                        item.body,
+                        model::Body::Approval(_) | model::Body::Question(_) | model::Body::Form(_)
+                    )
+                }),
+                _ => true,
+            })
+        };
         // A sub-agent or one of its steps coming or changing moves the explorer: noted here,
         // refreshed with the next flush, once per frame (other items never touch it).
         {
@@ -684,7 +699,7 @@ impl Inner {
                 }
                 Change::Removed(id) => {
                     self.dirty.borrow_mut().retain(|d| d != &id);
-                    self.transcript.removed(&id);
+                    self.transcript.removed(&self.model.borrow(), &id);
                 }
                 Change::Plan => self.plan.set(&self.model.borrow().plan),
                 Change::Gauge => self.header.set_gauge(self.model.borrow().gauge.as_ref()),
@@ -716,7 +731,9 @@ impl Inner {
         self.refresh_agent_chip();
         self.header
             .set_extra_access(self.model.borrow().extra_access());
-        self.interruption.update(&self.model.borrow());
+        if shelf {
+            self.interruption.update(&self.model.borrow());
+        }
     }
 
     fn queue_flush(self: &Rc<Self>) {
@@ -746,7 +763,8 @@ impl Inner {
     /// updating the `changed` ones), from the model.
     fn refresh_subagents(&self, changed: &[String]) {
         let model = self.model.borrow();
-        let agents = model.subagents_with(self.delegation.borrow().summaries());
+        let own = model.subagents();
+        let agents = Transcript::with_supervised(own.clone(), self.delegation.borrow().summaries());
         // Every sub-agent the thread started: the running ones first, then the finished ones
         // with how they ended (a replayed thread, or one whose sub-agents are all done, still
         // lists them).
@@ -758,7 +776,7 @@ impl Inner {
         }
         drop(model);
         // A background sub-agent's row opens once its item is known.
-        self.refresh_background();
+        self.refresh_background(&own, &agents);
     }
 
     /// Expands every sub-agent card in the thread, or collapses them all when every one is
@@ -847,6 +865,12 @@ impl Inner {
             return;
         }
         let panel = subagents::SubagentPanel::new(id, self.row_sink.clone());
+        let weak = Rc::downgrade(self);
+        panel.set_refresher(move || {
+            if let Some(inner) = weak.upgrade() {
+                inner.refresh_subagents(&[]);
+            }
+        });
         {
             let model = self.model.borrow();
             let summary = model.subagents().into_iter().find(|a| a.id == id);
@@ -877,12 +901,16 @@ impl Inner {
     }
 
     /// Where a background task leads: its sub-agent's panel, or its output (`None`: nothing).
-    fn background_target(&self, task: &BackgroundTask) -> Option<BackgroundTarget> {
+    /// `own`: the model's [`Transcript::subagents`], computed once by the caller.
+    fn background_target(
+        &self,
+        task: &BackgroundTask,
+        own: &[model::SubagentSummary],
+    ) -> Option<BackgroundTarget> {
         if task.kind == BackgroundTaskKind::Agent {
             // Claude's tasks name their `Agent` call; a provider worker is its own item.
             let id = task.tool_use_id.as_deref().unwrap_or(&task.id);
-            let known = self.model.borrow().subagents().iter().any(|a| a.id == id)
-                || self.delegation.borrow().has_worker(id);
+            let known = own.iter().any(|a| a.id == id) || self.delegation.borrow().has_worker(id);
             return known.then(|| BackgroundTarget::Subagent(id.to_owned()));
         }
         self.backend
@@ -892,16 +920,19 @@ impl Inner {
             .then_some(BackgroundTarget::Output)
     }
 
-    /// The strip's background task list, from the model.
-    fn refresh_background(&self) {
-        let tasks = self
-            .model
-            .borrow()
-            .background_tasks_with(self.delegation.borrow().summaries());
+    /// The strip's background task list, from the model. `own` and `agents`: the model's
+    /// [`Transcript::subagents`] and [`Transcript::subagents_with`] the delegation registry's
+    /// workers, which the caller has already computed.
+    fn refresh_background(
+        &self,
+        own: &[model::SubagentSummary],
+        agents: &[model::SubagentSummary],
+    ) {
+        let tasks = self.model.borrow().background_with(agents);
         let listed = tasks
             .into_iter()
             .map(|task| background::ListedTask {
-                openable: self.background_target(&task).is_some(),
+                openable: self.background_target(&task, own).is_some(),
                 task,
             })
             .collect();
@@ -909,7 +940,8 @@ impl Inner {
     }
 
     fn open_background(self: &Rc<Self>, task: &BackgroundTask) {
-        match self.background_target(task) {
+        let own = self.model.borrow().subagents();
+        match self.background_target(task, &own) {
             Some(BackgroundTarget::Subagent(id)) => self.open_subagent(&id),
             Some(BackgroundTarget::Output) => self.open_task_output(task),
             None => {}
@@ -1007,21 +1039,21 @@ impl Inner {
         let running = status.running_turn || self.model.borrow().running;
         // The header counts background work too, delegated workers included; the stop button
         // follows the main turn only.
-        let (activity, sub_agents) = {
+        // Every sub-agent, walked out of the model once for everything below.
+        let (activity, sub_agents, own, agents) = {
             let model = self.model.borrow();
             let workers = self.delegation.borrow();
-            let supervised = workers.summaries();
+            let own = model.subagents();
+            let agents = Transcript::with_supervised(own.clone(), workers.summaries());
             // A worker waiting on the user holds up the thread as the agent's own request would;
             // an approval outranks a question, whoever asks.
-            let activity = match (
-                model.activity_with(running, supervised.clone()),
-                workers.needs_user(),
-            ) {
+            let activity = match (model.activity_among(running, &agents), workers.needs_user()) {
                 (own @ model::Activity::NeedsApproval, _) => own,
                 (_, Some(needs)) => needs,
                 (own, None) => own,
             };
-            (activity, model.running_drivers(supervised))
+            let drivers = Transcript::running_drivers_among(&agents);
+            (activity, drivers, own, agents)
         };
         // The agent's own start, resume or pause shows in the header only: the strip by the
         // composer keeps the turn's own activity.
@@ -1034,7 +1066,7 @@ impl Inner {
             status.driver.info().label,
         );
         self.thinking.set(&activity, status.driver, &sub_agents);
-        self.refresh_background();
+        self.refresh_background(&own, &agents);
         self.composer.set_running(running, stop_note.as_deref());
         self.refresh_agent_chip();
         self.header
@@ -2883,8 +2915,640 @@ pub(crate) mod tests {
         window.destroy();
     }
 
+    /// Live appends keep the rows built (nested ones included) within the budget while following,
+    /// after a jump left the bottom, and after coming back; a jump to a step not built (evicted
+    /// with its card, or under a card's cap) builds it and lands on it; "earlier steps" builds
+    /// the rest of a card and keeps focus; a focused row is never evicted.
+    pub(crate) fn live_append_keeps_the_window_bounded() {
+        use agent_core::event::{ItemKind, ItemStatus};
+        use transcript::{CHILD_CAP, ROW_BUDGET};
+        let ctx = glib::MainContext::default();
+        let pump = || while ctx.iteration(false) {};
+        let view = ChatView::new(StubBackend::new(Driver::Claude));
+        let window = gtk4::Window::new();
+        window.set_default_size(700, 600);
+        window.set_child(Some(&view));
+        window.present();
+        let inner = view.inner().expect("view");
+        let t = &inner.transcript;
+        let step = |id: &str, parent: Option<&str>| {
+            view.apply(&Envelope::item_started(
+                id,
+                ItemKind::Command,
+                format!("echo {id}"),
+                None,
+                parent,
+            ));
+            view.apply(&Envelope::item_completed(
+                id,
+                ItemStatus::Completed,
+                Some("ok"),
+                None,
+            ));
+        };
+        let built = |id: &str| t.with_row(id, |_| ()).is_some();
+        // Twelve sub-agents of 100 steps each, with plain steps between them, all live.
+        for a in 0..12 {
+            let agent = format!("a{a}");
+            view.apply(&Envelope::item_started(
+                &agent,
+                ItemKind::Subagent,
+                "Agent",
+                None,
+                None,
+            ));
+            for c in 0..100 {
+                step(&format!("{agent}-c{c}"), Some(&agent));
+                assert!(t.row_count() <= ROW_BUDGET, "{} rows", t.row_count());
+            }
+            view.apply(&Envelope::item_completed(
+                &agent,
+                ItemStatus::Completed,
+                None,
+                None,
+            ));
+            for s in 0..20 {
+                step(&format!("{agent}-s{s}"), None);
+            }
+            pump();
+            assert!(t.row_count() <= ROW_BUDGET, "{} rows", t.row_count());
+        }
+        assert!(!built("a0"), "the oldest card went with the budget");
+        assert!(built("a11-c99") && built(&format!("a11-c{}", 100 - CHILD_CAP)));
+        assert!(
+            !built(&format!("a11-c{}", 99 - CHILD_CAP)),
+            "a card builds its newest"
+        );
+        let (count, _) = t.earlier_of("a11").expect("an earlier-steps button");
+        assert_eq!(count, 100 - CHILD_CAP);
+
+        // A jump leaves the bottom; what arrives meanwhile stays within the budget.
+        assert!(crate::testutil::pump_until(&ctx, 10, || {
+            t.row_bounds_in_viewport("a11-s19")
+                .is_some_and(|(b, _)| b.height() > 0.0)
+        }));
+        t.scroll_to_card("a11-s0");
+        for s in 0..300 {
+            step(&format!("late-{s}"), None);
+        }
+        pump();
+        assert!(t.row_count() <= ROW_BUDGET, "{} rows", t.row_count());
+        assert!(t.tail_len() > 0 && t.jump_shown(), "the rest waits below");
+        assert!(built("a11-s0"), "the view kept what it showed");
+        // Back to the end: the newest rows are built, and the window is bounded again.
+        view.scroll_to_end();
+        pump();
+        assert!(built("late-299") && t.tail_len() == 0);
+        assert!(t.row_count() <= ROW_BUDGET, "{} rows", t.row_count());
+
+        // A jump to a step of an evicted card builds it and lands on it.
+        assert!(!built("a0-c99"));
+        t.scroll_to_card("a0-c99");
+        assert!(built("a0-c99"), "the jump built what it needs");
+        let landed = || {
+            t.row_bounds_in_viewport("a0-c99")
+                .is_some_and(|(b, _)| (0.0..=160.0).contains(&b.y()))
+        };
+        assert!(
+            crate::testutil::pump_until(&ctx, 10, landed),
+            "the jump never showed the step: {}",
+            t.scroll_debug()
+        );
+        // A step under a built card's cap: built from it on, the button counting the rest.
+        assert!(!built("a0-c3"));
+        t.scroll_to_card("a0-c3");
+        assert!(built("a0-c3") && built("a0-c59"));
+        assert_eq!(t.earlier_of("a0").map(|(n, _)| n), Some(3));
+        // "3 earlier steps" builds the rest, and focus moves to the first of them.
+        let (_, button) = t.earlier_of("a0").expect("the button");
+        assert_eq!(button.label().as_deref(), Some("3 earlier steps"));
+        assert!(button.grab_focus());
+        button.emit_clicked();
+        assert!(built("a0-c0") && t.earlier_of("a0").is_none());
+        let focus = gtk4::prelude::RootExt::focus(&window).expect("focus stays in the window");
+        let first = t.with_row("a0-c0", |r| r.widget()).expect("built");
+        assert!(
+            focus.is_ancestor(&first),
+            "focus moved to the first earlier step"
+        );
+
+        // A focused row is never evicted, however much arrives while following.
+        view.scroll_to_end();
+        for s in 0..400 {
+            step(&format!("later-{s}"), None);
+        }
+        pump();
+        assert!(built("a0-c0"), "the focused row stays");
+        assert_eq!(
+            gtk4::prelude::RootExt::focus(&window).as_ref(),
+            Some(&focus),
+            "and keeps focus"
+        );
+        assert!(t.row_count() <= ROW_BUDGET, "{} rows", t.row_count());
+        assert!(!built("a1"), "the rows after it still go");
+        window.destroy();
+    }
+
+    /// A live view in a presented window, and a helper that applies one finished step.
+    fn live_window() -> (ChatView, gtk4::Window, Rc<Inner>) {
+        let view = ChatView::new(StubBackend::new(Driver::Claude));
+        let window = gtk4::Window::new();
+        window.set_default_size(700, 600);
+        window.set_child(Some(&view));
+        window.present();
+        let inner = view.inner().expect("view");
+        (view, window, inner)
+    }
+
+    fn live_step(view: &ChatView, id: &str, parent: Option<&str>) {
+        use agent_core::event::{ItemKind, ItemStatus};
+        view.apply(&Envelope::item_started(
+            id,
+            ItemKind::Command,
+            format!("echo {id}"),
+            None,
+            parent,
+        ));
+        view.apply(&Envelope::item_completed(
+            id,
+            ItemStatus::Completed,
+            Some("ok"),
+            None,
+        ));
+    }
+
+    /// The first text field inside `widget`.
+    fn first_entry(widget: &gtk4::Widget) -> Option<gtk4::Editable> {
+        if let Some(e) = widget.downcast_ref::<gtk4::Editable>() {
+            return Some(e.clone());
+        }
+        let mut child = widget.first_child();
+        while let Some(c) = child {
+            if let Some(e) = first_entry(&c) {
+                return Some(e);
+            }
+            child = c.next_sibling();
+        }
+        None
+    }
+
+    /// A half-filled form keeps its widgets, and so its unsent answer, when the view returns to
+    /// the end past more than a window of rows that waited, and on a jump far from the window:
+    /// neither starts the window over while it is built.
+    pub(crate) fn a_pending_answer_survives_returning_to_the_end_and_a_far_jump() {
+        use agent_core::form::{FieldInput, Form, FormField};
+        let ctx = glib::MainContext::default();
+        let pump = || while ctx.iteration(false) {};
+        let (view, window, inner) = live_window();
+        let t = &inner.transcript;
+        for i in 0..300 {
+            live_step(&view, &format!("early-{i}"), None);
+        }
+        let form = Form::Fields {
+            fields: vec![FormField {
+                name: "repo".into(),
+                title: None,
+                description: None,
+                required: true,
+                input: FieldInput::Text {
+                    format: None,
+                    min_length: None,
+                    max_length: None,
+                    default: None,
+                },
+            }],
+        };
+        view.apply(
+            &Envelope::new(Event::FormRequested {
+                server: "github".into(),
+                message: "Which repo?".into(),
+                form,
+            })
+            .request("f"),
+        );
+        for i in 0..600 {
+            live_step(&view, &format!("mid-{i}"), None);
+        }
+        pump();
+        let card = t
+            .with_row("form:f", |r| r.widget())
+            .expect("the form is built");
+        let field = first_entry(&card).expect("a text field");
+        field.set_text("half-typed");
+        // Away (to the form), then more than a window of rows arrives and waits.
+        t.scroll_to_card("form:f");
+        for i in 0..200 {
+            live_step(&view, &format!("late-{i}"), None);
+        }
+        pump();
+        assert!(
+            t.tail_len() > transcript::WINDOW,
+            "{} waiting",
+            t.tail_len()
+        );
+        view.scroll_to_end();
+        pump();
+        let built = |id: &str| t.with_row(id, |_| ()).is_some();
+        assert!(built("late-199"), "back at the end");
+        assert_eq!(t.with_row("form:f", |r| r.widget()).as_ref(), Some(&card));
+        assert_eq!(field.text(), "half-typed", "the answer survives");
+        // A jump far above the window builds its way there instead of starting over.
+        assert!(!built("early-0"));
+        t.scroll_to_card("early-0");
+        assert!(built("early-0"));
+        assert_eq!(t.with_row("form:f", |r| r.widget()).as_ref(), Some(&card));
+        assert_eq!(field.text(), "half-typed");
+        window.destroy();
+    }
+
+    /// Steps arriving in an expanded sub-agent while the user reads inside it, away from the
+    /// end, wait once the window is at its budget: the rows stay within it and the view does
+    /// not move; returning to the end builds the newest of them.
+    pub(crate) fn nested_steps_arriving_while_reading_a_card_stay_within_the_budget() {
+        use agent_core::event::ItemKind;
+        use transcript::ROW_BUDGET;
+        let ctx = glib::MainContext::default();
+        let (view, window, inner) = live_window();
+        let t = &inner.transcript;
+        for i in 0..620 {
+            live_step(&view, &format!("s{i}"), None);
+        }
+        view.apply(&Envelope::item_started(
+            "agent",
+            ItemKind::Subagent,
+            "Agent",
+            None,
+            None,
+        ));
+        for c in 0..50 {
+            live_step(&view, &format!("agent-c{c}"), Some("agent"));
+        }
+        // Rows after the card, so a jump into it leaves the view well away from the end.
+        for i in 0..20 {
+            live_step(&view, &format!("after-{i}"), None);
+        }
+        assert!(t.row_count() <= ROW_BUDGET);
+        let top = || {
+            t.row_bounds_in_viewport("agent-c45")
+                .filter(|(b, _)| b.height() > 0.0)
+                .map(|(b, _)| b.y())
+        };
+        // Laid out (the scroller knows its content) and following the end, as a live view is
+        // before the user jumps.
+        let (_, adj) = t.scroll_parts();
+        assert!(crate::testutil::pump_until(&ctx, 10, || {
+            top().is_some()
+                && adj.upper() > adj.page_size() + 1000.0
+                && adj.value() + adj.page_size() >= adj.upper() - 1.0
+        }));
+        t.scroll_to_card("agent-c45");
+        let settle = || {
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+            let _ = crate::testutil::pump_until(&ctx, 3, || std::time::Instant::now() > until);
+        };
+        settle();
+        assert!(
+            top().is_some_and(|y| (-400.0..=400.0).contains(&y)),
+            "the jump did not reach the step: {:?} {}",
+            top(),
+            t.scroll_debug()
+        );
+        assert!(!t.last_row_overflow().expect("rows").1, "away from the end");
+        let before = top().expect("laid out");
+        for c in 50..1050 {
+            live_step(&view, &format!("agent-c{c}"), Some("agent"));
+            assert!(t.row_count() <= ROW_BUDGET, "{} rows", t.row_count());
+        }
+        // Frames go by: whatever would move the view has had its layout.
+        settle();
+        let after = top().expect("still built");
+        assert!(
+            (after - before).abs() < 1.0,
+            "the view moved: {before} -> {after}"
+        );
+        assert!(t.with_row("agent-c1049", |_| ()).is_none(), "it waits");
+        view.scroll_to_end();
+        while ctx.iteration(false) {}
+        assert!(
+            t.with_row("agent-c1049", |_| ()).is_some(),
+            "built back at the end"
+        );
+        assert!(t.row_count() <= ROW_BUDGET, "{} rows", t.row_count());
+        window.destroy();
+    }
+
+    /// A jump to a step inside a collapsed card opens the card (in the model, so it stays open)
+    /// and lands on the step.
+    pub(crate) fn a_jump_into_a_collapsed_card_lands_on_its_step() {
+        use agent_core::event::ItemKind;
+        let ctx = glib::MainContext::default();
+        let (view, window, inner) = live_window();
+        let t = &inner.transcript;
+        view.apply(&Envelope::item_started(
+            "box",
+            ItemKind::Subagent,
+            "Agent",
+            None,
+            None,
+        ));
+        for c in 0..5 {
+            live_step(&view, &format!("box-c{c}"), Some("box"));
+        }
+        inner.row_event(RowEvent::Toggle {
+            id: "box".into(),
+            expanded: false,
+        });
+        for i in 0..40 {
+            live_step(&view, &format!("after-{i}"), None);
+        }
+        assert!(crate::testutil::pump_until(&ctx, 10, || {
+            t.row_bounds_in_viewport("after-39")
+                .is_some_and(|(b, _)| b.height() > 0.0)
+        }));
+        t.scroll_to_card("box-c2");
+        assert!(inner.model.borrow().get("box").is_some_and(|i| i.expanded));
+        let landed = || {
+            t.row_bounds_in_viewport("box-c2")
+                .is_some_and(|(b, _)| b.height() > 0.0 && (0.0..=160.0).contains(&b.y()))
+        };
+        assert!(
+            crate::testutil::pump_until(&ctx, 10, landed),
+            "the jump never showed the step: {}",
+            t.scroll_debug()
+        );
+        window.destroy();
+    }
+
+    /// A jump to a built row, and the shelf's jump-and-focus to a built question, each move the
+    /// view once, onto the row, from bounds read after a layout.
+    pub(crate) fn a_jump_to_a_built_row_moves_once_onto_it() {
+        use agent_core::event::{Question, QuestionOption, QuestionSource};
+        let ctx = glib::MainContext::default();
+        let (view, window, inner) = live_window();
+        let t = &inner.transcript;
+        for i in 0..40 {
+            live_step(&view, &format!("s{i}"), None);
+        }
+        view.apply(
+            &Envelope::new(Event::QuestionRequested {
+                questions: vec![Question {
+                    id: "q".into(),
+                    header: "Pick".into(),
+                    question: "Which one?".into(),
+                    options: ["one", "two"]
+                        .iter()
+                        .map(|o| QuestionOption {
+                            label: (*o).into(),
+                            description: None,
+                        })
+                        .collect(),
+                    multi_select: false,
+                }],
+                source: QuestionSource::Agent,
+            })
+            .request("q1"),
+        );
+        for i in 40..80 {
+            live_step(&view, &format!("s{i}"), None);
+        }
+        let (_, adj) = t.scroll_parts();
+        assert!(crate::testutil::pump_until(&ctx, 10, || {
+            adj.upper() > adj.page_size() + 1000.0
+                && adj.value() + adj.page_size() >= adj.upper() - 1.0
+        }));
+        let settle = || {
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(1000);
+            let _ = crate::testutil::pump_until(&ctx, 3, || std::time::Instant::now() > until);
+        };
+        settle();
+        let near_top = |id: &str| {
+            t.row_bounds_in_viewport(id)
+                .is_some_and(|(b, _)| (30.0..=50.0).contains(&b.y()))
+        };
+        let moves = || t.settle_counts().1;
+        let before = moves();
+        t.scroll_to_card("s20");
+        settle();
+        assert!(near_top("s20"), "landed on the row: {}", t.scroll_debug());
+        assert_eq!(moves() - before, 1, "one move for one jump");
+
+        let question = inner
+            .model
+            .borrow()
+            .item_for_request("q1")
+            .cloned()
+            .expect("the question");
+        let before = moves();
+        assert!(t.focus_pending_card(&question));
+        settle();
+        assert!(
+            near_top(&question),
+            "landed on the card: {}",
+            t.scroll_debug()
+        );
+        assert_eq!(moves() - before, 1, "one move for the jump and its focus");
+        let focus = gtk4::prelude::RootExt::focus(&window).expect("focused");
+        let card = t.with_row(&question, |r| r.widget()).expect("built");
+        assert!(focus.is_ancestor(&card), "the first answer has focus");
+        window.destroy();
+    }
+
+    /// Back at the end, a focused "later steps" button is not compacted away: the steps it stood
+    /// for are built in place and focus moves to the first of them.
+    pub(crate) fn a_focused_later_steps_button_hands_focus_on_back_at_the_end() {
+        use agent_core::event::ItemKind;
+        let ctx = glib::MainContext::default();
+        let (view, window, inner) = live_window();
+        let t = &inner.transcript;
+        for i in 0..620 {
+            live_step(&view, &format!("s{i}"), None);
+        }
+        view.apply(&Envelope::item_started(
+            "agent",
+            ItemKind::Subagent,
+            "Agent",
+            None,
+            None,
+        ));
+        for c in 0..50 {
+            live_step(&view, &format!("agent-c{c}"), Some("agent"));
+        }
+        for i in 0..20 {
+            live_step(&view, &format!("after-{i}"), None);
+        }
+        let (_, adj) = t.scroll_parts();
+        assert!(crate::testutil::pump_until(&ctx, 10, || {
+            adj.upper() > adj.page_size() + 1000.0
+                && adj.value() + adj.page_size() >= adj.upper() - 1.0
+        }));
+        t.scroll_to_card("agent-c45");
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(1000);
+        let _ = crate::testutil::pump_until(&ctx, 3, || std::time::Instant::now() > until);
+        assert!(
+            t.row_bounds_in_viewport("agent-c45")
+                .is_some_and(|(b, _)| (0.0..=160.0).contains(&b.y())),
+            "the jump did not land: {:?} {}",
+            t.row_bounds_in_viewport("agent-c45").map(|(b, _)| b.y()),
+            t.scroll_debug()
+        );
+        // Built until the window reaches its budget, then they wait.
+        for c in 50..700 {
+            live_step(&view, &format!("agent-c{c}"), Some("agent"));
+        }
+        let (waiting, button) = t
+            .later_of("agent")
+            .unwrap_or_else(|| panic!("steps wait: {} rows", t.row_count()));
+        assert!(waiting >= transcript::CHILD_CAP, "{waiting} waiting");
+        let first = format!("agent-c{}", 700 - waiting);
+        assert!(button.grab_focus());
+        view.scroll_to_end();
+        while ctx.iteration(false) {}
+        assert!(t.later_of("agent").is_none(), "the steps are built");
+        let focus = gtk4::prelude::RootExt::focus(&window).expect("focus stays in the window");
+        let row = t.with_row(&first, |r| r.widget()).expect("built in place");
+        assert!(
+            focus == row || focus.is_ancestor(&row),
+            "focus moved to the first step the button stood for"
+        );
+        window.destroy();
+    }
+
+    /// A pending jump always ends: it lands once from a fractional scroll position (the viewport
+    /// lays its content out at a whole-pixel offset), it is dropped when its row goes while it
+    /// waits, and it gives up after a bounded number of frames if its layout never comes.
+    pub(crate) fn a_pending_jump_lands_or_ends() {
+        use agent_core::event::ItemKind;
+        let ctx = glib::MainContext::default();
+        let (view, window, inner) = live_window();
+        let t = &inner.transcript;
+        for i in 0..80 {
+            live_step(&view, &format!("s{i}"), None);
+        }
+        let (_, adj) = t.scroll_parts();
+        assert!(crate::testutil::pump_until(&ctx, 10, || {
+            adj.upper() > adj.page_size() + 1000.0
+                && adj.value() + adj.page_size() >= adj.upper() - 1.0
+        }));
+        let settle = || {
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(1000);
+            let _ = crate::testutil::pump_until(&ctx, 3, || std::time::Instant::now() > until);
+        };
+        // The user scrolls to a fractional position, then jumps.
+        adj.set_value((adj.upper() - adj.page_size() - 600.0).floor() + 0.75);
+        settle();
+        assert!((adj.value().fract() - 0.75).abs() < 1e-6, "{}", adj.value());
+        let before = t.settle_counts().1;
+        t.scroll_to_card("s20");
+        settle();
+        assert!(!t.jump_pending(), "the jump ended: {}", t.scroll_debug());
+        assert!(
+            t.row_bounds_in_viewport("s20")
+                .is_some_and(|(b, _)| (30.0..=50.0).contains(&b.y())),
+            "landed on the row: {}",
+            t.scroll_debug()
+        );
+        assert_eq!(t.settle_counts().1 - before, 1, "once");
+
+        // Its row goes while it waits: the jump goes with it, whatever the layout.
+        view.apply(&Envelope::item_started(
+            "q1",
+            ItemKind::UserMessage,
+            "queued",
+            None,
+            None,
+        ));
+        t.set_never_laid_out(true);
+        t.scroll_to_card("q1");
+        assert!(t.jump_pending());
+        let changes = inner.model.borrow_mut().remove_item("q1");
+        inner.handle(changes);
+        t.settle_now();
+        assert!(!t.jump_pending(), "a gone row ends its jump");
+
+        // A layout that never comes: the jump gives up after a bounded wait, measured in
+        // frame-clock time (aged here, so no display rate decides it).
+        t.scroll_to_card("s30");
+        assert!(t.jump_pending());
+        t.settle_now();
+        assert!(t.jump_pending(), "the wait has only started");
+        t.age_clock(1_000_000);
+        t.settle_now();
+        assert!(t.jump_pending(), "not before its patience is spent");
+        t.age_clock(2_000_000);
+        t.settle_now();
+        assert!(!t.jump_pending(), "the jump gave up: {}", t.scroll_debug());
+        t.set_never_laid_out(false);
+        window.destroy();
+    }
+
+    /// A jump into a card still opening is never given up while it opens, however long the
+    /// revealer's transition runs against the display's frame rate.
+    pub(crate) fn a_jump_into_an_opening_card_waits_for_it() {
+        use agent_core::event::ItemKind;
+        let ctx = glib::MainContext::default();
+        let (view, window, inner) = live_window();
+        let t = &inner.transcript;
+        let settings = gtk4::Settings::default().expect("settings");
+        let animations = settings.is_gtk_enable_animations();
+        settings.set_gtk_enable_animations(true);
+        view.apply(&Envelope::item_started(
+            "agent",
+            ItemKind::Subagent,
+            "Agent",
+            None,
+            None,
+        ));
+        for i in 0..5 {
+            live_step(&view, &format!("c{i}"), Some("agent"));
+        }
+        inner.row_event(RowEvent::Toggle {
+            id: "agent".into(),
+            expanded: false,
+        });
+        for i in 0..40 {
+            live_step(&view, &format!("s{i}"), None);
+        }
+        assert!(crate::testutil::pump_until(&ctx, 10, || {
+            t.row_bounds_in_viewport("s39")
+                .is_some_and(|(b, _)| b.height() > 0.0)
+        }));
+        t.scroll_to_card("c2");
+        assert!(t.jump_pending(), "{}", t.scroll_debug());
+        // However much time passes while the card opens, the jump is kept.
+        assert!(
+            t.jump_opening(),
+            "the card is opening: {}",
+            t.scroll_debug()
+        );
+        t.settle_now();
+        t.age_clock(10_000_000);
+        t.settle_now();
+        assert!(t.jump_pending(), "kept while its card opens");
+        let landed = || {
+            !t.jump_pending()
+                && t.row_bounds_in_viewport("c2")
+                    .is_some_and(|(b, _)| b.height() > 0.0 && (0.0..=160.0).contains(&b.y()))
+        };
+        assert!(
+            crate::testutil::pump_until(&ctx, 10, landed),
+            "the jump never landed on its step: {}",
+            t.scroll_debug()
+        );
+        settings.set_gtk_enable_animations(animations);
+        window.destroy();
+    }
+
     pub(crate) fn ui_checks() {
         replay_fills_the_window_in_steps();
+        a_pending_jump_lands_or_ends();
+        a_jump_into_an_opening_card_waits_for_it();
+        a_jump_to_a_built_row_moves_once_onto_it();
+        a_focused_later_steps_button_hands_focus_on_back_at_the_end();
+        live_append_keeps_the_window_bounded();
+        a_pending_answer_survives_returning_to_the_end_and_a_far_jump();
+        nested_steps_arriving_while_reading_a_card_stay_within_the_budget();
+        a_jump_into_a_collapsed_card_lands_on_its_step();
+        cards::tests::a_closed_revealer_measures_its_child_unless_hidden();
         all_subagent_cards_toggle_together();
         model_chip_follows_pending_acceptance_and_rejection();
         stale_replay_checks();
@@ -2909,6 +3573,7 @@ pub(crate) mod tests {
         live_rows_make_an_entrance_and_replayed_rows_do_not();
         subagent_shelf::tests::shelf_follows_running_subagents();
         subagents::tests::worker_group_updates_without_rebuilding_its_row();
+        subagents::tests::a_long_sub_agent_opens_on_its_newest_steps();
         subagents::tests::names_are_never_squeezed_into_a_column();
         delegation::tests::ui_checks();
         let backend = StubBackend::new(Driver::Claude);

@@ -166,6 +166,25 @@ pub fn collapsible(
     Collapsible { card, toggle, body }
 }
 
+/// Hides `revealer`'s child once it has closed and shows it again as it starts to open. GTK
+/// measures a closed revealer's child on every size request (`tests::
+/// a_closed_revealer_measures_its_child_unless_hidden`), so every collapsed card's body was
+/// re-wrapped on each width change; a hidden child is skipped. Nothing shows differently: a
+/// closed revealer draws nothing, and the child is shown before the opening transition starts.
+pub(super) fn measure_only_when_open(revealer: &gtk4::Revealer) {
+    let sync = |r: &gtk4::Revealer| {
+        if let Some(child) = r.child() {
+            let open = r.reveals_child() || r.is_child_revealed();
+            if child.is_visible() != open {
+                child.set_visible(open);
+            }
+        }
+    };
+    sync(revealer);
+    revealer.connect_reveal_child_notify(sync);
+    revealer.connect_child_revealed_notify(sync);
+}
+
 pub(super) fn wrapping(l: &gtk4::Label) {
     l.set_wrap(true);
     l.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
@@ -902,6 +921,7 @@ impl ReasoningRow {
         let revealer = gtk4::Revealer::new();
         revealer.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
         revealer.set_child(Some(&body));
+        measure_only_when_open(&revealer);
         root.append(&revealer);
 
         let id = id.to_owned();
@@ -1287,6 +1307,7 @@ impl ToolCard {
         let revealer = gtk4::Revealer::new();
         revealer.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
         revealer.set_child(Some(&body));
+        measure_only_when_open(&revealer);
         root.append(&revealer);
 
         let id = id.to_owned();
@@ -1393,6 +1414,7 @@ impl ToolCard {
         let revealer = gtk4::Revealer::new();
         revealer.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
         revealer.set_child(Some(&column));
+        measure_only_when_open(&revealer);
 
         refresh_diff_tool(&open, &open_label, &toggle);
         let conn = DiffTools::shared().connect_changed(glib::clone!(
@@ -3011,6 +3033,81 @@ pub(super) fn pattern_error(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A widget that counts the times GTK measures it.
+    mod counting {
+        use gtk4::glib;
+        use gtk4::subclass::prelude::*;
+        use std::cell::Cell;
+
+        #[derive(Default)]
+        pub struct Imp {
+            pub measures: Cell<u32>,
+        }
+
+        #[glib::object_subclass]
+        impl ObjectSubclass for Imp {
+            const NAME: &'static str = "AtMeasureCounter";
+            type Type = Counter;
+            type ParentType = gtk4::Widget;
+        }
+
+        impl ObjectImpl for Imp {}
+
+        impl WidgetImpl for Imp {
+            fn measure(&self, _: gtk4::Orientation, _: i32) -> (i32, i32, i32, i32) {
+                self.measures.set(self.measures.get() + 1);
+                (10, 400, -1, -1)
+            }
+        }
+
+        glib::wrapper! {
+            pub struct Counter(ObjectSubclass<Imp>) @extends gtk4::Widget,
+                @implements gtk4::Accessible, gtk4::Buildable, gtk4::ConstraintTarget;
+        }
+    }
+
+    /// GTK measures a closed revealer's child on every size request (GTK 4.22 included), so a
+    /// collapsed card's body cost a resize what an open one did. [`measure_only_when_open`]
+    /// hides it once closed and shows it again before it opens.
+    pub(crate) fn a_closed_revealer_measures_its_child_unless_hidden() {
+        use gtk4::subclass::prelude::ObjectSubclassIsExt;
+        let measured = |revealer: &gtk4::Revealer, child: &counting::Counter, width: i32| {
+            let before = child.imp().measures.get();
+            let _ = revealer.measure(gtk4::Orientation::Vertical, width);
+            child.imp().measures.get() - before
+        };
+        let child: counting::Counter = glib::Object::new();
+        let plain = gtk4::Revealer::new();
+        plain.set_child(Some(&child));
+        assert!(!plain.reveals_child() && !plain.is_child_revealed());
+        assert!(
+            measured(&plain, &child, 500) > 0,
+            "GTK no longer measures a closed revealer's child: the hiding can go"
+        );
+
+        let child: counting::Counter = glib::Object::new();
+        let lazy = gtk4::Revealer::new();
+        lazy.set_transition_duration(0);
+        lazy.set_child(Some(&child));
+        measure_only_when_open(&lazy);
+        assert_eq!(measured(&lazy, &child, 501), 0, "closed: never measured");
+        lazy.set_reveal_child(true);
+        assert!(child.is_visible(), "shown before it opens");
+        assert!(measured(&lazy, &child, 502) > 0);
+        lazy.set_reveal_child(false);
+        assert!(!lazy.is_child_revealed() && !child.is_visible());
+        assert_eq!(measured(&lazy, &child, 503), 0);
+
+        // With a transition, it stays shown until the close is over.
+        let child: counting::Counter = glib::Object::new();
+        let sliding = gtk4::Revealer::new();
+        sliding.set_child(Some(&child));
+        measure_only_when_open(&sliding);
+        sliding.set_reveal_child(true);
+        sliding.set_reveal_child(false);
+        assert_eq!(child.is_visible(), sliding.is_child_revealed());
+    }
 
     #[test]
     #[ignore = "native GTK; run alone in an isolated display"]
