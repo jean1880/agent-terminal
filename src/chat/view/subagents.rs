@@ -18,8 +18,8 @@ use gtk4::prelude::*;
 use super::cards::{label, wrap_words, wrapping, Row, RowSink};
 #[cfg(test)]
 use super::model::ToolStatus;
-use super::panels::{follow_dialog, padded, popover_list, scrolled};
 use super::model::{Body, SubagentSummary, Transcript};
+use super::panels::{follow_dialog, padded, popover_list, scrolled};
 use super::transcript::CHILD_CAP;
 
 /// `running`, `done · 12 steps`.
