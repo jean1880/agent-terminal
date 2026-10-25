@@ -458,9 +458,7 @@ impl Inner {
             return WakeOutcome::Busy;
         }
         info!("waking the agent with its sub-agents' news");
-        self.prompt_in_flight.set(true);
-        if !self.dispatch_sent_prompt(text, None) {
-            self.prompt_in_flight.set(false);
+        if !self.dispatch_in_flight(text, None) {
             return WakeOutcome::Busy;
         }
         // Started only on positive evidence, as held news is spent: the line went to a process
@@ -563,11 +561,9 @@ impl Inner {
         info!(plan = ?input.plan, "delivering delegated input");
         match input.plan {
             DeliveryPlan::StartTurn => {
-                self.prompt_in_flight.set(true);
-                if self.dispatch_sent_prompt(&text, None) {
+                if self.dispatch_in_flight(&text, None) {
                     DelegatedOutcome::TurnStarted
                 } else {
-                    self.prompt_in_flight.set(false);
                     DelegatedOutcome::Refused(ErrorCode::InternalError)
                 }
             }
@@ -618,12 +614,7 @@ impl Inner {
         }
         let held: Vec<String> = self.held_permissions.borrow_mut().drain().collect();
         for wire in held {
-            self.command(Command::Approve {
-                request: wire,
-                decision: agent_core::event::Decision::Deny,
-                updated_input: None,
-                message: Some(message.clone()),
-            });
+            self.deny_request(wire, message.as_str());
         }
         let open: Vec<String> = self.open_approvals.borrow().clone();
         for shown in open {
@@ -634,12 +625,7 @@ impl Inner {
                 .map_or_else(|| shown.clone(), |card| card.wire.clone());
             self.pending_rules.borrow_mut().remove(&shown);
             self.codex_permissions.borrow_mut().remove(&shown);
-            let denied = self.command(Command::Approve {
-                request: wire,
-                decision: agent_core::event::Decision::Deny,
-                updated_input: None,
-                message: Some(message.clone()),
-            });
+            let denied = self.deny_request(wire, message.as_str());
             let ended = if denied {
                 Event::ApprovalResolved {
                     decision: agent_core::event::Decision::Deny,

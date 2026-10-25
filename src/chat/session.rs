@@ -1077,6 +1077,17 @@ impl Inner {
         }
     }
 
+    /// Answers the agent's request `wire` Deny, telling it `message`; true when the adapter
+    /// took the answer.
+    fn deny_request(self: &Rc<Self>, wire: impl Into<String>, message: impl Into<String>) -> bool {
+        self.command(Command::Approve {
+            request: wire.into(),
+            decision: Decision::Deny,
+            updated_input: None,
+            message: Some(message.into()),
+        })
+    }
+
     /// Persists (under the current provider thread), updates the status, then delivers.
     fn emit(&self, env: Envelope) {
         let delivery = ScopedFlag::set(&self.delivering);
@@ -2593,12 +2604,10 @@ impl Inner {
             return;
         }
         self.pending_rules.borrow_mut().remove(request);
-        let denied = self.command(Command::Approve {
-            request: request.to_owned(),
-            decision: Decision::Deny,
-            updated_input: None,
-            message: Some("No answer in agent-terminal before the deadline; denied.".to_owned()),
-        });
+        let denied = self.deny_request(
+            request,
+            "No answer in agent-terminal before the deadline; denied.",
+        );
         if denied {
             self.emit(
                 Envelope::new(Event::ApprovalResolved {
@@ -2804,9 +2813,7 @@ impl Inner {
         }
         self.start_process();
         for sent in prompts {
-            self.prompt_in_flight.set(true);
-            if !self.dispatch_sent_prompt(&sent.text, sent.handoff.clone()) {
-                self.prompt_in_flight.set(false);
+            if !self.dispatch_in_flight(&sent.text, sent.handoff.clone()) {
                 self.held_retries.borrow_mut().push_back(sent);
             }
         }
@@ -3516,13 +3523,12 @@ impl Inner {
             (None, Some(news)) => agent_core::delegation::wake::with_user_prompt(news.text(), text),
             (None, None) => text.to_owned(),
         };
-        self.prompt_in_flight.set(true);
         let queued = QueuedPrompt {
             item_id: item,
             text: text.to_owned(),
             stored,
         };
-        let accepted = self.dispatch_sent_prompt(&sent, handoff);
+        let accepted = self.dispatch_in_flight(&sent, handoff);
         self.settle_news(news, accepted, &sent, text);
         if accepted {
             self.note_unspawned_prompt(queued);
@@ -3563,6 +3569,17 @@ impl Inner {
             })
             .item(item),
         );
+    }
+
+    /// [`Self::dispatch_sent_prompt`], with a prompt counted in flight while it goes and no
+    /// longer once the adapter refused it.
+    fn dispatch_in_flight(self: &Rc<Self>, sent: &str, handoff: Option<Handoff>) -> bool {
+        self.prompt_in_flight.set(true);
+        let accepted = self.dispatch_sent_prompt(sent, handoff);
+        if !accepted {
+            self.prompt_in_flight.set(false);
+        }
+        accepted
     }
 
     /// Sends `sent` as a prompt; true when the adapter took it.
@@ -3652,9 +3669,7 @@ impl Inner {
             }
             let retry = self.held_retries.borrow_mut().pop_front();
             if let Some(retry) = retry {
-                self.prompt_in_flight.set(true);
-                if !self.dispatch_sent_prompt(&retry.text, retry.handoff.clone()) {
-                    self.prompt_in_flight.set(false);
+                if !self.dispatch_in_flight(&retry.text, retry.handoff.clone()) {
                     self.held_retries.borrow_mut().push_front(retry);
                     return;
                 }
@@ -3720,12 +3735,11 @@ impl Inner {
                 }
                 (None, None) => queued.text.clone(),
             };
-            self.prompt_in_flight.set(true);
             let queued = QueuedPrompt {
                 stored: true,
                 ..queued
             };
-            let accepted = self.dispatch_sent_prompt(&sent, handoff);
+            let accepted = self.dispatch_in_flight(&sent, handoff);
             self.settle_news(news, accepted, &sent, &queued.text);
             if !accepted {
                 self.hold_queued_prompt(queued);
@@ -5207,12 +5221,7 @@ impl Inner {
             options.retain(|d| matches!(d, Decision::Deny | Decision::Cancel));
         }
         self.emit(card);
-        let denied = self.command(Command::Approve {
-            request: request.to_owned(),
-            decision: Decision::Deny,
-            updated_input: None,
-            message: Some(format!("Denied by agent-terminal: {reason}")),
-        });
+        let denied = self.deny_request(request, format!("Denied by agent-terminal: {reason}"));
         if denied {
             self.emit(
                 Envelope::new(Event::ApprovalResolved {
