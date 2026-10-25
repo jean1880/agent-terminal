@@ -416,17 +416,59 @@ fn unrestricted_traversal(argv: &[String]) -> bool {
     }
 }
 
+/// rg's short flags that take no value and neither widen the search (`-u`, `-L`, `-.`) nor run
+/// anything (`-z`): [`rg_searches_a_folder`]'s allowlist.
+const RG_FLAGS_SHORT: &str = "nNisSwxvclFHIoqbUPa0";
+
+/// rg's long flags that take no value and neither widen the search nor run anything.
+const RG_FLAGS_LONG: &[&str] = &[
+    "line-number",
+    "no-line-number",
+    "ignore-case",
+    "case-sensitive",
+    "smart-case",
+    "word-regexp",
+    "line-regexp",
+    "invert-match",
+    "count",
+    "count-matches",
+    "files-with-matches",
+    "files-without-match",
+    "fixed-strings",
+    "with-filename",
+    "no-filename",
+    "only-matching",
+    "quiet",
+    "byte-offset",
+    "multiline",
+    "pcre2",
+    "text",
+    "null",
+    "heading",
+    "no-heading",
+    "column",
+    "no-column",
+    "vimgrep",
+    "json",
+    "no-messages",
+    "trim",
+    "stats",
+];
+
 /// Whether an `rg` call may search a folder: rg recurses into every directory it is given, and
 /// into the working directory when it is given no path, reading secret-named files that are not
 /// hidden or ignored (`credentials.json`, `prod.key`). Such a call is never covered by a session
 /// read pattern ([`Context::args_contained`]); only a search of named regular files is.
 ///
-/// Positional words are those that do not start with `-`, and every word after `--`. The first
-/// is the pattern, unless one comes from an option (`-e`/`--regexp`, `-f`/`--file`, or a short
-/// cluster holding `e` or `f`); every other one must name a regular file (`is_file`). An option's
-/// separate value (`-g '*.rs'`, `-t rust`, `-e needle`) is read as a positional word, and so
-/// fails closed; consuming it instead would trust a parse of every value-taking option (rg takes
-/// `-g -e` as the glob `-e`).
+/// An allowlist, so that no option can take the next word as its value: every option word before
+/// `--` is flags known to take none ([`RG_FLAGS_SHORT`], [`RG_FLAGS_LONG`], `--color=…`), or a
+/// pattern with its value attached (`-eneedle`, `-ie…`, `-f…`, `--regexp=…`, `--file=…`). Any
+/// other option (`-g '!x'`, `-t rust`, `-m 1`, `-e needle`) may make the next word its value, the
+/// path after it the pattern, and the cwd the search, so it counts as searching a folder.
+///
+/// The words left (those not starting with `-`, and every word after `--`) are then exactly
+/// rg's positionals: the first is the pattern unless an option gave one, and every other one must
+/// name a regular file (`is_file`).
 fn rg_searches_a_folder(argv: &[String], is_file: impl Fn(&str) -> bool) -> bool {
     if argv.first().map(|w| basename(w)) != Some("rg") {
         return false;
@@ -439,10 +481,24 @@ fn rg_searches_a_folder(argv: &[String], is_file: impl Fn(&str) -> bool) -> bool
             break;
         }
         if let Some(long) = word.strip_prefix("--") {
-            let name = long.split_once('=').map_or(long, |(name, _)| name);
-            pattern_from_option |= matches!(name, "regexp" | "file");
+            match long.split_once('=') {
+                None if RG_FLAGS_LONG.contains(&long) => {}
+                Some(("color" | "colour", value)) if !value.is_empty() => {}
+                Some(("regexp" | "file", value)) if !value.is_empty() => {
+                    pattern_from_option = true;
+                }
+                _ => return true,
+            }
         } else if let Some(short) = word.strip_prefix('-').filter(|s| !s.is_empty()) {
-            pattern_from_option |= short.contains(['e', 'f']);
+            for (i, letter) in short.char_indices() {
+                if matches!(letter, 'e' | 'f') && i + letter.len_utf8() < short.len() {
+                    pattern_from_option = true;
+                    break;
+                }
+                if !RG_FLAGS_SHORT.contains(letter) {
+                    return true;
+                }
+            }
         } else {
             positional.push(word.as_str());
         }
@@ -4320,7 +4376,10 @@ mod tests {
             "rg needle README.md",
             "rg -n needle README.md src/a.rs",
             "rg -eneedle README.md",
+            "rg -ieneedle README.md",
             "rg --regexp=needle -- README.md",
+            "rg -n -i -w -v needle README.md",
+            "rg --color=never --no-heading -S needle README.md src/a.rs",
         ] {
             assert!(rg.matches(&shell(ok), &c), "{ok}");
         }
@@ -4345,6 +4404,25 @@ mod tests {
         ] {
             assert!(!rg.matches(&shell(refused), &c), "{refused}");
         }
+        // An option's separate value taken for the pattern: rg then has no path and searches the
+        // cwd (`-v` printing every line). Only options known to take no value pass; the
+        // exec-capable search-zip never does, in a cluster too.
+        let matched: Vec<&str> = [
+            "rg -v -g '!x' README.md",
+            "rg -t rust README.md",
+            "rg -m 1 README.md",
+            "rg -T x README.md",
+            "rg -A 3 README.md",
+            "rg -j 2 README.md",
+            "rg --type-add 'x:*' -tx README.md",
+            "rg --color always README.md",
+            "rg --max-count 1 README.md",
+            "rg -nz needle README.md",
+        ]
+        .into_iter()
+        .filter(|call| rg.matches(&shell(call), &c))
+        .collect();
+        assert!(matched.is_empty(), "covered unasked: {matched:?}");
         // Answered for the session, a recursive search keeps the exact call, not `rg …`.
         let exact = decide(Some(&shell("rg x .")), None, Scope::Session, &c).expect("exact");
         assert!(matches!(&exact.target, Target::Argv { prefix: false, .. }));
