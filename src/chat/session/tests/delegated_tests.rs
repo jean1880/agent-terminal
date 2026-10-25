@@ -1766,6 +1766,74 @@ fn an_approval_cards_stop_turn_tells_the_hooks_the_root_stopped() {
     });
 }
 
+/// A delegation root's switch: the window stops it for the rebind, asks for the switch, then
+/// ends the rebind straight away. A switch still reading the thread then is not cancelled by
+/// that restart, nor is the outgoing agent started again: the switch starts its new agent.
+#[test]
+fn a_rebind_around_a_roots_switch_lets_the_switch_start_the_new_agent() {
+    use agent_kit::store_writer::StoreWriter;
+    in_loop(|ctx| {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("threads.sqlite");
+        let store = Rc::new(Store::open(&path).expect("store"));
+        let thread = fresh(&store, "/w");
+        let writer = StoreWriter::spawn(&path).expect("writer");
+        let handle = StoreHandle::Queued {
+            reader: store,
+            writer: writer.clone(),
+        };
+        let (sink, seen) = make_sink();
+        let hooks = Rc::new(TestHooks::default());
+        let old: Log = Rc::default();
+        let new: Log = Rc::default();
+        let session = ChatSession::with_options(
+            FakeAdapter::boxed(Driver::Agy, &old),
+            OpenSession {
+                model: Some("gemini-pro".into()),
+                mode: Mode::Plan,
+                ..open_session("unused", Vec::new(), "/")
+            },
+            SessionStore::from(handle),
+            thread,
+            sink,
+            Err(None),
+            minimal_env(dir.path()),
+            SessionOptions {
+                generation_base: ProcessGeneration(0),
+                hooks: Some(hooks.clone()),
+                child: None,
+            },
+        );
+        let factory = new.clone();
+        session.set_adapter_factory(Rc::new(move |d| launch_of(FakeAdapter::boxed(d, &factory))));
+        assert!(pump_until(ctx, 5, || session.status().alive));
+
+        session.rebind_stop();
+        writer
+            .write("a slow write", None, |_| {
+                std::thread::sleep(Duration::from_millis(400));
+                Ok(())
+            })
+            .expect("queued");
+        session.switch(Driver::Claude, Some("opus".into()), None);
+        let starts = hooks.started.borrow().len();
+        session.rebind_start();
+        assert_eq!(
+            hooks.started.borrow().len(),
+            starts,
+            "the outgoing agent was started again"
+        );
+        assert!(
+            pump_until(ctx, 10, || session.status().driver == Driver::Claude
+                && session.status().alive),
+            "the switch was lost to the rebind"
+        );
+        assert!(has(&seen, |e| matches!(e, Event::Notice { text }
+            if text.starts_with("Switched to Claude") || text.starts_with("Continuing in Claude"))));
+        session.shutdown(false);
+    });
+}
+
 /// Sub-agent news offered to a root: it waits while a turn runs, resumes a suspended process,
 /// starts a turn shown as the app's notice (never a user message), is only a notice once the
 /// agent was woken too often without the user, and never wakes a root the user stopped. The
