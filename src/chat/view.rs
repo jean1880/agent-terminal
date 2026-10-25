@@ -109,21 +109,7 @@ thread_local! {
 
 /// Loads the embedded style sheet once per process (above the app's brand CSS).
 fn load_style() {
-    if STYLE_LOADED.with(Cell::get) {
-        return;
-    }
-    let Some(display) = gdk::Display::default() else {
-        return;
-    };
-    crate::brand::install();
-    let provider = gtk4::CssProvider::new();
-    provider.load_from_data(STYLE);
-    gtk4::style_context_add_provider_for_display(
-        &display,
-        &provider,
-        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
-    );
-    STYLE_LOADED.with(|l| l.set(true));
+    crate::style::install_once(&STYLE_LOADED, STYLE);
 }
 
 mod imp {

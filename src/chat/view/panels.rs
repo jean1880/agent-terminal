@@ -541,11 +541,14 @@ fn confirm_busy_switch(
     then: impl Fn() + 'static,
 ) {
     let (title, body, confirm) = busy_switch_text(from, to, caveats);
-    let dialog = adw::AlertDialog::new(Some(&title), Some(&body));
-    dialog.add_responses(&[("cancel", "Keep Waiting"), ("switch", confirm)]);
-    dialog.set_response_appearance("switch", adw::ResponseAppearance::Destructive);
-    dialog.set_default_response(Some("cancel"));
-    dialog.set_close_response("cancel");
+    let dialog = crate::dialogs::confirm_dialog(
+        &title,
+        &body,
+        ("cancel", "Keep Waiting"),
+        ("switch", confirm),
+        adw::ResponseAppearance::Destructive,
+        false,
+    );
     dialog.connect_response(None, move |_, response| {
         if response == "switch" {
             then();
@@ -563,21 +566,21 @@ pub fn confirm_bypass(parent: &impl IsA<gtk4::Widget>, driver: Driver, then: imp
     } else {
         ""
     };
-    let dialog = adw::AlertDialog::new(
-        Some("Turn On Dangerous Permissive Mode?"),
-        Some(&format!(
+    let dialog = crate::dialogs::confirm_dialog(
+        "Turn On Dangerous Permissive Mode?",
+        &format!(
             "Every request {agent} makes in this thread will be approved without asking you: \
              shell commands, file edits and deletions anywhere your account can reach, network \
              access and MCP tools.{sandbox} Nothing will stop a mistaken or harmful step before \
              it runs.\n\nIt lasts for this agent session only: reopening the thread, restarting \
              the app, forking it or switching agent turns it off. Only continue if you trust \
              this agent with your files and accounts."
-        )),
+        ),
+        ("cancel", "Cancel"),
+        ("bypass", "Approve Everything"),
+        adw::ResponseAppearance::Destructive,
+        false,
     );
-    dialog.add_responses(&[("cancel", "Cancel"), ("bypass", "Approve Everything")]);
-    dialog.set_response_appearance("bypass", adw::ResponseAppearance::Destructive);
-    dialog.set_default_response(Some("cancel"));
-    dialog.set_close_response("cancel");
     dialog.connect_response(None, move |_, response| {
         if response == "bypass" {
             then();
