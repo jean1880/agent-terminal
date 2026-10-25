@@ -2190,6 +2190,8 @@ impl CodexAdapter {
                 );
             }
             (Pending::Compact, None, error) => {
+                // Refused: no manual compaction is coming, so a later automatic one is not one.
+                self.compact_pending = false;
                 out.push(Envelope::new(Event::Error {
                     message: error.unwrap_or_else(|| "request failed".to_owned()),
                 }));
@@ -6162,6 +6164,21 @@ mod tests {
         // A longer text that merely starts with it is a normal prompt.
         let w = prompt(&mut a, "/compact please");
         assert_eq!(w["method"], "turn/start");
+    }
+
+    #[test]
+    fn a_refused_compact_does_not_make_a_later_automatic_compaction_manual() {
+        let mut a = started(Mode::Ask);
+        let w = prompt(&mut a, "/compact");
+        let ev = a.feed(&json!({"id": w["id"], "error": {"message": "no"}}).to_string());
+        assert!(matches!(&ev[0].event, Event::Error { .. }));
+        let ev = a.feed(
+            r#"{"method":"item/completed","params":{"threadId":"th-1","turnId":"tu","completedAtMs":1,"item":{"type":"contextCompaction","id":"cc1"}}}"#,
+        );
+        assert!(matches!(
+            ev[0].event,
+            Event::Compacted { manual: false, .. }
+        ));
     }
 
     // ---- notifications ----

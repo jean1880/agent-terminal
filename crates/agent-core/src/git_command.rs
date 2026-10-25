@@ -619,10 +619,17 @@ fn git_sub(sub: &str, rest: &[String]) -> GitAction {
             let args = parse(rest, NO_OPTIONS);
             a.list("Of", &args.targets());
             // `--output` writes a file; `--ext-diff`/`--textconv` run configured programs.
-            if args
-                .opts
-                .iter()
-                .any(|(n, _)| ["--output", "--ext-diff", "--textconv"].contains(&n.as_str()))
+            // `git grep -O`/`--open-files-in-pager` opens the matches in a program.
+            let opens_pager = sub == "grep"
+                && args
+                    .opts
+                    .iter()
+                    .any(|(n, _)| n == "-O" || n.starts_with("--open-files-in-pager"));
+            if opens_pager
+                || args
+                    .opts
+                    .iter()
+                    .any(|(n, _)| ["--output", "--ext-diff", "--textconv"].contains(&n.as_str()))
             {
                 a.reach = Local;
                 a.warn("An option here writes a file or runs a configured program.");
@@ -1194,14 +1201,19 @@ fn git_checkout(rest: &[String]) -> GitAction {
         if args.has(&["-B"]) {
             a.warn("Resets an existing branch of that name to the new start point.");
         }
-    } else if !args.paths.is_empty() || args.positionals.iter().any(|p| p == ".") {
+    } else if !args.paths.is_empty()
+        || args.positionals.len() >= 2
+        || args.positionals.iter().any(|p| p == ".")
+    {
         a.kind = Kind::Restore;
         let files = args.targets();
-        let source = (!args.paths.is_empty())
+        // Without `--`, two or more positionals are `<rev> <file>...`.
+        let source = (!args.paths.is_empty() || args.positionals.len() >= 2)
             .then(|| args.positionals.first().cloned())
             .flatten();
         let files: Vec<String> = match &source {
-            Some(_) => args.paths.clone(),
+            Some(_) if !args.paths.is_empty() => args.paths.clone(),
+            Some(_) => args.positionals[1..].to_vec(),
             None => files,
         };
         a.title = match &source {
@@ -1210,6 +1222,12 @@ fn git_checkout(rest: &[String]) -> GitAction {
         };
         a.list("Files", &files);
         a.warn("Overwrites these files in the working tree; their uncommitted changes are lost.");
+        if args.paths.is_empty() && args.positionals.len() >= 2 {
+            a.detail(
+                "Note",
+                "read as <revision> <files>; if the first word is a file, all of them are discarded",
+            );
+        }
     } else {
         let target = args.positionals.first().cloned().unwrap_or_default();
         a.title = if target.is_empty() {
@@ -1523,7 +1541,7 @@ fn git_reset(rest: &[String]) -> GitAction {
     if mode == "hard" {
         a.warn("Hard reset: uncommitted changes in tracked files are lost for good.");
     }
-    if to != "HEAD" && mode != "keep" {
+    if to != "HEAD" {
         a.warn("Moves the branch: commits after the new point are no longer on it.");
     }
     a
@@ -2887,6 +2905,44 @@ mod tests {
         let a = read(&["git", "log", "--output=/tmp/x"]);
         assert_eq!(a.reach, Reach::Local);
         assert!(a.destructive());
+    }
+
+    #[test]
+    fn grep_open_in_pager_runs_a_program() {
+        for words in [
+            &["git", "grep", "-O", "foo"][..],
+            &["git", "grep", "-Oless", "foo"],
+            &["git", "grep", "--open-files-in-pager", "foo"],
+            &["git", "grep", "--open-files-in-pager=vim", "foo"],
+        ] {
+            let a = read(words);
+            assert_eq!(a.reach, Reach::Local, "{words:?}");
+            assert!(a.destructive(), "{words:?}");
+        }
+        assert_eq!(read(&["git", "grep", "foo"]).reach, Reach::ReadOnly);
+    }
+
+    #[test]
+    fn reset_keep_warns_about_the_branch_move() {
+        let a = read(&["git", "reset", "--keep", "HEAD~3"]);
+        assert!(a.warnings.iter().any(|w| w.contains("Moves the branch")));
+    }
+
+    #[test]
+    fn checkout_rev_and_file_replaces_the_file() {
+        let a = read(&["git", "checkout", "HEAD~1", "a.rs"]);
+        assert_eq!(a.kind, Kind::Restore);
+        assert_eq!(a.title, "Replace files with their version in HEAD~1");
+        assert!(a.destructive());
+        assert!(a.warnings.iter().any(|w| w.contains("Overwrites")));
+        // Two files and no rev is not possible without `--`, so the first is still a rev.
+        let a = read(&["git", "checkout", "main", "a.rs", "b.rs"]);
+        assert_eq!(a.kind, Kind::Restore);
+        assert!(a.destructive());
+        // `-b` keeps its meaning: the second positional is a start point only.
+        let a = read(&["git", "checkout", "-b", "n", "main"]);
+        assert_eq!(a.kind, Kind::Switch);
+        assert!(!a.destructive());
     }
 
     #[test]
