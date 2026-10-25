@@ -5917,6 +5917,11 @@ impl AgentTerminalWindow {
                  request in the browser?",
                 state.branch, state.remote
             ),
+            PushState::Unknown => format!(
+                "{} may have commits that are not on {} yet; that cannot be read from here. \
+                 Push it, then open the pull request in the browser?",
+                state.branch, state.remote
+            ),
             PushState::UpToDate => String::new(),
         };
         let body = format!(

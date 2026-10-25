@@ -126,6 +126,25 @@ pub enum PushState {
     UpToDate,
     /// This many commits are not on the upstream yet.
     Ahead(u32),
+    /// What the push target holds cannot be read from here (a different push repository, or a
+    /// target never fetched): it may need pushing.
+    Unknown,
+}
+
+/// A remote setting shown to the user, without the user, password or token of a URL.
+fn without_userinfo(value: &str) -> String {
+    match value.split_once("://") {
+        Some((scheme, rest)) => {
+            let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+            let host = authority.rsplit('@').next().unwrap_or(authority);
+            if path.is_empty() {
+                format!("{scheme}://{host}")
+            } else {
+                format!("{scheme}://{host}/{path}")
+            }
+        }
+        None => value.rsplit('@').next().unwrap_or(value).to_owned(),
+    }
 }
 
 /// What opening a pull request for a tab's repository would involve.
@@ -159,9 +178,11 @@ impl PrState {
         self.push != PushState::UpToDate
     }
 
-    /// Whether this is the branch pull requests go into.
+    /// Whether the push destination is the branch pull requests go into. The base is read from
+    /// the push remote's repository (and is unknown when that differs from the fetch one), so
+    /// equal names are the same branch of the same repository.
     pub fn on_base(&self) -> bool {
-        self.base.as_deref() == Some(self.branch.as_str())
+        self.base.as_deref() == Some(self.remote_branch.as_str())
     }
 }
 
@@ -204,16 +225,19 @@ pub fn pr_state(dir: &Path) -> Result<PrOutcome, String> {
     // git's own order: branch.<b>.pushRemote, remote.pushDefault, branch.<b>.remote, origin.
     // A configured push remote that is not a remote's name (a URL, say) is never replaced by
     // another repository.
-    for key in [
+    // Only the setting that wins is checked: an invalid default does not disable a valid branch one.
+    let configured_push = [
         format!("branch.{branch}.pushRemote"),
         "remote.pushDefault".to_owned(),
-    ] {
-        if let Some(name) = line(top, &["config", "--get", &key]) {
-            if !remotes.contains(&name) {
-                return Ok(PrOutcome::Unavailable(format!(
-                    "{key} is set to \"{name}\", which is not one of this repository's remotes"
-                )));
-            }
+    ]
+    .into_iter()
+    .find_map(|key| line(top, &["config", "--get", &key]).map(|name| (key, name)));
+    if let Some((key, name)) = &configured_push {
+        if !remotes.contains(name) {
+            let shown = agent_core::redact::redact(&without_userinfo(name));
+            return Ok(PrOutcome::Unavailable(format!(
+                "{key} is set to \"{shown}\", which is not one of this repository's remotes"
+            )));
         }
     }
     let in_remotes = |r: String| remotes.contains(&r).then_some(r);
@@ -222,14 +246,11 @@ pub fn pr_state(dir: &Path) -> Result<PrOutcome, String> {
         &["config", "--get", &format!("branch.{branch}.remote")],
     )
     .and_then(in_remotes);
-    let remote = line(
-        top,
-        &["config", "--get", &format!("branch.{branch}.pushRemote")],
-    )
-    .or_else(|| line(top, &["config", "--get", "remote.pushDefault"]))
-    .or_else(|| tracked_remote.clone())
-    .or_else(|| remotes.iter().find(|r| *r == "origin").cloned())
-    .or_else(|| remotes.first().cloned());
+    let remote = configured_push
+        .map(|(_, name)| name)
+        .or_else(|| tracked_remote.clone())
+        .or_else(|| remotes.iter().find(|r| *r == "origin").cloned())
+        .or_else(|| remotes.first().cloned());
     let Some(remote) = remote else {
         return Ok(PrOutcome::Unavailable(
             "This repository has no remote to open a pull request on".to_owned(),
@@ -275,6 +296,9 @@ pub fn pr_state(dir: &Path) -> Result<PrOutcome, String> {
             .is_some()
         })
     });
+    // The remote-tracking refs describe the fetch repository: when the push goes elsewhere, the
+    // base read from them is not the push repository's, so it is unknown.
+    let base = if push_elsewhere { None } else { base };
     // The upstream names the remote branch only when git's push would follow it, and never when
     // that is the base branch of a feature branch: `checkout -b feat origin/main` tracks main.
     let remote_branch = upstream_branch
@@ -284,8 +308,11 @@ pub fn pr_state(dir: &Path) -> Result<PrOutcome, String> {
         })
         .unwrap_or_else(|| branch.clone());
     // Whether the push target has every commit, judged by its own remote-tracking ref.
+    // A different push repository, or a tracked branch whose push target was never fetched, cannot
+    // be judged from here: `Unknown`. A branch with neither upstream nor target is `NoUpstream`.
+    let tracked = line(top, &["config", "--get", &format!("branch.{branch}.merge")]).is_some();
     let push = if push_elsewhere {
-        PushState::NoUpstream
+        PushState::Unknown
     } else {
         match line(
             top,
@@ -299,6 +326,7 @@ pub fn pr_state(dir: &Path) -> Result<PrOutcome, String> {
         {
             Some(0) => PushState::UpToDate,
             Some(n) => PushState::Ahead(n),
+            None if tracked => PushState::Unknown,
             None => PushState::NoUpstream,
         }
     };
@@ -330,13 +358,8 @@ pub fn push_branch(dir: &Path, state: &PrState) -> Result<(), String> {
         state.branch, state.remote_branch
     );
     let mut args = vec!["push"];
-    // Only a branch with no upstream gets one; a branch tracking something else keeps it.
-    let tracked = line(
-        dir,
-        &["config", "--get", &format!("branch.{}.merge", state.branch)],
-    )
-    .is_some();
-    if state.push == PushState::NoUpstream && !tracked {
+    // Only a branch with no upstream gets one; `pr_state` reports a tracked branch as `Unknown`.
+    if state.push == PushState::NoUpstream {
         args.push("--set-upstream");
     }
     args.extend([state.remote.as_str(), refspec.as_str()]);
@@ -438,7 +461,7 @@ mod tests {
         assert!(state(PushState::Ahead(2)).needs_push());
         assert!(!state(PushState::UpToDate).needs_push());
         let mut on_main = state(PushState::UpToDate);
-        on_main.branch = "main".into();
+        on_main.remote_branch = "main".into();
         assert!(on_main.on_base());
         assert!(!state(PushState::UpToDate).on_base());
         let mut local = state(PushState::UpToDate);
@@ -541,7 +564,8 @@ mod tests {
             let s = ready(&work);
             assert_eq!(
                 s.compare_url().as_deref(),
-                Some("https://github.com/o/r/compare/main...feat/y?expand=1")
+                // The fetch repository's base is not this repository's: GitHub picks its default.
+                Some("https://github.com/o/r/compare/feat/y?expand=1")
             );
         }
 
@@ -718,7 +742,88 @@ mod tests {
                     fork.to_str().unwrap(),
                 ],
             );
-            assert_ne!(ready(&work).push, PushState::UpToDate);
+            assert_eq!(ready(&work).push, PushState::Unknown);
+        }
+
+        #[test]
+        fn a_different_push_repository_does_not_lend_its_base_to_the_destination() {
+            let Some((tmp, work)) = new_clone() else {
+                return;
+            };
+            sh(
+                &work,
+                &["update-ref", "refs/remotes/origin/develop", "HEAD"],
+            );
+            sh(&work, &["checkout", "-q", "-b", "feat", "origin/develop"]);
+            commit_file(&work, "b.txt");
+            sh(&work, &["config", "push.default", "upstream"]);
+            let fork = tmp.path().join("fork.git");
+            fs::create_dir_all(&fork).unwrap();
+            sh(&fork, &["init", "-q", "--bare"]);
+            sh(
+                &work,
+                &[
+                    "remote",
+                    "set-url",
+                    "--push",
+                    "origin",
+                    fork.to_str().unwrap(),
+                ],
+            );
+            let s = ready(&work);
+            assert_eq!(s.base, None);
+            assert_eq!(s.remote_branch, "feat");
+        }
+
+        #[test]
+        fn an_invalid_default_does_not_disable_a_valid_branch_push_remote() {
+            let Some((_tmp, work)) = new_clone() else {
+                return;
+            };
+            sh(&work, &["switch", "-q", "-c", "feat"]);
+            sh(&work, &["config", "branch.feat.pushRemote", "origin"]);
+            sh(&work, &["config", "remote.pushDefault", "nowhere"]);
+            assert_eq!(ready(&work).remote, "origin");
+        }
+
+        #[test]
+        fn on_base_reads_the_destination_not_the_local_name() {
+            let Some((tmp, work)) = new_clone() else {
+                return;
+            };
+            let fork = tmp.path().join("fork.git");
+            fs::create_dir_all(&fork).unwrap();
+            sh(&fork, &["init", "-q", "--bare"]);
+            sh(&work, &["remote", "add", "fork", fork.to_str().unwrap()]);
+            sh(&work, &["update-ref", "refs/remotes/fork/main", "HEAD"]);
+            sh(&work, &["config", "branch.main.remote", "fork"]);
+            sh(&work, &["config", "branch.main.merge", "refs/heads/topic"]);
+            sh(&work, &["config", "push.default", "upstream"]);
+            let s = ready(&work);
+            assert_eq!(s.branch, "main");
+            assert_eq!(s.remote_branch, "topic");
+            assert!(!s.on_base());
+        }
+
+        #[test]
+        fn a_rejected_push_remote_url_is_shown_without_its_credentials() {
+            let Some((_tmp, work)) = new_clone() else {
+                return;
+            };
+            sh(&work, &["switch", "-q", "-c", "feat"]);
+            sh(
+                &work,
+                &[
+                    "config",
+                    "branch.feat.pushRemote",
+                    "https://user:tok@host/x.git",
+                ],
+            );
+            let Ok(PrOutcome::Unavailable(why)) = pr_state(&work) else {
+                panic!("expected Unavailable");
+            };
+            assert!(!why.contains("tok") && !why.contains("user"), "{why}");
+            assert!(why.contains("host/x.git"), "{why}");
         }
 
         #[test]
