@@ -419,6 +419,13 @@ struct Inner {
     /// are in the transcript its handoff carries). A switch that sends none (it rolled back, or
     /// the replacement is not running) queues them again.
     carried_unsent: RefCell<Vec<QueuedPrompt>>,
+    /// Set while a switch waits, off the main thread, for the store writer before it reads the
+    /// thread to hand it on ([`Inner::with_thread_handoff`]): prompts queue for the new process
+    /// meanwhile, and neither a wake nor a suspension cuts in.
+    switch_reading: Cell<bool>,
+    /// Bumped by every switch and every stop: a read finishing under an older value is
+    /// overtaken and goes no further.
+    switch_serial: Cell<u64>,
     /// Set while [`Inner::suspend`] stops the process: its exit is not the thread's news, so the
     /// adapter's exit envelopes reach neither the view nor the store.
     quiet_exit: Cell<bool>,
@@ -519,6 +526,7 @@ enum InFlight {
     Delivering,
     SendingQueue,
     QueueDue,
+    Switching,
 }
 
 impl InFlight {
@@ -535,6 +543,7 @@ impl InFlight {
             Self::Delivering => "an event is being delivered",
             Self::SendingQueue => "the queue is being sent",
             Self::QueueDue => "the queue is due",
+            Self::Switching => "a switch is reading the thread",
         }
     }
 
@@ -546,6 +555,7 @@ impl InFlight {
             Self::Delivering => "delivering",
             Self::SendingQueue => "dispatching the queue",
             Self::QueueDue => "a queued dispatch",
+            Self::Switching => "switching",
         }
     }
 }
@@ -873,6 +883,8 @@ impl ChatSession {
             unspawned_binding: Cell::new(None),
             carrying_task: Cell::new(false),
             carried_unsent: RefCell::new(Vec::new()),
+            switch_reading: Cell::new(false),
+            switch_serial: Cell::new(0),
             quiet_exit: Cell::new(false),
             suspended: Cell::new(false),
             reported: Cell::new(false),
@@ -1468,10 +1480,72 @@ impl Inner {
             .store
             .read(|s| s.transcript_messages(&self.thread))
             .and_then(|r| r)?;
-        Ok(build_handoff(
-            &messages,
+        Ok(self.handoff_of(from, &messages))
+    }
+
+    fn handoff_of(&self, from: Driver, messages: &[TranscriptMessage]) -> Handoff {
+        build_handoff(
+            messages,
             &format!("{} thread {}", from.info().long_label, self.thread),
-        ))
+        )
+    }
+
+    /// [`Self::thread_handoff`] for a switch, without blocking the main thread: the read waits
+    /// for every write queued so far, as that one does, but waits on a worker thread, then reads
+    /// here and hands the result to `then`. Meanwhile prompts queue and nothing wakes or
+    /// suspends the session (`switch_reading`). A later switch, a stop of the turn
+    /// ([`Self::end_pending_switch`]) or a process change first drops it: `then` never runs.
+    /// With no store writer (the in-memory store) the read is made now.
+    fn with_thread_handoff(
+        self: &Rc<Self>,
+        from: Driver,
+        then: impl FnOnce(&Rc<Self>, agent_kit::store::Result<Handoff>) + 'static,
+    ) {
+        let Some(writer) = self.store.writer() else {
+            let handoff = self.thread_handoff(from);
+            then(self, handoff);
+            return;
+        };
+        let barrier = writer.barrier();
+        let serial = self.switch_serial.get().wrapping_add(1);
+        self.switch_serial.set(serial);
+        self.switch_reading.set(true);
+        let generation = self.generation.get();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let wait = agent_kit::store_writer::READ_FLUSH_WAIT;
+            let caught_up = gtk4::gio::spawn_blocking(move || barrier.recv_timeout(wait).is_ok())
+                .await
+                .unwrap_or(false);
+            let Some(inner) = weak.upgrade() else { return };
+            if inner.switch_serial.get() != serial {
+                return; // overtaken by a later switch or a stop
+            }
+            inner.switch_reading.set(false);
+            if inner.generation.get() != generation {
+                debug!("the process changed while a switch read the thread; it goes no further");
+                return;
+            }
+            let handoff = if caught_up {
+                // Every write queued before the switch is committed: the reader sees them.
+                inner
+                    .store
+                    .reader()
+                    .transcript_messages(&inner.thread)
+                    .map(|messages| inner.handoff_of(from, &messages))
+            } else {
+                tracing::error!("the store writer did not catch up; not reading stale rows");
+                Err(agent_kit::store::StoreError::Behind)
+            };
+            then(&inner, handoff);
+        });
+    }
+
+    /// Drops a switch still waiting to read the thread ([`Self::with_thread_handoff`]).
+    fn end_pending_switch(&self) {
+        self.switch_serial
+            .set(self.switch_serial.get().wrapping_add(1));
+        self.switch_reading.set(false);
     }
 
     fn prepare_model_change(&self, model: String, effort: Option<String>, restarting: bool) {
@@ -2948,6 +3022,7 @@ impl Inner {
             (self.delivering.get(), InFlight::Delivering),
             (self.dispatching_queue.get(), InFlight::SendingQueue),
             (self.queued_dispatch_pending.get(), InFlight::QueueDue),
+            (self.switch_reading.get(), InFlight::Switching),
         ]
         .into_iter()
         .find_map(|(on, what)| on.then_some(what))
@@ -3343,7 +3418,8 @@ impl Inner {
         );
         let generation = self.generation.get();
         self.notice(retired_notice(&retired));
-        generation == self.generation.get()
+        // A switch still reading the thread sends the queue once its new process is up.
+        generation == self.generation.get() && !self.switch_reading.get()
     }
 
     /// Remembers the model the thread was set to, for the next time it is opened.
@@ -3464,8 +3540,9 @@ impl Inner {
     }
 
     fn send_prompt(self: &Rc<Self>, text: &str) {
-        if self.rebinding.get() {
-            // Nothing runs until the rebind starts the next generation, which sends the queue.
+        if self.rebinding.get() || self.switch_reading.get() {
+            // Nothing runs until the rebind starts the next generation, or the switch its new
+            // process, which then sends the queue.
             self.queue_prompt(text);
             return;
         }
@@ -3664,7 +3741,11 @@ impl Inner {
     }
 
     fn dispatch_queued_prompt(self: &Rc<Self>) {
-        if self.stopping.get() || self.dispatching_queue.get() || self.state.borrow().running_turn {
+        if self.stopping.get()
+            || self.dispatching_queue.get()
+            || self.switch_reading.get()
+            || self.state.borrow().running_turn
+        {
             return;
         }
         if self.delivering.get() {
@@ -3928,8 +4009,10 @@ impl Inner {
 
     /// The user chose "Stop turn" on a card: a stop of the turn, as the window's Stop is. A
     /// delegation root's hooks are told (the window's Stop tells the supervisor itself), so
-    /// its sub-agents' news does not wake it again until the user speaks.
+    /// its sub-agents' news does not wake it again until the user speaks, and a switch still
+    /// reading the thread goes no further.
     fn stopped_from_card(&self) {
+        self.end_pending_switch();
         if let Some(hooks) = &self.hooks {
             hooks.root_stopped();
         }
@@ -4115,6 +4198,8 @@ impl Inner {
     }
 
     fn switch(self: &Rc<Self>, driver: Driver, model: Option<String>, effort: Option<String>) {
+        // The latest choice wins over a switch still reading the thread.
+        self.end_pending_switch();
         let (caps, current_driver, mode, status_model, current_effort, running) = {
             let adapter = self.adapter.borrow();
             let state = self.state.borrow();
@@ -4184,31 +4269,33 @@ impl Inner {
         {
             // The picker already confirmed Switch and Continue. A process replacement actually
             // interrupts this turn and expires its questions/approvals before resuming.
-            let native = self.state.borrow().native_id.clone();
             // Transport writes are asynchronous: even a known native session might never
             // have received the latest task. Carry bounded context as well as native history.
-            let handoff = match self.thread_handoff(driver) {
-                Ok(handoff) => handoff,
-                Err(e) => {
-                    self.error(format!(
-                        "Could not read the unfinished task to continue: {e}"
-                    ));
-                    return;
+            self.with_thread_handoff(driver, move |inner, handoff| {
+                let handoff = match handoff {
+                    Ok(handoff) => handoff,
+                    Err(e) => {
+                        inner.error(format!(
+                            "Could not read the unfinished task to continue: {e}"
+                        ));
+                        return;
+                    }
+                };
+                let native = inner.state.borrow().native_id.clone();
+                {
+                    let _carrying = ScopedFlag::set(&inner.carrying_task);
+                    inner.respawn(&OpenSessionDelta {
+                        model: Some(target_model),
+                        effort,
+                        mode: None,
+                        resume: native,
+                    });
                 }
-            };
-            {
-                let _carrying = ScopedFlag::set(&self.carrying_task);
-                self.respawn(&OpenSessionDelta {
-                    model: Some(target_model),
-                    effort,
-                    mode: None,
-                    resume: native,
-                });
-            }
-            if handoff.carried > 0 {
-                self.arm_handoff(handoff);
-            }
-            self.continue_after_switch(driver);
+                if handoff.carried > 0 {
+                    inner.arm_handoff(handoff);
+                }
+                inner.continue_after_switch(driver);
+            });
             return;
         }
         // Suspended, same agent: no process to tell, and starting one here would skip a
@@ -4281,15 +4368,9 @@ impl Inner {
                 }
             }
             Transition::CreateWithHandoff => {
-                {
-                    // Busy, the switch's continuation carries the unfinished task; idle, nothing
-                    // does, and a message still waiting is queued again for the new agent.
-                    let _carrying = running.then(|| ScopedFlag::set(&self.carrying_task));
-                    self.create_with_handoff(driver, model, effort);
-                }
-                if running {
-                    self.continue_after_switch(driver);
-                }
+                // It ends the switch itself, once the thread is read.
+                self.create_with_handoff(driver, model, effort, running);
+                return;
             }
             Transition::Reject(reason) => self.error(reason),
         }
@@ -4333,19 +4414,53 @@ impl Inner {
         self.carried_unsent.borrow_mut().clear();
     }
 
+    /// Moves the thread to a new agent process on `driver`, carrying its history as a handoff,
+    /// then ends the switch: `busy`, its continuation carries the unfinished task; idle, nothing
+    /// does, and a message still waiting is sent to the new agent. The thread is read without
+    /// blocking ([`Self::with_thread_handoff`]), so all of it may happen later.
     fn create_with_handoff(
         self: &Rc<Self>,
         driver: Driver,
         model: Option<String>,
         effort: Option<String>,
+        busy: bool,
     ) {
         let Some(factory) = self.factory.borrow().clone() else {
             self.error("Switching agent is not available in this thread.");
+            self.end_switch(driver, busy);
             return;
         };
         // Built from the store before anything is stopped, so a failure leaves the thread as it was.
         let from = self.adapter.borrow().driver();
-        let handoff = match self.thread_handoff(from) {
+        self.with_thread_handoff(from, move |inner, handoff| {
+            {
+                // Busy, a message still waiting in an unspawned start is the continuation's.
+                let _carrying = busy.then(|| ScopedFlag::set(&inner.carrying_task));
+                inner.hand_off_to(driver, model, effort, from, &factory, handoff);
+            }
+            inner.end_switch(driver, busy);
+        });
+    }
+
+    /// The end of a switch: [`Self::create_with_handoff`]'s.
+    fn end_switch(self: &Rc<Self>, driver: Driver, busy: bool) {
+        if busy {
+            self.continue_after_switch(driver);
+        } else {
+            self.dispatch_queued_prompt();
+        }
+    }
+
+    fn hand_off_to(
+        self: &Rc<Self>,
+        driver: Driver,
+        model: Option<String>,
+        effort: Option<String>,
+        from: Driver,
+        factory: &AdapterFactory,
+        handoff: agent_kit::store::Result<Handoff>,
+    ) {
+        let handoff = match handoff {
             Ok(handoff) => handoff,
             Err(e) => {
                 self.error(format!("Could not read the thread to hand it off: {e}"));
@@ -5576,6 +5691,7 @@ impl ChatBackend for ChatSession {
     }
 
     fn interrupt(&self) {
+        self.inner.end_pending_switch();
         self.inner.command(Command::Interrupt);
     }
 
@@ -8824,7 +8940,9 @@ mod tests {
             );
 
             // Compact by handoff restarts the same agent on a fresh launch.
-            session.inner.create_with_handoff(Driver::Agy, None, None);
+            session
+                .inner
+                .create_with_handoff(Driver::Agy, None, None, false);
             assert_eq!(session.status().mode, Mode::Ask, "compact");
             let argv = session.launch_spec().argv;
             assert!(!argv.iter().any(|a| a == "plan"), "{argv:?}");
@@ -9551,6 +9669,97 @@ mod tests {
                 session.shutdown(false);
             }
         });
+    }
+
+    /// A switch that hands the thread on reads it only once the store writer has caught up, and
+    /// waits for that off the main thread: a writer still busy with earlier writes never freezes
+    /// the window. Both a switch to another agent and a busy switch on the same agent; a prompt
+    /// sent meanwhile waits for the new process.
+    #[test]
+    fn a_handoff_switch_waits_for_the_store_writer_off_the_main_thread() {
+        use agent_kit::store_writer::StoreWriter;
+        for same_agent in [false, true] {
+            in_loop(|ctx| {
+                let tmp = tempfile::tempdir().expect("tmp");
+                let path = tmp.path().join("threads.sqlite");
+                let store = Rc::new(Store::open(&path).expect("store"));
+                let thread = fresh(&store, "/w");
+                let writer = StoreWriter::spawn(&path).expect("writer");
+                let handle = StoreHandle::Queued {
+                    reader: store.clone(),
+                    writer: writer.clone(),
+                };
+                let log: Log = Rc::default();
+                let new_log: Log = Rc::default();
+                let (session, seen) = if same_agent {
+                    harness(
+                        FakeAdapter::boxed(Driver::Claude, &log),
+                        open_on("sonnet"),
+                        &handle,
+                        &thread,
+                    )
+                } else {
+                    harness(
+                        FakeAdapter::boxed(Driver::Agy, &log),
+                        OpenSession {
+                            model: Some("gemini-pro".into()),
+                            mode: Mode::Plan,
+                            ..open_session("unused", Vec::new(), "/")
+                        },
+                        &handle,
+                        &thread,
+                    )
+                };
+                let factory_log = new_log.clone();
+                session.set_adapter_factory(Rc::new(move |d| {
+                    launch_of(FakeAdapter::boxed(d, &factory_log))
+                }));
+                if same_agent {
+                    session.send_prompt("the unfinished task");
+                    assert!(session.status().running_turn);
+                }
+                let generation = session.inner.generation.get();
+                // The writer is still busy with an earlier write for a while.
+                writer
+                    .write("a slow write", None, |_| {
+                        std::thread::sleep(Duration::from_millis(1500));
+                        Ok(())
+                    })
+                    .expect("queued");
+                let started = std::time::Instant::now();
+                session.switch(Driver::Claude, Some("opus".into()), None);
+                let took = started.elapsed();
+                assert!(
+                    took < Duration::from_millis(500),
+                    "the switch held the main thread for {took:?} (same agent: {same_agent})"
+                );
+                if !same_agent {
+                    session.send_prompt("for the new agent");
+                }
+                assert!(
+                    pump_until(ctx, 10, || session.inner.generation.get() > generation
+                        && session.status().driver == Driver::Claude),
+                    "the switch never went ahead (same agent: {same_agent})"
+                );
+                if same_agent {
+                    let sent = prompts(&log);
+                    assert_eq!(sent.len(), 2, "the task, then its continuation: {sent:?}");
+                    assert!(sent[1].contains("the unfinished task"), "{sent:?}");
+                } else {
+                    assert!(has(&seen, |e| matches!(e, Event::Notice { text }
+                        if text.starts_with("Switched to Claude")
+                            || text.starts_with("Continuing in Claude"))));
+                    assert!(prompts(&log).is_empty(), "nothing reached the old agent");
+                    assert!(
+                        pump_until(ctx, 5, || prompts(&new_log)
+                            .iter()
+                            .any(|p| p.contains("for the new agent"))),
+                        "the prompt sent meanwhile went to the new agent"
+                    );
+                }
+                session.shutdown(false);
+            });
+        }
     }
 
     #[test]

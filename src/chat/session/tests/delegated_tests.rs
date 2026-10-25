@@ -1747,7 +1747,11 @@ fn an_approval_cards_stop_turn_tells_the_hooks_the_root_stopped() {
                 .inner
                 .finish_hook_approval("h1", Decision::Cancel, answered);
         }
-        assert_eq!(hooks.root_stops.get(), 2, "agy's Stop turn, answered or not");
+        assert_eq!(
+            hooks.root_stops.get(),
+            2,
+            "agy's Stop turn, answered or not"
+        );
 
         // Claude's card.
         feed(&session, &can_use_tool("r1", "touch a"));
