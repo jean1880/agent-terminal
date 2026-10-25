@@ -30,8 +30,8 @@ const TOKEN_PREFIXES: &[&str] = &[
     "atdc_",
 ];
 
-/// Authorization schemes whose next word is a credential.
-const AUTH_SCHEMES: &[&str] = &["Bearer ", "Basic ", "Token "];
+/// Authorization schemes whose next word, after one or more blanks, is a credential.
+const AUTH_SCHEMES: &[&str] = &["Bearer", "Basic", "Token"];
 
 /// Parts of a variable or key name that mark its value as secret.
 const SENSITIVE_NAME_PARTS: &[&str] = &[
@@ -40,6 +40,7 @@ const SENSITIVE_NAME_PARTS: &[&str] = &[
     "SECRET",
     "PASSWORD",
     "PASSWD",
+    "PASSPHRASE",
     "PRIVATE",
     "CREDENTIAL",
 ];
@@ -67,6 +68,22 @@ fn mask(secret: &str) -> String {
 /// Pattern based, so its ceiling is known: a credential with no recognizable
 /// prefix, not assigned to a sensitive-looking name, gets through. The brief
 /// says so in its header. Upgrade path: entropy scoring of long tokens.
+///
+/// Known limits, each a credential this does not mask:
+/// - a value under a name with no sensitive part (`DB_PASS=`, `pw:`, `auth=`);
+/// - a value shorter than eight characters after an assignment or flag (`NAME: 1234567`);
+/// - an unquoted `NAME=value` cut by a blank the shell would not see as one (`NAME=a b`,
+///   unless escaped as `a\ b`), and a value that continues on the next line (YAML block
+///   scalars `|`/`>`, a trailing `\`, JSON with an embedded newline): rules apply line by line;
+/// - command-line credentials of programs other than curl, wget, mysql, mariadb, mysqldump and
+///   sshpass, and of those programs behind an alias or a variable (`$CURL -u u:pw`);
+/// - a secret split by a separator inside its own word (`-u u:a;b` masks only to the `;`);
+/// - an authorization scheme other than Bearer, Basic and Token, and `Basic`/`Token` on a line
+///   that never says "authorization";
+/// - a YAML or INI value on a line that reads as code (it holds ` = ` or ends with `;`, `{` or
+///   `,`), which is cut at its first blank like an `=` value (`NAME: two words,`);
+/// - a flow mapping judged by brackets: an unmatched `{` or `[` in plain text before a key
+///   (outside quotes) makes its value end at the next `,`, `}` or `]`.
 pub fn redact(text: &str) -> String {
     let without_pem = redact_pem_blocks(text);
     let mut out = String::with_capacity(without_pem.len());
@@ -176,7 +193,7 @@ fn redact_header_values(line: &str) -> (String, bool) {
             };
             open |= value_end == line.len();
             let value = &line[value_start..value_end];
-            if !value.is_empty() && !value.starts_with("****") {
+            if !value.is_empty() && !is_masked(value) {
                 edits.push((value_start, value_end, mask_any(value)));
             }
             from = value_end.max(start);
@@ -185,13 +202,25 @@ fn redact_header_values(line: &str) -> (String, bool) {
     (apply_edits(line, edits), open)
 }
 
-/// The shell words of `line` as byte spans, quote-aware (`'a b'` and `"a b"` stay one word; no
-/// escapes). The flag is `true` when a quote is still open at the end of the line.
+/// The shell words of `line` as byte spans, quote-aware (`'a b'` and `"a b"` stay one word, and
+/// so do adjacent parts such as `'a'b"c"`). A backslash outside quotes or inside double quotes
+/// escapes the next character (`a\ b` is one word); inside single quotes it is literal. The flag
+/// is `true` when a quote or an escape is still open at the end of the line.
 fn shell_word_spans(line: &str) -> (Vec<(usize, usize)>, bool) {
     let mut spans = Vec::new();
     let mut start: Option<usize> = None;
     let mut quote: Option<char> = None;
+    let mut escaped = false;
     for (i, c) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if c == '\\' && quote != Some('\'') {
+            escaped = true;
+            start.get_or_insert(i);
+            continue;
+        }
         match quote {
             Some(q) => {
                 if c == q {
@@ -217,21 +246,13 @@ fn shell_word_spans(line: &str) -> (Vec<(usize, usize)>, bool) {
     if let Some(s) = start {
         spans.push((s, line.len()));
     }
-    (spans, quote.is_some())
+    (spans, quote.is_some() || escaped)
 }
 
-/// The bytes of `word` from `from` with one pair of surrounding quotes left out: the value's
-/// range within `word`.
+/// The value's range within `word` from `from`: the [`shell_value`] there, to the end of the
+/// shell word.
 fn value_range(word: &str, from: usize) -> (usize, usize) {
-    let rest = &word[from..];
-    match rest.chars().next() {
-        Some(q @ ('\'' | '"')) => {
-            let start = from + 1;
-            let end = word[start..].find(q).map_or(word.len(), |at| start + at);
-            (start, end)
-        }
-        _ => (from, word.len()),
-    }
+    shell_value(word.as_bytes(), from, |_| false)
 }
 
 /// curl's short options that take a value: in a cluster, the first of these takes the rest of
@@ -367,12 +388,19 @@ fn credential_args_reach(program: &str, words: &[&str]) -> (Vec<(usize, usize, u
     (hits, past_end.get())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Argument words [`redact_credential_options`] handed to the parser: the linearity check.
+    static ARGS_SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Command words that end one command and start the next on the same line.
 const COMMAND_SEPARATORS: &[&str] = &["|", "||", "&&", ";", "&"];
 
 /// Masks credentials that command-line options carry ([`credential_args`]): only in the words
 /// after a program that uses them (`curl`, `wget`, `mysql`/`mariadb`/`mysqldump`, `sshpass`),
-/// up to the next command separator, so `docker -u 1000:1000` or `mkdir -p dir` are left alone.
+/// up to the next command separator, so `docker -u 1000:1000` or `mkdir -p dir` are left alone. A
+/// separator attached to the program's word (`true;curl`) still reveals the program.
 /// Credential headers in any text are masked too ([`redact_header_values`]). Open (see
 /// [`redact_line`]) when a header value runs to the end, or a credential program's command does
 /// while a quote is open or an option still waits for its value word.
@@ -380,8 +408,30 @@ fn redact_credential_options(line: &str) -> (String, bool) {
     let (line, mut open) = redact_header_values(line);
     let (spans, quote_open) = shell_word_spans(&line);
     let words: Vec<&str> = spans.iter().map(|&(s, e)| &line[s..e]).collect();
+    // Where the command whose arguments start at word `k` ends, for every `k`, in one backward
+    // pass: a separator word ends it before itself, a word ending in one (`db;`) after itself.
+    let mut command_end = vec![words.len(); words.len() + 1];
+    for k in (0..words.len()).rev() {
+        command_end[k] = if COMMAND_SEPARATORS.contains(&words[k]) {
+            k
+        } else if words[k].ends_with([';', '|', '&']) {
+            k + 1
+        } else {
+            command_end[k + 1]
+        };
+    }
+    // The parser judges each argument word on its own and the next word, so a command read from
+    // its first `curl` already covers what a later `curl` in the same command would find: each
+    // span is read once per program name, which keeps the line linear (`curl curl curl …`).
+    let mut read: Vec<(&str, usize)> = Vec::new();
     let mut edits = Vec::new();
     for (p, program) in words.iter().enumerate() {
+        // A separator attached to the program (`true;curl`, `a&&curl`, `$(curl`) starts its
+        // command: the name is what follows the last one.
+        let program = program
+            .rsplit([';', '|', '&', '(', '`'])
+            .next()
+            .unwrap_or(program);
         let name = program.rsplit('/').next().unwrap_or(program);
         if !matches!(
             name,
@@ -389,28 +439,27 @@ fn redact_credential_options(line: &str) -> (String, bool) {
         ) {
             continue;
         }
-        // A separator word ends the command; a word ending in one (`db;`) is its last word.
-        let end = words[p + 1..]
-            .iter()
-            .enumerate()
-            .find_map(|(at, w)| {
-                if COMMAND_SEPARATORS.contains(w) {
-                    Some(p + 1 + at)
-                } else if w.ends_with([';', '|', '&']) {
-                    Some(p + 2 + at)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(words.len());
+        let end = command_end[p + 1];
+        // Words of one command share its end and come together: a new end is a new command.
+        if read.last().is_some_and(|&(_, e)| e != end) {
+            read.clear();
+        }
+        if read.contains(&(name, end)) {
+            continue;
+        }
+        read.push((name, end));
+        #[cfg(test)]
+        ARGS_SCANNED.with(|n| n.set(n.get() + (end - p - 1)));
         let (hits, past_end) = credential_args_reach(name, &words[p + 1..end]);
         open |= end == words.len() && (quote_open || past_end);
         for (i, s, e) in hits {
             let (word_start, _) = spans[p + 1 + i];
             let secret = &line[word_start + s..word_start + e];
             open |= word_start + e == line.len();
-            if !secret.starts_with("****") {
-                edits.push((word_start + s, word_start + e, mask_any(secret)));
+            if !is_masked(secret) {
+                let (_, word_end) = spans[p + 1 + i];
+                let word = &line[word_start..word_end];
+                edits.push((word_start + s, word_start + e, shell_mask(word, 0, s, e)));
             }
         }
     }
@@ -425,10 +474,7 @@ fn redact_credential_options(line: &str) -> (String, bool) {
 /// Ceiling: only the key's own name is judged, so a secret under an innocuous
 /// key still needs a recognizable shape. Upgrade path: entropy scoring.
 pub fn redact_keyed(key: &str, value: &str) -> String {
-    if is_sensitive_name(key)
-        && value.chars().count() >= MIN_SECRET_CHARS
-        && !value.starts_with("****")
-    {
+    if is_sensitive_name(key) && value.chars().count() >= MIN_SECRET_CHARS && !is_masked(value) {
         mask(value)
     } else {
         redact(value)
@@ -523,11 +569,15 @@ fn redact_auth_schemes(line: &str) -> (String, bool) {
     let mut open = !about_auth
         && AUTH_SCHEMES
             .iter()
-            .filter(|scheme| !scheme.eq_ignore_ascii_case("bearer "))
-            .any(|scheme| lower.contains(&scheme.to_ascii_lowercase()));
+            .filter(|scheme| !scheme.eq_ignore_ascii_case("bearer"))
+            .any(|scheme| {
+                let scheme = scheme.to_ascii_lowercase();
+                let found = scheme_positions(&lower, &scheme).next().is_some();
+                found
+            });
     let out = AUTH_SCHEMES
         .iter()
-        .filter(|scheme| about_auth || scheme.eq_ignore_ascii_case("bearer "))
+        .filter(|scheme| about_auth || scheme.eq_ignore_ascii_case("bearer"))
         .fold(line.to_string(), |text, scheme| {
             let (text, o) = redact_after(&text, scheme);
             open |= o;
@@ -536,36 +586,47 @@ fn redact_auth_schemes(line: &str) -> (String, bool) {
     (out, open)
 }
 
-/// Masks the word following each occurrence of `marker`, ignoring ASCII case. Open when a
-/// value runs to the end of the line.
+/// Where `scheme` (lowercase) stands in `lower` followed by a blank (space or tab), as the byte
+/// offset just past the scheme.
+fn scheme_positions<'a>(lower: &'a str, scheme: &'a str) -> impl Iterator<Item = usize> + 'a {
+    lower
+        .match_indices(scheme)
+        .map(move |(pos, _)| pos + scheme.len())
+        .filter(|&end| matches!(lower.as_bytes().get(end), Some(b' ' | b'\t')))
+}
+
+/// Masks the word following each occurrence of the scheme word `marker` and one or more blanks
+/// (spaces or tabs), ignoring ASCII case. Open when a value runs to the end of the line.
 fn redact_after(line: &str, marker: &str) -> (String, bool) {
+    // ASCII lower-casing keeps every byte where it was, so a position found in the lowered copy
+    // is the same position, and a char boundary, in the original.
+    let lower = line.to_ascii_lowercase();
     let marker = marker.to_ascii_lowercase();
-    let mut out = String::with_capacity(line.len());
-    let mut rest = line;
+    let bytes = line.as_bytes();
+    let mut edits = Vec::new();
     let mut open = false;
-    // ASCII lower-casing keeps every byte where it was, so a position found
-    // in the lowered copy is the same position — and a char boundary — in
-    // the original.
-    while let Some(pos) = rest.to_ascii_lowercase().find(&marker) {
-        let value_start = pos + marker.len();
-        let value_len = rest[value_start..]
-            .bytes()
-            .take_while(|b| {
-                is_token_byte(*b) || *b == b'.' || *b == b'=' || *b == b'/' || *b == b'+'
-            })
-            .count();
-        open |= value_start + value_len == rest.len();
-        let value = &rest[value_start..value_start + value_len];
-        out.push_str(&rest[..value_start]);
-        if value.len() >= MIN_SECRET_CHARS {
-            out.push_str(&mask(value));
-        } else {
-            out.push_str(value);
+    let mut from = 0;
+    for after in scheme_positions(&lower, &marker) {
+        if after < from {
+            continue;
         }
-        rest = &rest[value_start + value_len..];
+        let value_start = after
+            + bytes[after..]
+                .iter()
+                .take_while(|b| matches!(b, b' ' | b'\t'))
+                .count();
+        let value_len = bytes[value_start..]
+            .iter()
+            .take_while(|&&b| is_token_byte(b) || matches!(b, b'.' | b'=' | b'/' | b'+'))
+            .count();
+        let value_end = value_start + value_len;
+        open |= value_end == line.len();
+        if value_len >= MIN_SECRET_CHARS {
+            edits.push((value_start, value_end, mask(&line[value_start..value_end])));
+        }
+        from = value_end;
     }
-    out.push_str(rest);
-    (out, open)
+    (apply_edits(line, edits), open)
 }
 
 /// Masks the password in `scheme://user:password@host`. Open (see [`redact_line`]) when an
@@ -633,16 +694,15 @@ fn redact_flag_values(line: &str) -> (String, bool) {
             i = name_end.max(i + 1);
             continue;
         }
+        let neutral = skip_blanks(bytes, name_end);
         let (value_start, value_end) = value_span(bytes, name_end, blank);
         open |= value_end == bytes.len();
         let value = &line[value_start..value_end];
         // A value starting with '-' is the next flag, not this one's argument.
-        if value.chars().count() >= MIN_SECRET_CHARS
-            && !value.starts_with("****")
-            && !value.starts_with('-')
+        if value.chars().count() >= MIN_SECRET_CHARS && !is_masked(value) && !value.starts_with('-')
         {
             out.push_str(&line[copied..value_start]);
-            out.push_str(&mask(value));
+            out.push_str(&shell_mask(line, neutral, value_start, value_end));
             copied = value_end;
         }
         i = value_end.max(i + 1);
@@ -651,35 +711,223 @@ fn redact_flag_values(line: &str) -> (String, bool) {
     (out, open)
 }
 
-/// Where the value that follows `start` in `bytes` lies, as `(start, end)`: past any spaces and
-/// tabs, a quoted value runs to its closing quote (spaces and all, the quotes left out), an
-/// unquoted one to the first byte `stop_unquoted` accepts. `end` is the line's length when the
-/// value runs to the end.
-fn value_span(bytes: &[u8], start: usize, stop_unquoted: impl Fn(u8) -> bool) -> (usize, usize) {
-    let mut value_start = start;
-    while value_start < bytes.len() && matches!(bytes[value_start], b' ' | b'\t') {
-        value_start += 1;
-    }
-    let quote = match bytes.get(value_start) {
-        Some(q @ (b'"' | b'\'')) => {
-            value_start += 1;
-            Some(*q)
+/// The value that starts at `start` in `bytes`, read as one shell word, as `(start, end)`. Every
+/// path that reads a value goes through this one reader.
+///
+/// Quoted and unquoted parts that touch are joined (`'ab'cd`, `a"b c"`), as the shell joins them
+/// into one argument. A backslash escapes the next byte outside quotes and inside double quotes
+/// (`a\ b`, `"a\"b"`, as in the shell and JSON); inside single quotes it is literal, and `''`
+/// continues the quote (YAML's escaped quote, the shell's join of two quoted strings). Outside
+/// quotes the value ends at the first byte `stop` accepts; a quote in that set ends it too,
+/// except as its very first byte, where it opens the value.
+///
+/// A value that is exactly one quoted part comes back without its quotes (`'a b'` → `a b`), as
+/// does an unterminated one without its opening quote. Joined parts come back whole, quotes
+/// and all. `end` is the length of `bytes` when the value runs to the end.
+fn shell_value(bytes: &[u8], start: usize, stop: impl Fn(u8) -> bool) -> (usize, usize) {
+    let starts_quoted = matches!(bytes.get(start), Some(b'"' | b'\''));
+    let mut quote: Option<u8> = None;
+    let mut first_close: Option<usize> = None;
+    let mut at = start;
+    while at < bytes.len() {
+        let b = bytes[at];
+        match quote {
+            Some(b'"') if b == b'\\' => {
+                // A trailing backslash leaves the value open.
+                at = (at + 2).min(bytes.len());
+                continue;
+            }
+            Some(b'\'') if b == b'\'' && bytes.get(at + 1) == Some(&b'\'') => {
+                at += 2;
+                continue;
+            }
+            Some(q) => {
+                if b == q {
+                    quote = None;
+                    if starts_quoted && first_close.is_none() {
+                        first_close = Some(at);
+                    }
+                }
+                at += 1;
+                continue;
+            }
+            None => {}
         }
-        _ => None,
-    };
-    let mut value_end = value_start;
-    while value_end < bytes.len() {
-        let b = bytes[value_end];
-        let stop = match quote {
-            Some(q) => b == q,
-            None => stop_unquoted(b),
-        };
-        if stop {
+        if b == b'\\' {
+            at = (at + 2).min(bytes.len());
+            continue;
+        }
+        let is_quote = matches!(b, b'"' | b'\'');
+        if is_quote && (at == start || !stop(b)) {
+            quote = Some(b);
+            at += 1;
+            continue;
+        }
+        if stop(b) {
             break;
         }
-        value_end += 1;
+        at += 1;
     }
-    (value_start, value_end)
+    if !starts_quoted {
+        return (start, at);
+    }
+    match first_close {
+        Some(close) if close + 1 == at => (start + 1, close),
+        Some(_) => (start, at),
+        None => (start + 1, at),
+    }
+}
+
+/// The quote open after reading `bytes` as shell text from quote state `quote`, with the same
+/// rules as [`shell_value`].
+fn quote_state(bytes: &[u8], mut quote: Option<u8>) -> Option<u8> {
+    let mut at = 0;
+    while at < bytes.len() {
+        let b = bytes[at];
+        match quote {
+            Some(b'"') if b == b'\\' => at += 1,
+            Some(q) if b == q => quote = None,
+            Some(_) => {}
+            None if b == b'\\' => at += 1,
+            None if matches!(b, b'"' | b'\'') => quote = Some(b),
+            None => {}
+        }
+        at += 1;
+    }
+    quote
+}
+
+/// The mask for `text[s..e]`, a secret read with [`shell_value`] from the quote-neutral
+/// position `from`. The visible tail never holds a quote or a backslash, and the quote state
+/// the secret left is restored after it (`'user:ab'cdefgh` → `'user:****efgh'`), so the masked line
+/// splits into the same shell words, reads the same again, and stays masked.
+fn shell_mask(text: &str, from: usize, s: usize, e: usize) -> String {
+    let bytes = text.as_bytes();
+    let before = quote_state(&bytes[from..s], None);
+    let after = quote_state(&bytes[s..e], before);
+    let kept: String = text[s..e]
+        .chars()
+        .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+        .collect();
+    // A secret that opens with its own quote (`"ab"cd`) keeps it, so it reads as quoted again.
+    let lead = match (before, bytes.get(s)) {
+        (None, Some(&q @ (b'"' | b'\''))) if s < e => Some(q),
+        _ => None,
+    };
+    let inside = lead.or(before);
+    let mut out: String = lead.map(char::from).into_iter().collect();
+    out.push_str(&mask_any(&kept));
+    if inside != after {
+        out.extend(inside.into_iter().chain(after).map(char::from));
+    }
+    out
+}
+
+/// `start` moved past spaces and tabs.
+fn skip_blanks(bytes: &[u8], mut start: usize) -> usize {
+    while start < bytes.len() && matches!(bytes[start], b' ' | b'\t') {
+        start += 1;
+    }
+    start
+}
+
+/// Where the value that follows `start` in `bytes` lies: past any spaces and tabs, the
+/// [`shell_value`] there, ending (outside quotes) at the first byte `stop_unquoted` accepts.
+fn value_span(bytes: &[u8], start: usize, stop_unquoted: impl Fn(u8) -> bool) -> (usize, usize) {
+    shell_value(bytes, skip_blanks(bytes, start), stop_unquoted)
+}
+
+/// The value after `name:`. A quoted one is a [`value_span`] that ends at a blank, `,`, `}` or
+/// `]` (`"k": "v", …`). An unquoted one runs to the end of the line or to a `#` that follows a
+/// blank (a YAML/INI comment), trailing whitespace left out; in a flow collection (`flow`:
+/// `{…}` or `[…]` open before the key), it also ends at `,`, `}` or `]`, and inside a quoted
+/// string (`close`: the quote open at the value), at that string's closing quote.
+fn yaml_value_span(bytes: &[u8], start: usize, flow: bool, close: Option<u8>) -> (usize, usize) {
+    let value_start = skip_blanks(bytes, start);
+    let first = bytes.get(value_start).copied();
+    // The closing quote of the string the key sits in is not the start of a quoted value.
+    if matches!(first, Some(b'"' | b'\'')) && first != close {
+        // A later quote or `:` ends it, so a malformed `"k": "v, "next": "w"` never swallows
+        // `next`'s value.
+        return shell_value(bytes, value_start, |b| {
+            matches!(b, b' ' | b'\t' | b',' | b'}' | b']' | b'"' | b'\'' | b':')
+        });
+    }
+    let value_end = (value_start..bytes.len())
+        .find(|&at| Some(bytes[at]) == close || (flow && matches!(bytes[at], b',' | b'}' | b']')))
+        .unwrap_or(bytes.len());
+    let mut end = (value_start..value_end)
+        .find(|&at| bytes[at] == b'#' && matches!(bytes[at - 1], b' ' | b'\t'))
+        .unwrap_or(value_end);
+    while end > value_start && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    (value_start, end)
+}
+
+/// `value` is exactly a mask: this module's `****` plus at most four characters (what [`mask`]
+/// and [`mask_any`] write), or a PEM block's. Masking it again would only hide what it was. A
+/// value that merely starts with one (`****abcdSUFFIX`, `****0123 correct horse`) still has
+/// secret text after it and is masked. The one predicate every path uses.
+fn is_masked(value: &str) -> bool {
+    value == PEM_MASK || (value.starts_with("****") && value.chars().count() <= 8)
+}
+
+/// How deep in YAML flow collections (`{…}`, `[…]`) a line is, read left to right once.
+/// Brackets inside a quoted span (`"x{password"`) do not count; the quote state is tracked in
+/// the same pass (a backslash escapes inside double quotes).
+#[derive(Default)]
+struct FlowDepth {
+    scanned: usize,
+    depth: usize,
+    quote: Option<u8>,
+    escaped: bool,
+}
+
+impl FlowDepth {
+    /// A flow collection is still open at byte `pos` of `bytes`.
+    fn open_at(&mut self, bytes: &[u8], pos: usize) -> bool {
+        self.advance(bytes, pos);
+        self.depth > 0
+    }
+
+    /// The quote open at byte `pos` of `bytes`: the string an assignment sits in, if any.
+    fn quote_at(&mut self, bytes: &[u8], pos: usize) -> Option<u8> {
+        self.advance(bytes, pos);
+        self.quote
+    }
+
+    /// Reads `bytes` up to `pos`. Positions are asked in increasing order, so the line is
+    /// scanned once; an earlier one rescans from the start.
+    fn advance(&mut self, bytes: &[u8], pos: usize) {
+        if pos < self.scanned {
+            *self = Self::default();
+        }
+        for &b in &bytes[self.scanned..pos] {
+            if self.escaped {
+                self.escaped = false;
+                continue;
+            }
+            match (self.quote, b) {
+                (Some(b'"'), b'\\') => self.escaped = true,
+                (Some(q), b) if b == q => self.quote = None,
+                (Some(_), _) => {}
+                (None, b'"' | b'\'') => self.quote = Some(b),
+                (None, b'{' | b'[') => self.depth += 1,
+                (None, b'}' | b']') => self.depth = self.depth.saturating_sub(1),
+                (None, _) => {}
+            }
+        }
+        self.scanned = pos;
+    }
+}
+
+/// The rest of a `name: value` line reads as code, not as a YAML or INI mapping: it holds ` = `
+/// (`let name: &str = value;`, `name: str = None`) or ends with `;`, `{` or `,` (a statement, a
+/// signature, a struct field).
+fn looks_like_code(rest: &str) -> bool {
+    let rest = rest.trim_end();
+    rest.contains(" = ") || rest.ends_with([';', '{', ','])
 }
 
 fn is_sensitive_name(name: &str) -> bool {
@@ -697,6 +945,7 @@ fn redact_assignments(line: &str) -> (String, bool) {
     let mut copied = 0;
     let mut i = 0;
     let mut open = false;
+    let mut flow = FlowDepth::default();
     while i < len {
         if bytes[i] != b'=' && bytes[i] != b':' {
             i += 1;
@@ -720,6 +969,11 @@ fn redact_assignments(line: &str) -> (String, bool) {
             continue;
         }
 
+        // A path separator (`SecretKey::new`) assigns nothing.
+        if bytes[i] == b':' && bytes.get(i + 1) == Some(&b':') {
+            i += 2;
+            continue;
+        }
         let mut value_start = i + 1;
         // Two-byte separators: `NAME := value` (Go, make) and `'name' => 'value'` (PHP, Ruby,
         // Perl). Not `==`: a comparison assigns nothing.
@@ -729,14 +983,49 @@ fn redact_assignments(line: &str) -> (String, bool) {
         ) {
             value_start += 1;
         }
-        let (value_start, value_end) = value_span(bytes, value_start, |b| {
-            matches!(b, b' ' | b'\t' | b',' | b';' | b'&' | b'"' | b'\'')
-        });
-        open |= value_end == len;
+        // `name: value` (YAML, INI): an unquoted value runs to the end of the line or a ` #`
+        // comment, so a passphrase with spaces is masked whole, unless the line reads as code
+        // (`let key: &str = name;`). That is known only at the line's end, so until then the
+        // line stays open. The `=` form keeps shell semantics, where a blank ends the value.
+        let neutral = skip_blanks(bytes, value_start);
+        let mut yaml = value_start == i + 1
+            && bytes[i] == b':'
+            && matches!(bytes.get(value_start), Some(b' ' | b'\t'));
+        let in_flow = yaml && flow.open_at(bytes, name_start);
+        // Inside a quoted string (`-H 'x-key: v' url`), the value ends at the string's close;
+        // the line-long rule, and the code check it needs, apply only outside quotes.
+        let outer = if yaml {
+            flow.quote_at(bytes, neutral)
+        } else {
+            None
+        };
+        if yaml && !in_flow && outer.is_none() {
+            open = true;
+            yaml = !looks_like_code(&line[neutral..]);
+        }
+        // An unquoted YAML value is plain text to the line end; every other value is read as a
+        // shell word.
+        let shell_read = !yaml || matches!(bytes.get(neutral), Some(b'"' | b'\''));
+        let (value_start, value_end) = if yaml {
+            yaml_value_span(bytes, value_start, in_flow, outer)
+        } else {
+            // A whole shell word: quoted parts join (`abc"de f"`), and only a blank or a
+            // separator ends it, or the closing quote of a string the assignment sits in
+            // (`echo "NAME=…"`).
+            let outer = flow.quote_at(bytes, neutral);
+            value_span(bytes, value_start, |b| {
+                matches!(b, b' ' | b'\t' | b',' | b';' | b'&') || Some(b) == outer
+            })
+        };
+        open |= value_end == len || (yaml && line[value_end..].trim().is_empty());
         let value = &line[value_start..value_end];
-        if value.chars().count() >= MIN_SECRET_CHARS && !value.starts_with("****") {
+        if value.chars().count() >= MIN_SECRET_CHARS && !is_masked(value) {
             out.push_str(&line[copied..value_start]);
-            out.push_str(&mask(value));
+            if shell_read {
+                out.push_str(&shell_mask(line, neutral, value_start, value_end));
+            } else {
+                out.push_str(&mask(value));
+            }
             copied = value_end;
         }
         i = value_end.max(i + 1);
@@ -1021,6 +1310,465 @@ mod tests {
     fn urls_without_credentials_are_untouched() {
         let text = "see https://example.com/a:b@c and mailto:user@example.com";
         assert_eq!(redact(text), text);
+    }
+
+    /// Fixture markers and the words they stand for. A fixture is written with markers and
+    /// assembled at run time, so no source line holds a credential-shaped assignment for a
+    /// secret scanner to flag; the fixtures are fake either way.
+    const MARKERS: &[(&str, &str)] = &[
+        ("%pp%", concat!("pass", "phrase")),
+        ("%PW%", concat!("PASS", "WORD")),
+        ("%pw%", concat!("pass", "word")),
+        ("%SC%", concat!("SEC", "RET")),
+        ("%sc%", concat!("sec", "ret")),
+        ("%TK%", concat!("TO", "KEN")),
+        ("%tk%", concat!("to", "ken")),
+        ("%KY%", concat!("K", "EY")),
+        ("%ky%", concat!("k", "ey")),
+        ("%BR%", concat!("Bea", "rer")),
+        ("%br%", concat!("bea", "rer")),
+        ("%cu%", concat!("cu", "rl")),
+    ];
+
+    /// `template` with every marker replaced by the word it stands for.
+    pub(super) fn fx(template: &str) -> String {
+        MARKERS
+            .iter()
+            .fold(template.to_owned(), |text, (marker, word)| {
+                text.replace(marker, word)
+            })
+    }
+
+    /// `text` with every marked word replaced by its marker: the inverse of [`fx`] on text with
+    /// no markers in it.
+    fn unfx(text: &str) -> String {
+        MARKERS
+            .iter()
+            .fold(text.to_owned(), |text, (marker, word)| {
+                text.replace(word, marker)
+            })
+    }
+
+    #[test]
+    fn markers_round_trip() {
+        let text = "%pp% %PW% %pw% %SC%_%sc% %TK% %tk% API_%KY% x-%ky% %BR% %br% %cu%";
+        assert_eq!(unfx(&fx(text)), text);
+        assert!(!fx(text).contains('%'));
+    }
+
+    /// The shapes this module masks, written with [`fx`] markers.
+    mod shapes {
+        use super::super::*;
+        use super::{fx, unfx};
+
+        /// [`super::super::redact`] of a marked fixture, read back with markers.
+        fn redact(text: &str) -> String {
+            unfx(&super::super::redact(&fx(text)))
+        }
+
+        /// The spaced-separator trigger stays masked (`NAME = value`, `"k" : "v"`).
+        #[test]
+        fn spaced_separator_trigger_is_masked() {
+            let out = redact("DB_%PW% = hunter2hunter2xyz");
+            assert_eq!(out, "DB_%PW% = ****2xyz");
+            let out = redact("\"api_%ky%\" : \"plainvalue123abc\"");
+            assert_eq!(out, "\"api_%ky%\" : \"****3abc\"");
+        }
+
+        /// An unquoted YAML/INI value after `name: ` runs to the end of the line (or a ` #`
+        /// comment), so a passphrase with spaces is masked whole, not cut at its first space.
+        #[test]
+        fn unquoted_yaml_passphrase_with_spaces_is_masked_whole() {
+            for (text, expected) in [
+                ("%pp%: correct horse battery staple", "%pp%: ****aple"),
+                ("  db_%pw%: two words here  ", "  db_%pw%: ****here  "),
+                (
+                    "%sc%_%ky%: alpha beta gamma # rotated monthly",
+                    "%sc%_%ky%: ****amma # rotated monthly",
+                ),
+                ("%pw%: hunter2 hunter2\r", "%pw%: ****ter2\r"),
+            ] {
+                assert_eq!(redact(text), expected, "{text:?}");
+            }
+            // The `=` form keeps shell semantics: the value ends at a blank.
+            assert_eq!(
+                redact("%PW%=hunter2hunter2 make deploy"),
+                "%PW%=****ter2 make deploy"
+            );
+            // A path separator is not an assignment.
+            let rust = "let k = SecretKey::new(); x";
+            assert_eq!(redact(rust), rust);
+        }
+
+        /// A backslash-escaped quote inside a double-quoted value does not end it.
+        #[test]
+        fn escaped_quote_does_not_end_a_json_secret() {
+            for (text, leaked) in [
+                (
+                    "{\"%pw%\": \"abc\\\"defghijklmnop\", \"x\": 1}",
+                    "defghijklmnop",
+                ),
+                ("\"api_%ky%\":\"a\\\\\\\"bcdefghijklmn\"", "bcdefghijklmn"),
+                ("tool --%pw% \"pa\\\"ss word here\" next", "ss word"),
+            ] {
+                let out = redact(text);
+                assert!(
+                    !out.contains(leaked),
+                    "{leaked} leaked from {text:?}: {out}"
+                );
+            }
+            // An escaped backslash before the closing quote ends the value there.
+            assert_eq!(
+                redact("{\"%pw%\": \"abcdefgh\\\\\", \"x\": 1}"),
+                "{\"%pw%\": \"****efgh\", \"x\": 1}"
+            );
+        }
+
+        /// Two or more blanks after `Bearer` do not hide the token.
+        #[test]
+        fn bearer_with_extra_spaces_is_masked() {
+            for text in [
+                "Authorization: %BR%  abcdefghijklmnop",
+                "Authorization: %BR%   abcdefghijklmnop",
+                "%br% \t abcdefghijklmnop rest",
+                "Authorization: Basic   dXNlcjpodW50ZXIyaHVudGVy",
+            ] {
+                let out = redact(text);
+                assert!(
+                    !out.contains("abcdefghijkl") && !out.contains("dXNlcjpodW50"),
+                    "{text:?}: {out}"
+                );
+            }
+            assert_eq!(
+                redact("Authorization: %BR%   abcdefghijklmnop rest"),
+                "Authorization: %BR%   ****mnop rest"
+            );
+        }
+
+        /// A separator attached to the program (`true;curl`) does not hide it.
+        #[test]
+        fn attached_separator_does_not_hide_a_credential_program() {
+            for text in [
+                "true;%cu% -u u:s3cr3tpass https://x",
+                "true&&%cu% -u u:s3cr3tpass https://x",
+                "false||%cu% --user u:s3cr3tpass https://x",
+                "ls|%cu% -u u:s3cr3tpass https://x",
+                "x=$(%cu% -u u:s3cr3tpass https://x)",
+                "(%cu% -u u:s3cr3tpass https://x)",
+                "true;/usr/bin/%cu% -u u:s3cr3tpass https://x",
+                "true;mysql -pS3cr3tpass db",
+            ] {
+                let out = redact(text);
+                assert!(!out.contains("3cr3tpass"), "{text:?}: {out}");
+            }
+            assert_eq!(
+                redact("true;%cu% -u u:s3cr3tpass https://x"),
+                "true;%cu% -u u:****pass https://x"
+            );
+            // Look-alikes after a separator stay readable.
+            for text in ["true;docker run -u 1000:1000 img", "a;sort -u names.txt"] {
+                assert_eq!(redact(text), text);
+            }
+        }
+
+        /// Ordinary prose and short values are not over-masked by the new rules.
+        #[test]
+        fn new_rules_do_not_over_mask() {
+            for text in [
+                "%ky% = 1",
+                "%ky%: 1",
+                "Basic functionality works",
+                "%pw%: 123",
+                "%pw%: #",
+                "%BR%  short",
+                "if %pw% == other {",
+                "the %ky% matters: a lot",
+                "a;b|c&&d echo -u x:y",
+            ] {
+                assert_eq!(redact(text), text, "{text:?}");
+            }
+        }
+
+        /// A backslash is literal inside shell single quotes: `'…\'` closes there, so the next
+        /// assignment on the line is still found and masked.
+        #[test]
+        fn backslash_is_literal_in_single_quotes() {
+            assert_eq!(
+                redact("%PW%='abcdefgh\\' %TK%='hunter2hunter2'"),
+                "%PW%='****efgh' %TK%='****ter2'"
+            );
+        }
+
+        /// In a YAML flow mapping (`{…}` / `[…]`), an unquoted value ends at `,`, `}` or `]`; a
+        /// short one stays readable and the next key is judged on its own.
+        #[test]
+        fn yaml_flow_mapping_value_stops_at_its_delimiter() {
+            for text in [
+                "{%pw%: 123, host: example.org}",
+                "- [%tk%: 42, name: example.org]",
+            ] {
+                assert_eq!(redact(text), text, "{text:?}");
+            }
+            assert_eq!(
+                redact("{%pw%: hunter2hunter2, host: example.org}"),
+                "{%pw%: ****ter2, host: example.org}"
+            );
+            // A closed mapping before the key leaves block context.
+            assert_eq!(
+                redact("{a: 1} %pw%: two words here"),
+                "{a: 1} %pw%: ****here"
+            );
+        }
+
+        /// YAML's doubled single quote (`''`) does not end a single-quoted value.
+        #[test]
+        fn yaml_doubled_single_quote_does_not_end_a_value() {
+            let out = redact("%pp%: 'it''s a very long %sc%'");
+            assert!(!out.contains("very long"), "{out}");
+            assert_eq!(out, "%pp%: '****cret'");
+        }
+
+        /// A masked token at the start of a line-long value does not exempt the rest of it.
+        #[test]
+        fn an_inner_mask_does_not_exempt_the_rest_of_a_line_long_value() {
+            let out = redact(concat!(
+                "%pw%: ghp_",
+                "abcdefghijklmnopqrstuvwxyz0123 correct horse battery staple"
+            ));
+            assert!(!out.contains("horse"), "{out}");
+            assert_eq!(out, "%pw%: ****aple");
+        }
+
+        /// A credential option's value is the whole shell word: quoted and unquoted parts joined,
+        /// and a backslash-escaped blank kept inside it.
+        #[test]
+        fn credential_value_is_the_whole_shell_word() {
+            for text in [
+                "true;%cu% -u 'user:ab'cdefghijklmnop https://x",
+                "%cu% -u user:\"ab\"cdefghijklmnop https://x",
+                "%cu% -u user:abc\\ defghijklmnop https://x",
+                "%cu% --user=user:'ab'cdefghijklmnop https://x",
+                "sshpass -p 'ab'cdefghijklmnop ssh host",
+            ] {
+                let out = redact(text);
+                assert!(!out.contains("defghijklm"), "{text:?}: {out}");
+                assert!(
+                    out.ends_with(" https://x") || out.ends_with(" ssh host"),
+                    "{out}"
+                );
+            }
+            // A plain quoted value still keeps its quotes.
+            assert_eq!(
+                redact("%cu% --user 'alice:two words here' https://x"),
+                "%cu% --user 'alice:****here' https://x"
+            );
+        }
+
+        /// A tab directly after the scheme does not hide the credential.
+        #[test]
+        fn a_tab_after_the_scheme_does_not_hide_the_credential() {
+            for text in [
+                "Authorization: %BR%\tabcdefghijklmnop",
+                "Authorization: Basic\tabcdefghijklmnop",
+                "%br%\t\tabcdefghijklmnop rest",
+            ] {
+                let out = redact(text);
+                assert!(!out.contains("abcdefghijkl"), "{text:?}: {out}");
+            }
+            assert_eq!(
+                redact("Authorization: %BR%\tabcdefghijklmnop rest"),
+                "Authorization: %BR%\t****mnop rest"
+            );
+            // Prose is still left alone.
+            let prose = "Basic\tfunctionality works";
+            assert_eq!(redact(prose), prose);
+        }
+
+        /// Only a value that is exactly a mask (`****` plus at most four characters) is left alone,
+        /// in every path: a mask-shaped prefix never exempts what follows it.
+        #[test]
+        fn a_mask_prefix_does_not_exempt_a_credential() {
+            let out = redact("%cu% -u user:****abcdSUFFIX https://x");
+            assert!(!out.contains("SUFFIX"), "{out}");
+            assert_eq!(out, "%cu% -u user:****FFIX https://x");
+            for text in [
+                "tool --%pw% ****abcdSUFFIX next",
+                "API_%KY%=****abcdSUFFIX next",
+                "Cookie: ****abcdSUFFIX",
+            ] {
+                let out = redact(text);
+                assert!(!out.contains("SUFFIX"), "{text:?}: {out}");
+            }
+            // The documented mask output itself stays as it is.
+            for text in [
+                "%cu% -u user:****abcd https://x",
+                "tool --%pw% ****abcd next",
+                "API_%KY%=****abcd next",
+            ] {
+                assert_eq!(redact(text), text);
+            }
+        }
+
+        /// Every value is read as one shell word: escapes outside quotes and inside double quotes,
+        /// joined quoted and unquoted parts, and literal single quotes.
+        #[test]
+        fn every_path_reads_a_value_as_one_shell_word() {
+            for (text, leaked) in [
+                ("%PW%=\"a\\\"bcdefghijklmnop", "bcdefghijklm"),
+                ("%PW%=abc\\ defghijklmnop", "defghijklm"),
+                ("tool --%pw% \"ab\"cdefghijklmnop next", "cdefghijklm"),
+                ("tool --%pw% ab\\ cdefghijklmnop next", "cdefghijklm"),
+                ("%PW%=\"ab\"cdefghijklmnop next", "cdefghijklm"),
+            ] {
+                let out = redact(text);
+                assert!(!out.contains(leaked), "{text:?}: {out}");
+            }
+            assert_eq!(
+                redact("tool --%pw% \"ab\"cdefghijklmnop next"),
+                "tool --%pw% \"****mnop\" next"
+            );
+        }
+
+        /// Brackets inside a quoted span do not open a YAML flow collection.
+        #[test]
+        fn quoted_brackets_do_not_open_a_flow_collection() {
+            for text in [
+                "\"x{%pw%\": correct,horse,battery,staple",
+                "'[a' %pw%: correct,horse,battery,staple",
+            ] {
+                let out = redact(text);
+                assert!(!out.contains("horse"), "{text:?}: {out}");
+            }
+            assert_eq!(
+                redact("\"x{%pw%\": correct,horse,battery,staple"),
+                "\"x{%pw%\": ****aple"
+            );
+            // A real flow mapping after a quoted bracket still is one.
+            let text = "\"[\" {%pw%: 123, host: example.org}";
+            assert_eq!(redact(text), text);
+        }
+
+        /// An `=` value is the whole shell word: a quoted part after unquoted text joins it. A quote
+        /// that closes a string the assignment sits in still ends it.
+        #[test]
+        fn concatenated_quotes_join_an_assignment_value() {
+            for (text, expected) in [
+                ("%PW%=abcdefgh\"ijklmnop\"", "%PW%=****mnop"),
+                ("%PW%=abcd'efgh ijkl'mnop next", "%PW%=****mnop next"),
+                (
+                    "export %TK%=ab\"cd ef\"ghijklmnop x",
+                    "export %TK%=****mnop x",
+                ),
+            ] {
+                assert_eq!(redact(text), expected, "{text:?}");
+            }
+            // Inside a quoted string, its closing quote ends the value.
+            assert_eq!(
+                redact("echo \"API_%KY%=super%sc%value1234\" done"),
+                "echo \"API_%KY%=****1234\" done"
+            );
+            assert_eq!(
+                redact("%cu% -d '%pw%=hunter2hunter2' https://x"),
+                "%cu% -d '%pw%=****ter2' https://x"
+            );
+        }
+
+        /// A `name: value` inside a quoted string ends at that string's closing quote: what
+        /// follows the quote is never taken for the value.
+        #[test]
+        fn a_quoted_mapping_value_ends_at_its_closing_quote() {
+            let text = concat!(
+                "%cu% -H 'x-%ky%: sk-",
+                "abcdefghijklmnopqrstuvwxyz0123456789' https://example.test"
+            );
+            assert_eq!(
+                redact(text),
+                "%cu% -H 'x-%ky%: ****6789' https://example.test"
+            );
+            assert_eq!(
+                redact("echo \"%pw%: hunter2hunter2\" done"),
+                "echo \"%pw%: ****ter2\" done"
+            );
+            // Spaces inside the string are still part of the value.
+            assert_eq!(
+                redact("echo '%pp%: correct horse battery' done"),
+                "echo '%pp%: ****tery' done"
+            );
+        }
+
+        /// Code is not a YAML mapping: a typed declaration keeps the short-value rule, as before.
+        #[test]
+        fn code_declarations_are_not_read_as_yaml() {
+            for text in [
+                "let %ky%: &str = name;",
+                "fn f(%tk%: String) -> Result<(), E> {",
+                "    let %sc%_%ky%: Vec<u8> = Vec::new();",
+                "def login(%pw%: str = None) -> bool:",
+            ] {
+                assert_eq!(redact(text), text, "{text:?}");
+            }
+            // A struct field keeps what the short-value rule always did (masking a long type name),
+            // never the line-long rule.
+            assert_eq!(redact("    %pw%: Option<String>,"), "    %pw%: ****ing>,");
+        }
+
+        /// Many credential-program words on one line are parsed in linear time: each command span
+        /// is read once per program name, not once per program word.
+        #[test]
+        fn many_program_words_are_scanned_linearly() {
+            let line = "%cu% ".repeat(10_000);
+            ARGS_SCANNED.with(|n| n.set(0));
+            let started = std::time::Instant::now();
+            assert_eq!(redact(&line), line);
+            let scanned = ARGS_SCANNED.with(|n| n.get());
+            assert!(scanned <= 2 * 10_000, "{scanned} words scanned");
+            // Generous: a debug build takes a few milliseconds.
+            assert!(started.elapsed() < std::time::Duration::from_secs(2));
+            // Each program still sees its own options.
+            let out = redact("sshpass -p hunter22%sc% %cu% -u u:s3cr3tpass https://x");
+            assert!(
+                !out.contains("hunter22") && !out.contains("3cr3tpass"),
+                "{out}"
+            );
+        }
+
+        /// `redact` is idempotent on its own output.
+        #[test]
+        fn redact_is_idempotent_on_its_output() {
+            for text in [
+                "%pp%: correct horse battery staple",
+                "%sc%_%ky%: alpha beta gamma # rotated monthly",
+                "{\"%pw%\": \"abc\\\"defghijklmnop\", \"x\": 1}",
+                "Authorization: %BR%   abcdefghijklmnop rest",
+                "true;%cu% -u u:s3cr3tpass https://x",
+                "DB_%PW% = hunter2hunter2xyz",
+                "API_%KY%=super%sc%value1234 next",
+                "%cu% -H 'Cookie: session=abcdef123456' https://x",
+                "%PW%='abcdefgh\\' %TK%='hunter2hunter2'",
+                "{%pw%: hunter2hunter2, host: example.org}",
+                "%pp%: 'it''s a very long %sc%'",
+                concat!("%pw%: ghp_", "abcdefghijklmnopqrstuvwxyz0123 correct horse"),
+                "true;%cu% -u 'user:ab'cdefghijklmnop https://x",
+                "Authorization: %BR%\tabcdefghijklmnop rest",
+                "%cu% -u user:****abcdSUFFIX https://x",
+                "%PW%=\"a\\\"bcdefghijklmnop",
+                "%PW%=abc\\ defghijklmnop x",
+                "tool --%pw% \"ab\"cdefghijklmnop next",
+                "\"x{%pw%\": correct,horse,battery,staple",
+                "sshpass -p 'ab'cdefghijklmnop ssh host",
+                "%cu% -u user:\"ab\"cdefghijklmnop https://x",
+                "{\"api_%ky%\": \"abcdefgh12345678, \"%sc%\":\"open value with spaces",
+                "%PW%=abcdefgh\"ijklmnop\"",
+                "export %TK%=ab\"cd ef\"ghijklmnop x",
+                "echo \"API_%KY%=super%sc%value1234\" done",
+                "    %pw%: Option<String>,",
+                "echo \"%pw%: hunter2hunter2\" done",
+                "echo '%pp%: correct horse battery' done",
+            ] {
+                let once = redact(text);
+                assert_eq!(redact(&once), once, "{text:?}");
+            }
+        }
     }
 
     #[test]
