@@ -165,6 +165,7 @@ pub fn pr_words(outcome: &Result<PrOutcome, String>) -> PrWords {
         PushState::NoUpstream => status.push_str(" · not pushed yet"),
         PushState::Ahead(1) => status.push_str(" · 1 commit to push"),
         PushState::Ahead(n) => status.push_str(&format!(" · {n} commits to push")),
+        PushState::Unknown => status.push_str(" · may need pushing"),
         PushState::UpToDate => {}
     }
     if state.uncommitted {
