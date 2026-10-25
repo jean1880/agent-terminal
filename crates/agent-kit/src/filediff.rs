@@ -139,6 +139,12 @@ pub fn resolve(toplevel: &Path, path: &str) -> Result<RepoFile, String> {
     if std::fs::symlink_metadata(&abs).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err("The file is a symlink".to_owned());
     }
+    // `abs` went through any in-repository directory alias; `rel` must name the same place, since
+    // git knows the file by its real path.
+    let rel = abs
+        .strip_prefix(&root)
+        .map(Path::to_path_buf)
+        .map_err(|_| "The file is outside the repository, or behind a symlink".to_owned())?;
     Ok(RepoFile { rel, abs })
 }
 
@@ -239,6 +245,20 @@ pub fn read_working(file: &RepoFile) -> Result<Side, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Side::Missing),
         Err(e) => Err(format!("Could not read the file: {e}")),
     }
+}
+
+/// `path`'s bytes when it is a file of at most `max` bytes, else `None`. The size is checked
+/// before reading and the read itself is bounded, so a huge (or growing) file is never loaded.
+fn read_capped(path: &Path, max: usize) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > max as u64 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(max as u64 + 1).read_to_end(&mut bytes).ok()?;
+    (bytes.len() <= max).then_some(bytes)
 }
 
 /// The diff of `file` between the baseline and now. Blocking.
@@ -382,7 +402,9 @@ pub fn shown_for_item_in(
                 for path in &files {
                     let full = resolve_file_path(path);
                     let mut file_handled = false;
-                    if let Some(repo) = crate::git::discover(&full).ok().flatten() {
+                    // `discover` runs git in the directory it is given, so ask from the folder.
+                    let from = full.parent().unwrap_or(&full);
+                    if let Some(repo) = crate::git::discover(from).ok().flatten() {
                         let full_str = full.to_string_lossy();
                         if let Ok(file) = resolve(&repo.toplevel, &full_str) {
                             if let Some(head) = repo.head {
@@ -398,12 +420,9 @@ pub fn shown_for_item_in(
                             }
                         }
                     }
-                    if !file_handled && full.is_file() {
-                        if let Ok(bytes) = std::fs::read(&full) {
-                            if !bytes.is_empty()
-                                && !is_binary(&bytes)
-                                && bytes.len() <= editdiff::MAX_SIDE_BYTES
-                            {
+                    if !file_handled {
+                        if let Some(bytes) = read_capped(&full, editdiff::MAX_SIDE_BYTES) {
+                            if !bytes.is_empty() && !is_binary(&bytes) {
                                 let content = String::from_utf8_lossy(&bytes);
                                 let d = editdiff::file_diff(path, None, &content);
                                 fallback.push_str(&d.diff);
@@ -725,6 +744,65 @@ mod tests {
 
         // Not an edit at all.
         assert!(shown_for_item(None, &json!({"command": "ls"})).is_err());
+    }
+
+    #[test]
+    fn the_fallback_diffs_a_tracked_file_against_head_not_as_a_new_file() {
+        use serde_json::json;
+        let Some(dir) = repo() else { return };
+        let p = dir.path();
+        std::fs::write(p.join("a.txt"), "one\nTWO\nthree\n").expect("edit");
+        // No baseline and no edit text: only the file's own path is known.
+        let input = json!({"file_path": p.join("a.txt")});
+        let shown = shown_for_item_in(None, &input, None).expect("shown");
+        assert!(shown.text.contains("-two\n+TWO\n"), "{}", shown.text);
+        assert!(!shown.text.contains("/dev/null"), "{}", shown.text);
+    }
+
+    #[test]
+    fn a_symlinked_directory_alias_resolves_to_the_real_relative_path() {
+        use serde_json::json;
+        let Some(dir) = repo() else { return };
+        let p = dir.path();
+        std::fs::create_dir(p.join("real")).expect("real");
+        std::fs::write(p.join("real/f.txt"), "a\nb\n").expect("f");
+        sh(p, &["add", "real/f.txt"]);
+        sh(p, &["commit", "-q", "-m", "real"]);
+        std::os::unix::fs::symlink(p.join("real"), p.join("alias")).expect("alias");
+        let base = take_turn_base(p, 6002, "test", true)
+            .expect("base")
+            .expect("repo");
+        std::fs::write(p.join("real/f.txt"), "a\nB\n").expect("edit");
+
+        let file = resolve(&base.toplevel, "alias/f.txt").expect("resolve");
+        assert_eq!(file.rel, PathBuf::from("real/f.txt"));
+        assert_eq!(
+            file.abs,
+            base.toplevel.canonicalize().expect("c").join("real/f.txt")
+        );
+        let FileDiff::Text(d) = turn_file_diff(&base, &file).expect("diff") else {
+            panic!("text")
+        };
+        assert!(d.diff.contains("-b\n+B\n"), "{}", d.diff);
+        assert!(!d.diff.contains("/dev/null"), "{}", d.diff);
+        let shown = shown_for_item(Some(&base), &json!({"file_path": "alias/f.txt"})).expect("s");
+        assert!(shown.text.contains("-b\n+B\n"), "{}", shown.text);
+    }
+
+    #[test]
+    fn a_file_past_the_cap_is_not_read_into_memory() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let big = dir.path().join("big.bin");
+        let f = std::fs::File::create(&big).expect("create");
+        // Sparse: no blocks are allocated on disk.
+        f.set_len(1 << 40).expect("sparse");
+        assert_eq!(read_capped(&big, editdiff::MAX_SIDE_BYTES), None);
+        let small = dir.path().join("small.txt");
+        std::fs::write(&small, "hi\n").expect("small");
+        assert_eq!(
+            read_capped(&small, editdiff::MAX_SIDE_BYTES),
+            Some(b"hi\n".to_vec())
+        );
     }
 
     #[test]

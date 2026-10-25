@@ -30,6 +30,18 @@ use crate::diff_tool::{self, DiffTools, NewSide, OpenRequest};
 /// How long a card waits for a baseline that is still being taken.
 const BASE_WAIT: Duration = Duration::from_secs(10);
 
+/// The path an "Open in tool" request carries: a relative one is the thread's, so it is joined to
+/// the thread's `dir` (the rule the card's own diff uses) rather than left for the repository
+/// root to resolve.
+fn path_to_open(dir: &str, path: &str) -> String {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        path.to_owned()
+    } else {
+        Path::new(dir).join(p).to_string_lossy().into_owned()
+    }
+}
+
 /// One turn's baseline, filled in off the main thread.
 #[derive(Default)]
 struct BaseSlot {
@@ -168,6 +180,7 @@ impl DiffSource for ThreadDiffs {
 
     fn open_external(&self, ask: DiffAsk) {
         let Some(me) = self.me.upgrade() else { return };
+        let dir = self.dir.clone();
         let Some(tool) = DiffTools::shared().get() else {
             (self.toast)(diff_tool::NO_TOOL_HINT);
             return;
@@ -197,7 +210,7 @@ impl DiffSource for ThreadDiffs {
             let name = tool.name.clone();
             let request = OpenRequest {
                 toplevel: base.toplevel.clone(),
-                path,
+                path: path_to_open(&dir, &path),
                 old_rev: base.rev.clone(),
                 new_side: NewSide::Working,
             };
@@ -215,6 +228,13 @@ mod tests {
 
     fn diffs() -> Rc<ThreadDiffs> {
         ThreadDiffs::new("/nonexistent", 1, "test", Rc::new(|_| {}))
+    }
+
+    #[test]
+    fn a_relative_path_to_open_is_the_threads_not_the_repository_roots() {
+        assert_eq!(path_to_open("/repo/sub", "a.rs"), "/repo/sub/a.rs");
+        assert_eq!(path_to_open("/repo/sub", "x/a.rs"), "/repo/sub/x/a.rs");
+        assert_eq!(path_to_open("/repo/sub", "/repo/b.rs"), "/repo/b.rs");
     }
 
     #[test]
