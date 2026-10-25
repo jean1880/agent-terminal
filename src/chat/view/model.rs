@@ -4,6 +4,7 @@
 //! updates (or creates) only the rows those name. Expanded/collapsed state lives on the
 //! [`Item`], so it survives a row being evicted from the materialised window and rebuilt.
 
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use agent_core::adapter::{Driver, Mode};
@@ -167,12 +168,21 @@ pub(super) fn shell_launch(tool: &Tool) -> Option<agent_core::agent_command::Age
     if tool.kind != ItemKind::Command {
         return None;
     }
-    let input = tool
+    let parsed;
+    let input = match tool
         .input
-        .clone()
+        .as_ref()
         .filter(|i| i.as_object().is_some_and(|o| !o.is_empty()))
-        .or_else(|| serde_json::from_str(&tool.input_text).ok())?;
-    agent_core::agent_command::from_command_input(&input)
+    {
+        Some(input) => input,
+        // Blank text is never JSON: no parse (and no error to build) for it.
+        None if tool.input_text.trim().is_empty() => return None,
+        None => {
+            parsed = serde_json::from_str::<Value>(&tool.input_text).ok()?;
+            &parsed
+        }
+    };
+    agent_core::agent_command::from_command_input(input)
 }
 
 /// Empty plans and wholly completed plans do not occupy the active-work shelf.
@@ -370,6 +380,55 @@ impl SubagentSummary {
             reported_model: tool.reported_model.clone(),
         }
     }
+}
+
+/// Everything [`SubagentSummary::of`] or [`SubagentSummary::of_shell`] (`shell`) reads from a
+/// tool item besides its id: an item whose source is unchanged reads the same summary.
+#[derive(Debug)]
+struct SummarySource {
+    shell: bool,
+    kind: ItemKind,
+    title: String,
+    status: ToolStatus,
+    steps: usize,
+    input: Option<Value>,
+    input_text: String,
+    reported_model: Option<String>,
+}
+
+impl SummarySource {
+    fn of(shell: bool, item: &Item, tool: &Tool) -> Self {
+        Self {
+            shell,
+            kind: tool.kind,
+            title: tool.title.clone(),
+            status: tool.status,
+            steps: item.children.len(),
+            input: tool.input.clone(),
+            input_text: tool.input_text.clone(),
+            reported_model: tool.reported_model.clone(),
+        }
+    }
+
+    fn matches(&self, shell: bool, item: &Item, tool: &Tool) -> bool {
+        self.shell == shell
+            && self.kind == tool.kind
+            && self.status == tool.status
+            && self.steps == item.children.len()
+            && self.input_text == tool.input_text
+            && self.title == tool.title
+            && self.reported_model == tool.reported_model
+            && self.input == tool.input
+    }
+}
+
+/// A tool item's summary as last read ([`Transcript::subagents`]), with its source.
+#[derive(Debug)]
+struct SummaryMemo {
+    source: SummarySource,
+    summary: Option<SubagentSummary>,
+    /// The last [`Transcript::subagents`] pass that visited it.
+    pass: u64,
 }
 
 /// The string value of `"key":` in JSON that may still be arriving (cut anywhere). Only a value
@@ -756,6 +815,10 @@ pub struct Transcript {
     /// the session restarts or exits, which is when Codex forgets the grant.
     extra_access: Vec<String>,
     seq: u64,
+    /// Each sub-agent and command item's summary as [`Self::subagents`] last read it: an item
+    /// it walks past unchanged is not parsed again.
+    summaries: RefCell<HashMap<ItemId, SummaryMemo>>,
+    summary_pass: Cell<u64>,
 }
 
 impl Transcript {
@@ -926,6 +989,45 @@ impl Transcript {
     /// Every sub-agent the thread started, nested ones and agents its shell commands launched
     /// included, in the order they began.
     pub fn subagents(&self) -> Vec<SubagentSummary> {
+        let mut memo = self.summaries.borrow_mut();
+        let pass = self.summary_pass.get().wrapping_add(1);
+        self.summary_pass.set(pass);
+        let mut visited = 0usize;
+        // `SubagentSummary::of` (or `of_shell`) of `item`, read again only if it changed.
+        let mut read = |shell: bool, item: &Item, tool: &Tool| -> Option<SubagentSummary> {
+            if shell
+                && (tool.kind != ItemKind::Command
+                    || !tool
+                        .input
+                        .as_ref()
+                        .is_some_and(|i| i.as_object().is_some_and(|o| !o.is_empty()))
+                        && tool.input_text.trim().is_empty())
+            {
+                // No launch to read (`shell_launch`): nothing worth keeping.
+                return None;
+            }
+            visited += 1;
+            if let Some(kept) = memo.get_mut(&item.id) {
+                if kept.source.matches(shell, item, tool) {
+                    kept.pass = pass;
+                    return kept.summary.clone();
+                }
+            }
+            let summary = if shell {
+                SubagentSummary::of_shell(item, tool)
+            } else {
+                Some(SubagentSummary::of(item, tool))
+            };
+            memo.insert(
+                item.id.clone(),
+                SummaryMemo {
+                    source: SummarySource::of(shell, item, tool),
+                    summary: summary.clone(),
+                    pass,
+                },
+            );
+            summary
+        };
         let mut out = Vec::new();
         let mut stack: Vec<&ItemId> = self.order.iter().rev().collect();
         while let Some(id) = stack.pop() {
@@ -933,10 +1035,8 @@ impl Transcript {
                 continue;
             };
             if let Body::Tool(t) = &item.body {
-                if t.kind == ItemKind::Subagent {
-                    out.push(SubagentSummary::of(item, t));
-                } else if let Some(shell) = SubagentSummary::of_shell(item, t) {
-                    out.push(shell);
+                if let Some(summary) = read(t.kind != ItemKind::Subagent, item, t) {
+                    out.push(summary);
                 }
             }
             stack.extend(item.children.iter().rev());
@@ -944,10 +1044,15 @@ impl Transcript {
         for id in &self.worker_ids {
             if let Some(item) = self.items.get(id) {
                 if let Body::Tool(tool) = &item.body {
-                    out.push(SubagentSummary::of(item, tool));
+                    out.extend(read(false, item, tool));
                 }
             }
         }
+        // Items gone (or no longer read) since: their summaries go too.
+        if memo.len() > visited {
+            memo.retain(|_, kept| kept.pass == pass);
+        }
+        drop(memo);
         for worker in &mut out {
             worker.driver = worker
                 .delegation
@@ -3474,6 +3579,62 @@ mod tests {
             Some(id) => e.item(id),
             None => e,
         }
+    }
+
+    /// The summaries `subagents` keeps between walks never differ from a fresh read: through a
+    /// streamed input, new steps, a same-length edit, a shell launch and a removed item.
+    #[test]
+    fn kept_subagent_summaries_always_match_a_fresh_read() {
+        let fresh = |t: &Transcript| {
+            t.summaries.borrow_mut().clear();
+            t.subagents()
+        };
+        let check = |t: &Transcript| {
+            let kept = t.subagents();
+            assert_eq!(kept, fresh(t));
+            // Warm the memo again for the next step.
+            assert_eq!(t.subagents(), kept);
+        };
+        let mut t = Transcript::new();
+        let launch = Envelope::item_started(
+            "launch",
+            ItemKind::Command,
+            "cross-agent",
+            Some(serde_json::json!({"command": "claude -p 'look around' --model opus"})),
+            None,
+        );
+        for env in [
+            started("agent", ItemKind::Subagent, None),
+            delta(
+                Some("agent"),
+                StreamKind::ToolInput,
+                r#"{"subagent_type":"Explore","descr"#,
+            ),
+            delta(Some("agent"), StreamKind::ToolInput, r#"iption":"Map it"}"#),
+            started("step", ItemKind::Command, Some("agent")),
+            started("nested", ItemKind::Subagent, Some("agent")),
+            launch,
+            Envelope::item_completed("step", ItemStatus::Completed, None, None),
+        ] {
+            t.apply(&env, Driver::Claude);
+            check(&t);
+        }
+        let names: Vec<_> = t.subagents().into_iter().map(|a| a.name).collect();
+        assert_eq!(names.len(), 3, "{names:?}");
+        assert_eq!(names[0], "Explore");
+
+        // An edit of the same length is seen.
+        for task in ["aaaa", "bbbb"] {
+            if let Some(Body::Tool(tool)) = t.get_mut("agent").map(|i| &mut i.body) {
+                tool.input = Some(serde_json::json!({ "description": task }));
+            }
+            assert_eq!(t.subagents()[0].task, task);
+            check(&t);
+        }
+
+        t.remove_item("nested");
+        check(&t);
+        assert!(!t.summaries.borrow().contains_key("nested"));
     }
 
     /// A finished sub-agent's steps still running stop (their completions were lost); those of
