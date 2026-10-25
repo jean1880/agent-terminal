@@ -3515,19 +3515,23 @@ pub(crate) mod tests {
         t.scroll_to_card("c2");
         assert!(t.jump_pending(), "{}", t.scroll_debug());
         // However much time passes while the card opens, the jump is kept.
-        if t.jump_opening() {
-            t.age_clock(10_000_000);
-            t.settle_now();
-            assert!(t.jump_pending(), "kept while its card opens");
-        }
         assert!(
-            crate::testutil::pump_until(&ctx, 10, || !t.jump_pending()),
-            "the jump never landed: {}",
+            t.jump_opening(),
+            "the card is opening: {}",
             t.scroll_debug()
         );
+        t.settle_now();
+        t.age_clock(10_000_000);
+        t.settle_now();
+        assert!(t.jump_pending(), "kept while its card opens");
+        let landed = || {
+            !t.jump_pending()
+                && t.row_bounds_in_viewport("c2")
+                    .is_some_and(|(b, _)| b.height() > 0.0 && (0.0..=160.0).contains(&b.y()))
+        };
         assert!(
-            t.row_bounds_in_viewport("c2").is_some(),
-            "landed on its step: {}",
+            crate::testutil::pump_until(&ctx, 10, landed),
+            "the jump never landed on its step: {}",
             t.scroll_debug()
         );
         settings.set_gtk_enable_animations(animations);
