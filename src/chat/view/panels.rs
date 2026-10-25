@@ -12,7 +12,7 @@ use agent_core::catalog::{group_for_picker, CatalogModel};
 use gtk4::glib;
 use serde_json::Value;
 
-use super::cards::{accent_class, brand_image, label};
+use super::cards::{accent_class, brand_image, label, wrapped_text};
 use super::header::gauge_text;
 use super::model::{format_tokens, Gauge};
 use super::payload;
@@ -308,9 +308,7 @@ fn model_list(
         column.append(&heading);
         let notes = caveats(driver);
         if !notes.is_empty() {
-            let note = label(&notes.join(" "), &["dim-label", "switch-caveats"]);
-            note.set_wrap(true);
-            note.set_xalign(0.0);
+            let note = wrapped_text(&notes.join(" "), &["dim-label", "switch-caveats"]);
             note.set_margin_start(6);
             note.set_margin_end(6);
             column.append(&note);
@@ -416,10 +414,8 @@ fn picker_footer(source: &Rc<dyn ModelSource>, picker: &adw::Dialog) -> Option<g
     footer.set_margin_start(18);
     footer.set_margin_end(18);
     footer.set_margin_bottom(10);
-    let text = label("", &["dim-label", "model-footer-text"]);
+    let text = wrapped_text("", &["dim-label", "model-footer-text"]);
     text.set_hexpand(true);
-    text.set_xalign(0.0);
-    text.set_wrap(true);
     let button = gtk4::Button::with_label("Refresh");
     button.add_css_class("flat");
     button.set_tooltip_text(Some("Fetch every agent's model list again"));
@@ -567,13 +563,11 @@ pub fn model_picker(ctx: &PanelCtx) {
     let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
     outer.append(&search);
     // How a choice is made: nothing in a list of rows says a click commits.
-    let hint = label(
+    let hint = wrapped_text(
         "Click a model to switch to it. Set its effort first, or press Apply to change only \
          the effort.",
         &["dim-label", "model-picker-hint"],
     );
-    hint.set_wrap(true);
-    hint.set_xalign(0.0);
     hint.set_margin_start(18);
     hint.set_margin_end(18);
     outer.append(&hint);

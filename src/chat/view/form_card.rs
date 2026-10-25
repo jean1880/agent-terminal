@@ -15,7 +15,8 @@ use gtk4::prelude::*;
 use serde_json::Value;
 
 use super::cards::{
-    add_button, button_row, chip_flow, content_label, label, mono, wrapping, RowEvent, RowSink,
+    add_button, card_head, chip, chip_flow, content_label, label, mono, outcome_footer, wrap_words,
+    wrapping, RowEvent, RowSink,
 };
 use super::form_draft::{choose_hint, number_value, Draft};
 use super::model::{FormCard, FormState};
@@ -138,22 +139,12 @@ impl Inner {
         root.add_css_class("question-card");
         root.add_css_class("card");
 
-        let head = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
-        let icon = gtk4::Image::from_icon_name("at-network-server-symbolic");
+        let (head, icon) = card_head("at-network-server-symbolic", heading_of(&card.form));
         icon.set_valign(gtk4::Align::Start);
-        head.append(&icon);
-        let heading = label(heading_of(&card.form), &["question-heading"]);
-        wrapping(&heading);
-        head.append(&heading);
         root.append(&head);
 
         // Whose words follow: the tool server's, quoted.
-        let chip = label(&format!("{} tool server", card.server), &["question-chip"]);
-        chip.set_halign(gtk4::Align::Start);
-        chip.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        chip.set_max_width_chars(48);
-        chip.set_tooltip_text(Some(&format!("{} tool server", card.server)));
-        root.append(&chip);
+        root.append(&chip(&format!("{} tool server", card.server), 48));
         let message = content_label(card.message.trim(), &["md-quote", "form-message"]);
         wrapping(&message);
         message.set_visible(!card.message.trim().is_empty());
@@ -199,9 +190,16 @@ impl Inner {
             root.append(&open_failed);
         }
 
-        // The reason or outcome above the buttons: the buttons wrap, and a wrapping label
-        // beside a wrapping row is where GTK's height-for-width measuring disagrees with itself.
-        let footer = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+        // Above the buttons: the warning and the refusal (put in front below), then the outcome.
+        let status = label("", &["approval-outcome"]);
+        let (footer, buttons) = outcome_footer(&status);
+        let refusal = label(
+            "Codex did not accept that answer. Try again, or decline.",
+            &["form-error"],
+        );
+        wrapping(&refusal);
+        refusal.set_visible(card.refused);
+        footer.prepend(&refusal);
         // Text typed here goes to a tool server: say, in the app's own words, what never to type.
         if let Form::Fields { fields: specs } = &card.form {
             if specs
@@ -213,22 +211,9 @@ impl Inner {
                     &["form-note", "form-secret-note"],
                 );
                 wrapping(&warn);
-                footer.append(&warn);
+                footer.prepend(&warn);
             }
         }
-        let refusal = label(
-            "Codex did not accept that answer. Try again, or decline.",
-            &["form-error"],
-        );
-        wrapping(&refusal);
-        refusal.set_visible(card.refused);
-        footer.append(&refusal);
-        let status = label("", &["approval-outcome"]);
-        wrapping(&status);
-        status.set_visible(false);
-        let (buttons_row, buttons) = button_row();
-        footer.append(&status);
-        footer.append(&buttons_row);
         root.append(&footer);
         let sent_to = label(
             &format!("Sent to {}.", card.server),
@@ -580,8 +565,7 @@ fn build_link(url: &str, body: &gtk4::Box) {
 fn field_head(spec: &FormField) -> gtk4::Box {
     let head = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     let name = label(&spec.label(), &["form-field-label"]);
-    name.set_wrap(true);
-    name.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+    wrap_words(&name);
     head.append(&name);
     if spec.required {
         let tag = label("Required", &["form-required"]);

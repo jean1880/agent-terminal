@@ -186,9 +186,44 @@ pub(super) fn measure_only_when_open(revealer: &gtk4::Revealer) {
 }
 
 pub(super) fn wrapping(l: &gtk4::Label) {
+    wrap_words(l);
+    l.set_hexpand(true);
+}
+
+/// Wraps `l` between words, and inside a word too long for a line, without making it expand.
+pub(super) fn wrap_words(l: &gtk4::Label) {
     l.set_wrap(true);
     l.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
-    l.set_hexpand(true);
+}
+
+/// A [`label`] that wraps between words.
+pub(super) fn wrapped_text(text: &str, classes: &[&str]) -> gtk4::Label {
+    let l = label(text, classes);
+    l.set_wrap(true);
+    l
+}
+
+/// A card's head: the `icon` beside its wrapping `heading` (a question card's look). Returns the
+/// head and its icon.
+pub(super) fn card_head(icon: &str, heading: &str) -> (gtk4::Box, gtk4::Image) {
+    let head = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
+    let image = gtk4::Image::from_icon_name(icon);
+    head.append(&image);
+    let heading = label(heading, &["question-heading"]);
+    wrapping(&heading);
+    head.append(&heading);
+    (head, image)
+}
+
+/// A one-line chip naming whose words follow, cut at `max_chars` with the whole text as its
+/// tooltip.
+pub(super) fn chip(text: &str, max_chars: i32) -> gtk4::Label {
+    let chip = label(text, &["question-chip"]);
+    chip.set_halign(gtk4::Align::Start);
+    chip.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    chip.set_max_width_chars(max_chars);
+    chip.set_tooltip_text(Some(text));
+    chip
 }
 
 /// A selectable, wrapping monospace label for tool input and output.
@@ -873,8 +908,7 @@ fn divider_parts(text: &str, class: &str, driver: Option<Driver>) -> (gtk4::Widg
     }
     // Wraps: a long model name must not set the transcript's minimum width.
     let words = content_label(text, &["divider-text"]);
-    words.set_wrap(true);
-    words.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+    wrap_words(&words);
     words.set_justify(gtk4::Justification::Center);
     words.set_xalign(0.5);
     pill.append(&words);
@@ -1742,6 +1776,20 @@ pub(super) fn button_row() -> (gtk4::Box, gtk4::FlowBox) {
     (row, flow)
 }
 
+/// A card's footer: `outcome` (wrapping, hidden until there is one) above a [`button_row`].
+/// Above the buttons, not beside them: the buttons wrap, and a wrapping label beside a wrapping
+/// row is where GTK's height-for-width measuring disagrees with itself. Returns the footer and
+/// the flow box to fill.
+pub(super) fn outcome_footer(outcome: &gtk4::Label) -> (gtk4::Box, gtk4::FlowBox) {
+    let footer = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+    wrapping(outcome);
+    outcome.set_visible(false);
+    let (row, flow) = button_row();
+    footer.append(outcome);
+    footer.append(&row);
+    (footer, flow)
+}
+
 /// Shows or hides a [`button_row`]'s flow box with the row around it, which would leave a gap.
 pub(super) fn set_row_visible(flow: &gtk4::FlowBox, visible: bool) {
     flow.set_visible(visible);
@@ -2015,15 +2063,8 @@ impl ApprovalCard {
         wrapping(&note);
         note.set_visible(false);
         root.append(&note);
-        // The outcome above the buttons, not beside them: the buttons wrap, and a wrapping label
-        // beside a wrapping row is where GTK's height-for-width measuring disagrees with itself.
-        let footer = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
         let outcome = content_label("", &["approval-outcome"]);
-        wrapping(&outcome);
-        outcome.set_visible(false);
-        let (buttons_row, buttons) = button_row();
-        footer.append(&outcome);
-        footer.append(&buttons_row);
+        let (footer, buttons) = outcome_footer(&outcome);
         root.append(&footer);
         Self {
             root,
@@ -2480,11 +2521,7 @@ impl QuestionCardWidget {
         let root = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
         root.add_css_class("question-card");
         root.add_css_class("card");
-        let head = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
-        head.append(&gtk4::Image::from_icon_name("at-dialog-question-symbolic"));
-        let heading = label("The agent has a question", &["question-heading"]);
-        wrapping(&heading);
-        head.append(&heading);
+        let (head, _) = card_head("at-dialog-question-symbolic", "The agent has a question");
         root.append(&head);
 
         let selected: Rc<RefCell<Vec<Vec<usize>>>> =
@@ -2498,12 +2535,7 @@ impl QuestionCardWidget {
         for (qi, q) in card.questions.iter().enumerate() {
             let qbox = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
             if !q.header.is_empty() {
-                let chip = label(&q.header, &["question-chip"]);
-                chip.set_halign(gtk4::Align::Start);
-                chip.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-                chip.set_max_width_chars(40);
-                chip.set_tooltip_text(Some(&q.header));
-                qbox.append(&chip);
+                qbox.append(&chip(&q.header, 40));
             }
             let text = content_label(&q.question, &["question-text"]);
             wrapping(&text);

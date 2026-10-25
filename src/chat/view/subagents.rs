@@ -15,7 +15,7 @@ use std::rc::{Rc, Weak};
 use adw::prelude::AdwDialogExt;
 use gtk4::prelude::*;
 
-use super::cards::{label, wrapping, Row, RowSink};
+use super::cards::{label, wrap_words, wrapping, Row, RowSink};
 #[cfg(test)]
 use super::model::ToolStatus;
 use super::model::{Body, SubagentSummary, Transcript};
@@ -156,10 +156,7 @@ impl ListRow {
         brand.set_pixel_size(14);
         top.append(&brand);
         let name = label("", &["subagent-name"]);
-        name.set_hexpand(true);
-        name.set_xalign(0.0);
-        name.set_wrap(true);
-        name.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+        wrapping(&name);
         // A wrapping label's minimum is one character: without a floor, a narrow list squeezed
         // `senior-engineer` into a column of letters beside its status.
         name.set_width_chars(16);
@@ -174,8 +171,7 @@ impl ListRow {
         task.set_max_width_chars(48);
         b.append(&task);
         let identity = label("", &["dim-label"]);
-        identity.set_wrap(true);
-        identity.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+        wrap_words(&identity);
         identity.set_max_width_chars(48);
         b.append(&identity);
         let row = gtk4::ListBoxRow::new();
@@ -470,8 +466,7 @@ impl SubagentPanel {
         body.set_margin_end(18);
 
         let title = label("", &["subagent-panel-title"]);
-        title.set_wrap(true);
-        title.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+        wrap_words(&title);
         let status = label("", &["dim-label"]);
         let head = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
         let title_line = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
@@ -482,8 +477,7 @@ impl SubagentPanel {
         head.append(&title_line);
         head.append(&status);
         let identity = label("", &["dim-label"]);
-        identity.set_wrap(true);
-        identity.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+        wrap_words(&identity);
         head.append(&identity);
         let controls = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
         head.append(&controls);

@@ -13,7 +13,7 @@ use adw::prelude::AdwDialogExt;
 use agent_core::event::{BackgroundTask, BackgroundTaskKind};
 use gtk4::prelude::*;
 
-use super::cards::label;
+use super::cards::{label, wrapped_text};
 use super::model::task_name;
 use super::payload::TaskOutput;
 
@@ -184,8 +184,7 @@ impl TaskOutputPanel {
         body.set_margin_bottom(18);
         body.set_margin_start(18);
         body.set_margin_end(18);
-        let title = label(&task_name(task), &["subagent-panel-title"]);
-        title.set_wrap(true);
+        let title = wrapped_text(&task_name(task), &["subagent-panel-title"]);
         title.set_selectable(true);
         let status = label("Reading output…", &["dim-label"]);
         body.append(&title);

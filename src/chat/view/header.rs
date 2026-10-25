@@ -7,7 +7,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use agent_core::adapter::{Driver, Mode};
 
-use super::cards::{accent_class, label};
+use super::cards::{accent_class, label, wrapped_text};
 use super::model::{format_tokens, Activity, Gauge};
 
 /// Hookless agy cannot enforce a new policy mid-turn without interrupting it.
@@ -255,8 +255,7 @@ impl Header {
         let mode_box = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
         mode_box.set_valign(gtk4::Align::Center);
         mode_box.append(&mode);
-        let pending_mode = label("", &["dim-label"]);
-        pending_mode.set_wrap(true);
+        let pending_mode = wrapped_text("", &["dim-label"]);
         pending_mode.set_max_width_chars(18);
         pending_mode.set_visible(false);
         mode_box.append(&pending_mode);
@@ -277,8 +276,7 @@ impl Header {
         let access_text = label("Extra access", &["extra-access-text"]);
         access_inner.append(&access_text);
         access.set_child(Some(&access_inner));
-        let access_list = label("", &["extra-access-list"]);
-        access_list.set_wrap(true);
+        let access_list = wrapped_text("", &["extra-access-list"]);
         access_list.set_max_width_chars(48);
         access_list.set_selectable(false);
         let access_pop_box = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
