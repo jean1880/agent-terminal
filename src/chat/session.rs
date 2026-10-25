@@ -249,7 +249,8 @@ struct Inner {
     unbound: RefCell<Option<String>>,
     /// How long a tool step may wait for its hook query to show up.
     canary_grace: Cell<Duration>,
-    /// Tool item ids that were cancelled, declined or failed before completion (not tripped by canary).
+    /// Tool item ids a hook refused before they ran (`ItemStatus::Declined`): the canary lets
+    /// them off, and only them.
     canary_cancelled: RefCell<HashSet<String>>,
     /// The fresh proof every hooked agy start waits on (see [`Inner::start_process`]).
     hook_check: RefCell<HookCheck>,
@@ -2320,15 +2321,15 @@ impl Inner {
                     inner.trip_canary();
                 });
             }
-            Event::ItemCompleted { status, error, .. } => {
+            // Only a step the adapter reports refused before it ran (`Declined`) is let off: it
+            // ran nothing. A step that ran and then failed, or was interrupted, ran unasked all
+            // the same; its error text is never read here, as a tool can print anything.
+            Event::ItemCompleted {
+                status: ItemStatus::Declined,
+                ..
+            } => {
                 if let Some(id) = &env.item {
-                    if *status != ItemStatus::Completed
-                        || error.as_deref().is_some_and(|e| {
-                            e.contains("denied") || e.contains("hook") || e.contains("refused")
-                        })
-                    {
-                        self.canary_cancelled.borrow_mut().insert(id.clone());
-                    }
+                    self.canary_cancelled.borrow_mut().insert(id.clone());
                 }
             }
             _ => {}
@@ -8898,6 +8899,115 @@ mod tests {
                 assert!(!session.status().alive);
             });
         }
+    }
+
+    /// `STEP` ended in error with `message`, as agy reports it.
+    fn step_error(message: &str) -> String {
+        serde_json::json!({"event": "step_update", "conversation_id": "c1", "step_update": {
+            "conversation_id": "c1", "state": "ERROR", "step_index": 1, "step_type": "tool",
+            "tool_name": "run_command",
+            "tool_info": {"error": {"message": message, "type": "TOOL_ERROR"}}}})
+        .to_string()
+    }
+
+    /// A hooked agy whose tool step, with no hook query, ran and then failed. Its failure is no
+    /// excuse: the step ran unasked, so the canary still trips, whatever the error says.
+    #[test]
+    fn a_step_that_ran_and_failed_with_no_hook_query_still_trips_the_canary() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let (sink, seen) = make_sink();
+            let handle = bound_handle(tmp.path());
+            // Its error quotes words the canary once took for a refusal.
+            let failed = step_error("pre-commit hook refused the commit: permission denied");
+            let open = scripted(
+                tmp.path(),
+                &format!("echo '{STEP}'\necho '{failed}'\nexec sleep 30"),
+            );
+            let session = ChatSession::new(
+                Box::new(AgyAdapter::new("agy")),
+                open,
+                store,
+                thread,
+                sink,
+                Some(handle),
+            );
+            session.set_canary_grace(Duration::from_millis(200));
+            let failed_seen = |seen: &Seen| {
+                has(seen, |e| {
+                    matches!(
+                        e,
+                        Event::ItemCompleted {
+                            status: ItemStatus::Failed,
+                            ..
+                        }
+                    )
+                })
+            };
+            assert!(pump_until(ctx, 15, || failed_seen(&seen)), "no failure");
+            assert!(
+                pump_until(ctx, 15, || hook_missing_error(&seen)),
+                "the canary let a step that ran unasked pass"
+            );
+            assert!(pump_until(ctx, 15, || {
+                lines(tmp.path().join("args.log")).len() == 2
+            }));
+            let args = lines(tmp.path().join("args.log"));
+            assert!(
+                !args[1].contains("--dangerously-skip-permissions"),
+                "{args:?}"
+            );
+            session.shutdown(false);
+        });
+    }
+
+    /// A step a hook refused before it ran (agy reports it `Declined`) ran nothing, so it trips
+    /// nothing, even with no query of ours.
+    #[test]
+    fn a_step_a_hook_refused_before_running_does_not_trip_the_canary() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let (sink, seen) = make_sink();
+            let handle = bound_handle(tmp.path());
+            let refused = step_error("tool call denied by pre-tool hook: denied elsewhere");
+            let open = scripted(
+                tmp.path(),
+                &format!("echo '{STEP}'\necho '{refused}'\nexec sleep 30"),
+            );
+            let session = ChatSession::new(
+                Box::new(AgyAdapter::new("agy")),
+                open,
+                store,
+                thread,
+                sink,
+                Some(handle),
+            );
+            session.set_canary_grace(Duration::from_millis(200));
+            let declined = |seen: &Seen| {
+                has(seen, |e| {
+                    matches!(
+                        e,
+                        Event::ItemCompleted {
+                            status: ItemStatus::Declined,
+                            ..
+                        }
+                    )
+                })
+            };
+            assert!(pump_until(ctx, 15, || declined(&seen)), "no refusal");
+            // Well past the grace: nothing trips, nothing starts again.
+            assert!(
+                !pump_until(ctx, 1, || hook_missing_error(&seen)),
+                "the canary tripped on a step that never ran"
+            );
+            assert_eq!(lines(tmp.path().join("args.log")).len(), 1);
+            assert!(session.status().alive);
+            session.shutdown(false);
+        });
     }
 
     #[test]
