@@ -125,8 +125,9 @@ struct DetectedLink {
     clock: std::cell::Cell<u64>,
     /// The check's answer and when it arrived; `None` while a check runs.
     detected: RefCell<Option<(u64, Result<String, String>)>>,
-    /// The scan's state last seen for this agent, and when it changed to it.
-    scan: RefCell<Option<(u64, Availability)>>,
+    /// The scan result last seen for this agent: when it was first seen, its number
+    /// ([`AgentAvailability::scanned`]) and its state.
+    scan: RefCell<Option<(u64, u64, Availability)>>,
     /// Redraws the Enabled row; gone once its dialog closed.
     refresh: RefCell<Option<std::rc::Weak<dyn Fn()>>>,
 }
@@ -138,18 +139,31 @@ impl DetectedLink {
         now
     }
 
-    /// When the scan's `state` was first seen: a new stamp only when it changed, since the
-    /// availability signal fires for every agent's scan.
-    fn scanned_at(&self, state: &Availability) -> u64 {
+    /// When this agent's latest scan result (number `scans`, [`AgentAvailability::scanned`])
+    /// was first seen: a new stamp for every new result, the same Ready path again included, but
+    /// not when the signal fires for another agent's scan.
+    fn scanned_at(&self, scans: u64, state: &Availability) -> u64 {
         let mut scan = self.scan.borrow_mut();
         match scan.as_ref() {
-            Some((at, seen)) if seen == state => *at,
+            Some((at, seen_scans, seen)) if *seen_scans == scans && seen == state => *at,
             _ => {
                 let at = self.tick();
-                *scan = Some((at, state.clone()));
+                *scan = Some((at, scans, state.clone()));
                 at
             }
         }
+    }
+
+    /// The Enabled row's subtitle for `driver` now, from `availability` and the last check.
+    fn enabled_now(&self, availability: &AgentAvailability, driver: Driver) -> String {
+        let state = availability.get(driver);
+        let scanned_at = self.scanned_at(availability.scanned(driver), &state);
+        let detected = self.detected.borrow();
+        enabled_subtitle(
+            driver,
+            (scanned_at, &state),
+            detected.as_ref().map(|(at, found)| (*at, found)),
+        )
     }
 
     fn set(&self, found: Option<Result<String, String>>) {
@@ -1702,14 +1716,7 @@ impl AgentTerminalWindow {
             #[strong]
             link,
             move || {
-                let state = AgentAvailability::shared().get(driver);
-                let scanned_at = link.scanned_at(&state);
-                let detected = link.detected.borrow();
-                let text = enabled_subtitle(
-                    driver,
-                    (scanned_at, &state),
-                    detected.as_ref().map(|(at, found)| (*at, found)),
-                );
+                let text = link.enabled_now(&AgentAvailability::shared(), driver);
                 get_it.set_visible(text == Availability::Missing.describe(driver));
                 enabled.set_subtitle(&text);
             }
@@ -2740,18 +2747,44 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn the_link_stamps_a_scan_only_when_its_state_changes() {
+    fn the_link_stamps_each_new_scan_result_but_not_another_agents() {
         let link = DetectedLink::default();
         let ready = Availability::Ready("/usr/bin/claude".into());
-        let first = link.scanned_at(&ready);
+        let first = link.scanned_at(1, &ready);
         link.set(Some(Err("Not found: x".into())));
-        // Another agent's scan fires the signal again: the same state keeps its stamp, so the
-        // newer check still speaks.
-        assert_eq!(link.scanned_at(&ready), first);
+        // Another agent's scan fires the signal again: this agent's result (still number 1)
+        // keeps its stamp, so the newer check still speaks.
+        assert_eq!(link.scanned_at(1, &ready), first);
         let checked = link.detected.borrow().as_ref().map(|(at, _)| *at).unwrap();
         assert!(checked > first);
-        // A real rescan result is newer than that check.
-        assert!(link.scanned_at(&Availability::Detecting) > checked);
+        // A new result for this agent is newer than that check, even with the same state.
+        assert!(link.scanned_at(2, &ready) > checked);
+    }
+
+    #[test]
+    fn a_rescan_with_the_same_ready_path_overrides_an_older_not_found() {
+        let driver = Driver::Claude;
+        let availability = AgentAvailability::new();
+        let link = DetectedLink::default();
+        let ready = Availability::Ready("/usr/bin/claude".into());
+        // A cached Ready.
+        availability.set(driver, ready.clone());
+        assert_eq!(
+            link.enabled_now(&availability, driver),
+            ready.describe(driver)
+        );
+        // The binary disappears: Detected checks the command and finds nothing.
+        link.set(Some(Err("Not found: /usr/bin/claude".into())));
+        assert!(link
+            .enabled_now(&availability, driver)
+            .starts_with("Not found"));
+        // The binary returns, and the next scan gives the very same Ready path.
+        availability.set(driver, ready.clone());
+        assert_eq!(
+            link.enabled_now(&availability, driver),
+            ready.describe(driver),
+            "an unchanged rescan left the stale Not found"
+        );
     }
 
     #[test]
