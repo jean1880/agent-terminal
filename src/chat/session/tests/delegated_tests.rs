@@ -116,6 +116,8 @@ struct TestHooks {
     suspend_asks: RefCell<Vec<u64>>,
     /// Each generation whose binding was released without a process.
     abandoned: RefCell<Vec<u64>>,
+    /// How often the session said the user stopped the turn from inside it.
+    root_stops: Cell<usize>,
 }
 
 impl DelegationHooks for TestHooks {
@@ -180,6 +182,10 @@ impl DelegationHooks for TestHooks {
     fn suspending(&self, generation: ProcessGeneration) -> bool {
         self.suspend_asks.borrow_mut().push(generation.0);
         self.allow_suspend.get()
+    }
+
+    fn root_stopped(&self) {
+        self.root_stops.set(self.root_stops.get() + 1);
     }
 
     fn line(&self, _generation: ProcessGeneration, line: &str, _stderr: bool) {
@@ -1697,6 +1703,62 @@ fn a_delegation_root_suspends_only_with_its_hooks_consent() {
             !session.resumes_from_suspension(),
             "a started process is no longer that resume"
         );
+    });
+}
+
+/// "Stop turn" on an approval card stops a root as the window's Stop does: its hooks are told
+/// (the supervisor then holds its sub-agents' news until the user speaks), from agy's hook card
+/// and from Claude's, answered or not, and only for Stop turn.
+#[test]
+fn an_approval_cards_stop_turn_tells_the_hooks_the_root_stopped() {
+    in_loop(|ctx| {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let thread = fresh(&store, &dir.path().to_string_lossy());
+        let (sink, seen) = make_sink();
+        let hooks = Rc::new(TestHooks::default());
+        let session = ChatSession::with_options(
+            Box::new(agent_core::claude::ClaudeAdapter::new()),
+            super::idle_claude(dir.path()),
+            SessionStore::from(store),
+            thread,
+            sink,
+            Err(None),
+            minimal_env(dir.path()),
+            SessionOptions {
+                generation_base: ProcessGeneration(0),
+                hooks: Some(hooks.clone()),
+                child: None,
+            },
+        );
+        session.reload_session();
+        assert!(pump_until(ctx, 10, || has(&seen, |e| matches!(
+            e,
+            Event::TurnCompleted { .. }
+        ))));
+
+        // agy's hook card: the post-answer path, as its socket would take it.
+        for decision in [Decision::Allow, Decision::Deny] {
+            session.inner.finish_hook_approval("h1", decision, true);
+        }
+        assert_eq!(hooks.root_stops.get(), 0, "only Stop turn is a stop");
+        for answered in [true, false] {
+            session
+                .inner
+                .finish_hook_approval("h1", Decision::Cancel, answered);
+        }
+        assert_eq!(hooks.root_stops.get(), 2, "agy's Stop turn, answered or not");
+
+        // Claude's card.
+        feed(&session, &can_use_tool("r1", "touch a"));
+        session.respond_approval("r1", Decision::Deny);
+        assert_eq!(resolution(&seen, "r1"), Some(Decision::Deny));
+        assert_eq!(hooks.root_stops.get(), 2);
+        feed(&session, &can_use_tool("r2", "touch b"));
+        session.respond_approval("r2", Decision::Cancel);
+        assert_eq!(resolution(&seen, "r2"), Some(Decision::Cancel));
+        assert_eq!(hooks.root_stops.get(), 3, "Claude's Stop turn");
+        session.shutdown(false);
     });
 }
 

@@ -3897,6 +3897,9 @@ impl Inner {
             None => {}
         }
         self.emit(Envelope::new(Event::ApprovalResolved { decision }).request(request));
+        if decision == Decision::Cancel {
+            self.stopped_from_card();
+        }
     }
 
     fn finish_hook_approval(self: &Rc<Self>, request: &str, decision: Decision, answered: bool) {
@@ -3905,7 +3908,17 @@ impl Inner {
         }
         // Stop turn still stops when a stricter mode denied the call or its hook went away.
         if decision == Decision::Cancel {
+            self.stopped_from_card();
             self.command(Command::Interrupt);
+        }
+    }
+
+    /// The user chose "Stop turn" on a card: a stop of the turn, as the window's Stop is. A
+    /// delegation root's hooks are told (the window's Stop tells the supervisor itself), so
+    /// its sub-agents' news does not wake it again until the user speaks.
+    fn stopped_from_card(&self) {
+        if let Some(hooks) = &self.hooks {
+            hooks.root_stopped();
         }
     }
 
@@ -5024,6 +5037,9 @@ impl Inner {
             ));
         }
         self.emit(Envelope::new(Event::ApprovalResolved { decision }).request(shown));
+        if decision == Decision::Cancel {
+            self.stopped_from_card();
+        }
     }
 
     /// The id the view knows a Codex permission card by, for an envelope that names the

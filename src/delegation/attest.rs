@@ -136,6 +136,28 @@ impl DelegationHooks for Hooks {
         sup.rotate_before_stop(&self.worker, generation);
         true
     }
+    fn root_stopped(&self) {
+        let Some(sup) = self.supervisor.upgrade() else {
+            return;
+        };
+        // Roots only: a child's own card stops its own turn, not its root.
+        let thread = {
+            let state = sup.state.borrow();
+            let Some(w) = state.workers.get(&self.worker) else {
+                return;
+            };
+            if w.row.parent_id.is_some() {
+                return;
+            }
+            state
+                .roots
+                .get(&w.root)
+                .map(|r| r.row.root_thread_id.clone())
+        };
+        if let Some(thread) = thread {
+            sup.root_stop(&thread);
+        }
+    }
     fn binding(&self, driver: Driver, generation: ProcessGeneration) -> Option<LaunchBinding> {
         let sup = self.supervisor.upgrade()?;
         let epoch = sup.epoch(&self.worker).ok()?;

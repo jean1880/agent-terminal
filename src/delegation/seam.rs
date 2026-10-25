@@ -258,6 +258,11 @@ pub(crate) trait DelegationHooks {
     fn suspending(&self, _generation: ProcessGeneration) -> bool {
         false
     }
+    /// The user stopped the turn from inside the session (an approval card's "Stop turn"), not
+    /// through the window's Stop, which tells the supervisor itself. A root then hears no more
+    /// of its sub-agents' news until the user speaks to it again; a child ignores it (the
+    /// default does nothing). Called with no session borrow held.
+    fn root_stopped(&self) {}
     /// Every raw provider line, before the adapter. Memory only: never logged, never stored.
     fn line(&self, generation: ProcessGeneration, line: &str, stderr: bool);
     /// Every adapter envelope before masking and persistence.
