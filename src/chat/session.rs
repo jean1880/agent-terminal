@@ -3364,9 +3364,12 @@ impl Inner {
                 |news| agent_core::delegation::wake::with_user_prompt(news.text(), text),
             );
             let accepted = self.command(Command::Steer { text: sent.clone() });
-            self.settle_news(news, accepted, &sent, text);
+            // Kept before settling, so news given back is taken out of the replayed copy too.
             if accepted {
                 self.remember_pre_init_prompt(&sent, None);
+            }
+            self.settle_news(news, accepted, &sent, text);
+            if accepted {
                 return;
             }
         }
