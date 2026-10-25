@@ -50,7 +50,11 @@ pub fn run_command(
         let (done, finished) = mpsc::channel();
         let sink = Arc::clone(&buffer);
         let stop = Arc::clone(&stop);
+        #[cfg(test)]
+        let probed = command == tests::PROBE_NAME;
         std::thread::spawn(move || {
+            #[cfg(test)]
+            let _live = tests::LiveDrain::enter(probed);
             if let Some((mut pipe, fd)) = pipe {
                 let mut chunk = [0u8; 8192];
                 loop {
@@ -144,41 +148,72 @@ pub fn run_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
-    /// A background job outlives the command, holds its stdout open and stays
-    /// silent until the test says go (a file created only after `run_command`
-    /// returned). The drain must then have let go of the pipe, so the job's
-    /// write fails. Nothing depends on how fast the processes run: the job
-    /// writes nothing before the signal, and its wait and retries are bounded.
-    #[test]
-    fn a_silent_background_holder_is_released_after_return() {
-        let dir = tempfile::tempdir().unwrap();
-        let go = dir.path().join("go");
-        let marker = dir.path().join("pipe-closed");
-        let script = format!(
-            "( trap '' PIPE; i=0; \
-               while [ ! -e '{go}' ] && [ $i -lt 500 ]; do sleep 0.02; i=$((i+1)); done; \
-               i=0; while [ $i -lt 100 ]; do \
-               head -c 1 /dev/zero || {{ touch '{marker}'; exit 0; }}; \
-               sleep 0.05; i=$((i+1)); done ) & echo hi",
-            go = go.display(),
-            marker = marker.display()
-        );
-        let mut cmd = std::process::Command::new("sh");
-        cmd.arg("-c").arg(script);
-        let out = run_command(cmd, "sh", 10).unwrap();
-        assert_eq!(String::from_utf8_lossy(&out.stdout), "hi\n");
+    /// The command name that makes `run_command` count its drain threads, so
+    /// other tests running `run_command` in parallel never disturb the count.
+    pub(super) const PROBE_NAME: &str = "exec-drain-probe";
+    static LIVE_DRAINS: AtomicUsize = AtomicUsize::new(0);
 
-        // Only now may the job write.
-        std::fs::write(&go, "").unwrap();
-        let deadline = Instant::now() + Duration::from_secs(8);
-        while !marker.exists() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(50));
+    /// Counts one probed drain thread while it lives.
+    pub(super) struct LiveDrain(bool);
+    impl LiveDrain {
+        pub(super) fn enter(probed: bool) -> Self {
+            if probed {
+                LIVE_DRAINS.fetch_add(1, Ordering::SeqCst);
+            }
+            Self(probed)
         }
-        assert!(
-            marker.exists(),
-            "the drain kept reading after run_command returned"
+    }
+    impl Drop for LiveDrain {
+        fn drop(&mut self) {
+            if self.0 {
+                LIVE_DRAINS.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// Kills the holder when the test ends, however it ends.
+    struct Holder(i32);
+    impl Drop for Holder {
+        fn drop(&mut self) {
+            // SAFETY: plain kill(2) on a pid this test started.
+            unsafe { libc::kill(self.0, libc::SIGKILL) };
+        }
+    }
+
+    /// A background job holds the command's stdout and stderr open and never
+    /// writes. Once `run_command` has returned, both drain threads must exit
+    /// on their own (they cannot be woken by output), while the holder is
+    /// still alive.
+    #[test]
+    fn a_silent_background_holder_does_not_keep_the_drains_alive() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg("sleep 30 & echo $!");
+        let out = run_command(cmd, PROBE_NAME, 10).unwrap();
+        let pid: i32 = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("the shell prints the holder's pid");
+        let _holder = Holder(pid);
+        // SAFETY: signal 0 only checks that the process exists.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0, "the holder is alive");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while LIVE_DRAINS.load(Ordering::SeqCst) != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            LIVE_DRAINS.load(Ordering::SeqCst),
+            0,
+            "a drain thread is still blocked on the silent holder's pipe"
+        );
+        // SAFETY: as above; the holder must still be alive here.
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "the holder outlived the drains"
         );
     }
 }
