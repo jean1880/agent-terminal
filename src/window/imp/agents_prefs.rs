@@ -81,34 +81,27 @@ const PERMISSION_SOURCES_HELP: &str =
     "Extra permissions.toml files to import from and export to, separated by ':' (absolute or \
      ~/ paths to existing files). Blank: none";
 
-const AGENT_EDIT_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
-
+/// One commit-only row's uncommitted edit: held until a commit ([`Self::flush`]) saves it, or
+/// dropped ([`Self::cancel`]) when the text turns invalid. The window keeps every live one so
+/// closing flushes them ([`AgentTerminalWindow::flush_agent_edits`]).
 #[derive(Default)]
 pub(super) struct EditDebounce {
-    source: RefCell<Option<glib::SourceId>>,
     pending: RefCell<Option<std::boxed::Box<dyn FnOnce()>>>,
 }
 
 impl EditDebounce {
     fn cancel(&self) {
-        if let Some(id) = self.source.borrow_mut().take() {
-            id.remove();
-        }
         self.pending.borrow_mut().take();
     }
 
     fn flush(&self) {
-        if let Some(id) = self.source.borrow_mut().take() {
-            id.remove();
-        }
         let pending = self.pending.borrow_mut().take();
         if let Some(pending) = pending {
             pending();
         }
     }
 
-    /// Keeps `then` until [`Self::flush`] (a commit, the dialog or the window closing) with no
-    /// timer: for a row that persists only on commit.
+    /// Keeps `then` until [`Self::flush`] (a commit, the dialog or the window closing).
     fn hold(&self, then: impl FnOnce() + 'static) {
         self.cancel();
         *self.pending.borrow_mut() = Some(std::boxed::Box::new(then));
@@ -120,19 +113,6 @@ impl EditDebounce {
         if !active {
             self.flush();
         }
-    }
-
-    fn schedule(self: &Rc<Self>, then: impl FnOnce() + 'static) {
-        self.cancel();
-        *self.pending.borrow_mut() = Some(std::boxed::Box::new(then));
-        let weak = Rc::downgrade(self);
-        *self.source.borrow_mut() =
-            Some(glib::timeout_add_local_once(AGENT_EDIT_DELAY, move || {
-                if let Some(timer) = weak.upgrade() {
-                    timer.source.borrow_mut().take();
-                    timer.flush();
-                }
-            }));
     }
 }
 
@@ -300,6 +280,29 @@ fn command_ok(text: &str) -> bool {
 
 // Splits an arguments field as a shell would, as the diff tool's command line is split.
 use super::diff_prefs::parse_argv as parse_args;
+
+/// What the Command row does with `text`, against the `saved` command: validated on every
+/// change, saved only on commit ([`crate::config::field_change`]).
+fn command_edit(text: &str, saved: &str, commit: bool) -> FieldChange<String> {
+    let text = text.trim();
+    let parsed = if command_ok(text) {
+        Ok(text.to_owned())
+    } else {
+        Err("Enter a command name or a path (not an option)".to_owned())
+    };
+    crate::config::field_change(parsed, &saved.to_owned(), commit)
+}
+
+/// What the Environment File row does with `text` (blank is none), against the `saved` file.
+fn env_file_edit(text: &str, saved: Option<&str>, commit: bool) -> FieldChange<Option<String>> {
+    let text = text.trim();
+    let parsed = if env_file_ok(text) {
+        Ok((!text.is_empty()).then(|| text.to_owned()))
+    } else {
+        Err("That file does not exist".to_owned())
+    };
+    crate::config::field_change(parsed, &saved.map(str::to_owned), commit)
+}
 
 /// Whether an env-file field is usable: blank, or a file that exists.
 fn env_file_ok(text: &str) -> bool {
@@ -1812,6 +1815,122 @@ impl AgentTerminalWindow {
         timer
     }
 
+    /// Makes `row` a commit-only text entry: validated on every change by `decide` (given the
+    /// text and whether it is a commit), saved only on commit. A commit is Enter, the apply
+    /// button (shown), focus leaving the row, the row's window losing focus (which also writes
+    /// the config at once, so a valid edit left focused survives a crash), or the dialog or app
+    /// window closing (through `timer`, an [`Self::agent_edit_timer`]). On commit `apply` gets
+    /// the value to save, or `None` when the committed text is the value already in use.
+    fn commit_only_entry<T: 'static>(
+        &self,
+        row: &adw::EntryRow,
+        feedback: &adw::ActionRow,
+        help: &'static str,
+        timer: &Rc<EditDebounce>,
+        decide: impl Fn(&Self, &str, bool) -> FieldChange<T> + 'static,
+        apply: impl Fn(&Self, Option<T>) + 'static,
+    ) {
+        let obj = self.obj();
+        let decide = Rc::new(decide);
+        row.set_show_apply_button(true);
+        let commit = Rc::new(glib::clone!(
+            #[weak]
+            obj,
+            #[weak]
+            row,
+            #[weak]
+            feedback,
+            #[strong]
+            decide,
+            move || {
+                let imp = obj.imp();
+                match decide(imp, &row.text(), true) {
+                    FieldChange::Invalid(reason) => {
+                        show_validation(&row, &feedback, help, Some(&reason));
+                    }
+                    FieldChange::Keep => apply(imp, None),
+                    FieldChange::Persist(value) => apply(imp, Some(value)),
+                }
+            }
+        ));
+        row.connect_changed(glib::clone!(
+            #[weak]
+            obj,
+            #[weak]
+            feedback,
+            #[strong]
+            timer,
+            move |row| match decide(obj.imp(), &row.text(), false) {
+                FieldChange::Invalid(reason) => {
+                    timer.cancel();
+                    show_validation(row, &feedback, help, Some(&reason));
+                }
+                FieldChange::Keep | FieldChange::Persist(_) => {
+                    show_validation(row, &feedback, help, None);
+                    let commit = commit.clone();
+                    timer.hold(move || commit());
+                }
+            }
+        ));
+        let commit_now = glib::clone!(
+            #[strong]
+            timer,
+            move || timer.flush()
+        );
+        row.connect_apply({
+            let commit_now = commit_now.clone();
+            move |_| commit_now()
+        });
+        row.connect_entry_activated({
+            let commit_now = commit_now.clone();
+            move |_| commit_now()
+        });
+        let focus = gtk4::EventControllerFocus::new();
+        focus.connect_leave(move |_| commit_now());
+        row.add_controller(focus);
+        // The window the row is in (the app's, or the dialog's own when it floats), followed
+        // while the row is mapped.
+        type WindowWatch = Option<(glib::WeakRef<gtk4::Window>, glib::SignalHandlerId)>;
+        let window_watch: Rc<RefCell<WindowWatch>> = Rc::default();
+        row.connect_map(glib::clone!(
+            #[weak]
+            obj,
+            #[strong]
+            timer,
+            #[strong]
+            window_watch,
+            move |row| {
+                let Some(window) = row.root().and_downcast::<gtk4::Window>() else {
+                    return;
+                };
+                let id = window.connect_is_active_notify(glib::clone!(
+                    #[weak]
+                    obj,
+                    #[strong]
+                    timer,
+                    move |window| {
+                        timer.window_focus_changed(window.is_active());
+                        if !window.is_active() {
+                            obj.imp().flush_pending_save();
+                        }
+                    }
+                ));
+                if let Some((old, old_id)) = window_watch.replace(Some((window.downgrade(), id))) {
+                    if let Some(old) = old.upgrade() {
+                        old.disconnect(old_id);
+                    }
+                }
+            }
+        ));
+        row.connect_unmap(move |_| {
+            if let Some((window, id)) = window_watch.take() {
+                if let Some(window) = window.upgrade() {
+                    window.disconnect(id);
+                }
+            }
+        });
+    }
+
     /// The detail rows alone, with no Enabled row to tell: for tests.
     #[cfg(test)]
     fn add_agent_detail_rows(
@@ -1886,50 +2005,31 @@ impl AgentTerminalWindow {
             }
         ));
         detect(profile.command.clone());
+        // Saved only on commit: a half-typed path never becomes the agent's command.
         let command_timer = self.agent_edit_timer(dialog);
-        command.connect_changed(glib::clone!(
-            #[strong]
-            command_timer,
-            #[weak]
-            obj,
-            #[strong]
-            detect,
-            #[weak]
-            command_error,
-            move |row| {
-                command_timer.cancel();
-                let text = row.text().trim().to_owned();
-                if !command_ok(&text) {
-                    show_validation(
-                        row,
-                        &command_error,
-                        COMMAND_HELP,
-                        Some("Enter a command name or a path (not an option)"),
-                    );
-                    return;
+        self.commit_only_entry(
+            &command,
+            &command_error,
+            COMMAND_HELP,
+            &command_timer,
+            move |imp, text, commit| {
+                command_edit(text, &imp.agent_profile_now(driver).command, commit)
+            },
+            move |imp, value| {
+                let changed = value.is_some();
+                if let Some(text) = value {
+                    imp.edit_agent_profile(driver, |p| p.command = text);
                 }
-                show_validation(row, &command_error, COMMAND_HELP, None);
-                let obj = obj.downgrade();
-                let detect = detect.clone();
-                command_timer.schedule(move || {
-                    let Some(obj) = obj.upgrade() else {
-                        return;
-                    };
-                    let imp = obj.imp();
-                    let changed = imp.agent_profile_now(driver).command != text;
+                if !imp.is_closing() {
+                    // A commit checks the command again, even one already in use.
+                    detect(imp.agent_profile_now(driver).command);
                     if changed {
-                        imp.edit_agent_profile(driver, |p| p.command = text.clone());
+                        imp.refresh_profile_selection();
+                        imp.refresh_agent_data(super::threads::Probes::Force);
                     }
-                    if !imp.is_closing() {
-                        detect(text);
-                        if changed {
-                            imp.refresh_profile_selection();
-                            imp.refresh_agent_data(super::threads::Probes::Force);
-                        }
-                    }
-                });
-            }
-        ));
+                }
+            },
+        );
         group.add(&command);
         group.add(&command_error);
         group.add(&status);
@@ -1947,115 +2047,25 @@ impl AgentTerminalWindow {
         // Validated on every change, saved only on commit (Enter, the apply button, focus
         // leaving the row, or the dialog or window closing): a half-typed argument list is
         // never written, and never restarts the agent.
-        args.set_show_apply_button(true);
         let args_timer = self.agent_edit_timer(dialog);
-        let commit_args = Rc::new(glib::clone!(
-            #[weak]
-            obj,
-            #[weak]
-            args,
-            #[weak]
-            args_error,
-            move || {
-                let imp = obj.imp();
-                let saved = imp.agent_profile_now(driver).args;
-                match crate::config::field_change(parse_args(&args.text()), &saved, true) {
-                    FieldChange::Invalid(reason) => {
-                        show_validation(&args, &args_error, ARGS_HELP, Some(&reason));
-                    }
-                    FieldChange::Keep => {}
-                    FieldChange::Persist(parsed) => {
-                        imp.edit_agent_profile(driver, |p| p.args = parsed);
-                    }
+        self.commit_only_entry(
+            &args,
+            &args_error,
+            ARGS_HELP,
+            &args_timer,
+            move |imp, text, commit| {
+                crate::config::field_change(
+                    parse_args(text),
+                    &imp.agent_profile_now(driver).args,
+                    commit,
+                )
+            },
+            move |imp, value| {
+                if let Some(parsed) = value {
+                    imp.edit_agent_profile(driver, |p| p.args = parsed);
                 }
-            }
-        ));
-        args.connect_changed(glib::clone!(
-            #[weak]
-            obj,
-            #[weak]
-            args_error,
-            #[strong]
-            args_timer,
-            #[strong]
-            commit_args,
-            move |row| {
-                let saved = obj.imp().agent_profile_now(driver).args;
-                match crate::config::field_change(parse_args(&row.text()), &saved, false) {
-                    FieldChange::Invalid(reason) => {
-                        args_timer.cancel();
-                        show_validation(row, &args_error, ARGS_HELP, Some(&reason));
-                    }
-                    FieldChange::Keep | FieldChange::Persist(_) => {
-                        show_validation(row, &args_error, ARGS_HELP, None);
-                        let commit = commit_args.clone();
-                        args_timer.hold(move || commit());
-                    }
-                }
-            }
-        ));
-        let commit_now = glib::clone!(
-            #[strong]
-            args_timer,
-            move || args_timer.flush()
+            },
         );
-        args.connect_apply({
-            let commit_now = commit_now.clone();
-            move |_| commit_now()
-        });
-        args.connect_entry_activated({
-            let commit_now = commit_now.clone();
-            move |_| commit_now()
-        });
-        let focus = gtk4::EventControllerFocus::new();
-        focus.connect_leave(move |_| commit_now());
-        args.add_controller(focus);
-        // The window the row is in (the app's, or the dialog's own when it floats) losing focus
-        // commits too, and writes the config at once: a valid edit left in a focused row is not
-        // lost if the app is then killed. Followed while the row is mapped.
-        type WindowWatch = Option<(glib::WeakRef<gtk4::Window>, glib::SignalHandlerId)>;
-        let window_watch: Rc<RefCell<WindowWatch>> = Rc::default();
-        args.connect_map(glib::clone!(
-            #[weak]
-            obj,
-            #[strong]
-            args_timer,
-            #[strong]
-            window_watch,
-            move |row| {
-                let Some(window) = row.root().and_downcast::<gtk4::Window>() else {
-                    return;
-                };
-                let id = window.connect_is_active_notify(glib::clone!(
-                    #[weak]
-                    obj,
-                    #[strong]
-                    args_timer,
-                    move |window| {
-                        args_timer.window_focus_changed(window.is_active());
-                        if !window.is_active() {
-                            obj.imp().flush_pending_save();
-                        }
-                    }
-                ));
-                if let Some((old, old_id)) = window_watch.replace(Some((window.downgrade(), id))) {
-                    if let Some(old) = old.upgrade() {
-                        old.disconnect(old_id);
-                    }
-                }
-            }
-        ));
-        args.connect_unmap(glib::clone!(
-            #[strong]
-            window_watch,
-            move |_| {
-                if let Some((window, id)) = window_watch.take() {
-                    if let Some(window) = window.upgrade() {
-                        window.disconnect(id);
-                    }
-                }
-            }
-        ));
         group.add(&args);
         group.add(&args_error);
 
@@ -2065,42 +2075,27 @@ impl AgentTerminalWindow {
             profile.env_file.as_deref().unwrap_or(""),
         );
         let env_timer = self.agent_edit_timer(dialog);
-        env_file.connect_changed(glib::clone!(
-            #[strong]
-            env_timer,
-            #[weak]
-            obj,
-            #[weak]
-            env_error,
-            move |row| {
-                env_timer.cancel();
-                let text = row.text().trim().to_owned();
-                if !env_file_ok(&text) {
-                    show_validation(
-                        row,
-                        &env_error,
-                        ENV_FILE_HELP,
-                        Some("That file does not exist"),
-                    );
-                    return;
-                }
-                show_validation(row, &env_error, ENV_FILE_HELP, None);
-                let value = (!text.is_empty()).then_some(text);
-                let obj = obj.downgrade();
-                env_timer.schedule(move || {
-                    let Some(obj) = obj.upgrade() else {
-                        return;
-                    };
-                    let imp = obj.imp();
-                    if imp.agent_profile_now(driver).env_file != value {
-                        imp.edit_agent_profile(driver, |p| p.env_file = value);
-                        if !imp.is_closing() {
-                            imp.refresh_agent_data(super::threads::Probes::Force);
-                        }
+        self.commit_only_entry(
+            &env_file,
+            &env_error,
+            ENV_FILE_HELP,
+            &env_timer,
+            move |imp, text, commit| {
+                env_file_edit(
+                    text,
+                    imp.agent_profile_now(driver).env_file.as_deref(),
+                    commit,
+                )
+            },
+            move |imp, value| {
+                if let Some(value) = value {
+                    imp.edit_agent_profile(driver, |p| p.env_file = value);
+                    if !imp.is_closing() {
+                        imp.refresh_agent_data(super::threads::Probes::Force);
                     }
-                });
-            }
-        ));
+                }
+            },
+        );
         group.add(&env_file);
         group.add(&env_error);
 
@@ -2780,6 +2775,60 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn a_half_typed_command_is_not_saved_before_commit() {
+        let saved = "claude";
+        // Typing a path: each prefix is a valid command, and none is saved while typing.
+        for typed in ["/", "/usr/bin/cl", "/usr/bin/claude-nigh"] {
+            assert_eq!(
+                command_edit(typed, saved, false),
+                FieldChange::Keep,
+                "{typed:?} was saved while typing"
+            );
+        }
+        assert_eq!(
+            command_edit("/usr/bin/claude-nightly", saved, true),
+            FieldChange::Persist("/usr/bin/claude-nightly".into())
+        );
+        for commit in [false, true] {
+            assert!(matches!(
+                command_edit("--oops", saved, commit),
+                FieldChange::Invalid(_)
+            ));
+        }
+        assert_eq!(command_edit(" claude ", saved, true), FieldChange::Keep);
+    }
+
+    #[test]
+    fn a_half_typed_env_file_is_not_saved_before_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        // A prefix of the intended path that happens to name a file too.
+        let prefix = dir.path().join("work");
+        let full = dir.path().join("work.env");
+        std::fs::write(&prefix, "A=1\n").unwrap();
+        std::fs::write(&full, "A=2\n").unwrap();
+        let (prefix, full) = (prefix.to_string_lossy(), full.to_string_lossy());
+        assert_eq!(
+            env_file_edit(&prefix, None, false),
+            FieldChange::Keep,
+            "a valid prefix was saved while typing"
+        );
+        assert_eq!(
+            env_file_edit(&full, None, true),
+            FieldChange::Persist(Some(full.to_string()))
+        );
+        // Clearing the row is a value too, saved on commit only.
+        assert_eq!(env_file_edit("", Some(&full), false), FieldChange::Keep);
+        assert_eq!(
+            env_file_edit("", Some(&full), true),
+            FieldChange::Persist(None)
+        );
+        assert!(matches!(
+            env_file_edit("/definitely/not/here.env", None, true),
+            FieldChange::Invalid(_)
+        ));
+    }
+
+    #[test]
     fn a_held_edit_commits_when_its_window_loses_focus() {
         let commits = Rc::new(std::cell::Cell::new(0));
         let timer = EditDebounce::default();
@@ -2940,10 +2989,16 @@ pub(super) mod tests {
         ] {
             field.set_text(text);
         }
+        // Nothing is saved while typing, however long the user pauses.
+        let paused = std::time::Instant::now();
+        crate::testutil::pump_until(&ctx, 1, || paused.elapsed().as_millis() > 800);
         assert_eq!(
             window.imp().agent_profile_now(Driver::Codex).command,
             saved.command
         );
+        assert_eq!(super::super::threads::scan_generation_for_test(), before);
+        // Enter commits it, once.
+        field.emit_by_name::<()>("entry-activated", &[]);
         assert!(crate::testutil::pump_until(&ctx, 5, || window
             .imp()
             .agent_profile_now(Driver::Codex)
@@ -2970,8 +3025,7 @@ pub(super) mod tests {
         let before = super::super::threads::scan_generation_for_test();
         field.set_text("/nonexistent/valid-draft/codex");
         field.set_text("--invalid");
-        let elapsed = std::time::Instant::now();
-        assert!(crate::testutil::pump_until(&ctx, 2, || elapsed.elapsed() > AGENT_EDIT_DELAY * 2));
+        field.emit_by_name::<()>("entry-activated", &[]);
         assert_eq!(
             window.imp().agent_profile_now(Driver::Codex).command,
             final_command
@@ -2981,6 +3035,8 @@ pub(super) mod tests {
         status.set_subtitle("Checking…");
         field.set_text("/nonexistent/another-draft/codex");
         field.set_text(final_command);
+        // Committing the command already in use checks it again, with no rescan.
+        field.emit_by_name::<()>("entry-activated", &[]);
         assert!(crate::testutil::pump_until(&ctx, 10, || status
             .subtitle()
             .is_some_and(|s| s != "Checking…")));
