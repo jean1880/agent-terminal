@@ -130,17 +130,43 @@ impl EditDebounce {
 
 /// What an agent's Detected row last found for the saved command, shared with its Enabled row
 /// so the two rows never contradict each other ([`enabled_subtitle`]).
+/// Both answers are stamped on one clock, so the newer one speaks.
 #[derive(Default)]
 struct DetectedLink {
-    /// `None` while a check runs.
-    detected: RefCell<Option<Result<String, String>>>,
+    /// The last stamp handed out.
+    clock: std::cell::Cell<u64>,
+    /// The check's answer and when it arrived; `None` while a check runs.
+    detected: RefCell<Option<(u64, Result<String, String>)>>,
+    /// The scan's state last seen for this agent, and when it changed to it.
+    scan: RefCell<Option<(u64, Availability)>>,
     /// Redraws the Enabled row; gone once its dialog closed.
     refresh: RefCell<Option<std::rc::Weak<dyn Fn()>>>,
 }
 
 impl DetectedLink {
+    fn tick(&self) -> u64 {
+        let now = self.clock.get() + 1;
+        self.clock.set(now);
+        now
+    }
+
+    /// When the scan's `state` was first seen: a new stamp only when it changed, since the
+    /// availability signal fires for every agent's scan.
+    fn scanned_at(&self, state: &Availability) -> u64 {
+        let mut scan = self.scan.borrow_mut();
+        match scan.as_ref() {
+            Some((at, seen)) if seen == state => *at,
+            _ => {
+                let at = self.tick();
+                *scan = Some((at, state.clone()));
+                at
+            }
+        }
+    }
+
     fn set(&self, found: Option<Result<String, String>>) {
-        *self.detected.borrow_mut() = found;
+        let stamped = found.map(|f| (self.tick(), f));
+        *self.detected.borrow_mut() = stamped;
         let refresh = self
             .refresh
             .borrow()
@@ -1666,8 +1692,13 @@ impl AgentTerminalWindow {
             link,
             move || {
                 let state = AgentAvailability::shared().get(driver);
+                let scanned_at = link.scanned_at(&state);
                 let detected = link.detected.borrow();
-                let text = enabled_subtitle(driver, &state, detected.as_ref());
+                let text = enabled_subtitle(
+                    driver,
+                    (scanned_at, &state),
+                    detected.as_ref().map(|(at, found)| (*at, found)),
+                );
                 get_it.set_visible(text == Availability::Missing.describe(driver));
                 enabled.set_subtitle(&text);
             }
@@ -2493,12 +2524,17 @@ fn catalogue_efforts(driver: Driver) -> Vec<String> {
 
 /// The Enabled row's subtitle: the shared scan's `state`, unless the Detected row's own check
 /// of the saved command (`detected`, `None` while it runs) disagrees with it. The two rows
-/// never contradict each other.
+/// never contradict each other. Each answer carries when it arrived (`scanned_at`, and the
+/// check's own stamp) on one clock.
 fn enabled_subtitle(
     driver: Driver,
-    state: &Availability,
-    detected: Option<&Result<String, String>>,
+    (scanned_at, state): (u64, &Availability),
+    detected: Option<(u64, &Result<String, String>)>,
 ) -> String {
+    // Only a check newer than the scan may speak over it; an older one is stale.
+    let detected = detected
+        .filter(|(checked_at, _)| *checked_at > scanned_at)
+        .map(|(_, found)| found);
     match (state, detected) {
         (Availability::Disabled, _) | (_, None) => state.describe(driver),
         (Availability::Ready(_), Some(Err(_))) => Availability::Missing.describe(driver),
@@ -2630,27 +2666,62 @@ pub(super) mod tests {
         let driver = Driver::Claude;
         let ready = Availability::Ready("/usr/bin/claude".into());
         let not_found: Result<String, String> = Err("Not found: /nonexistent/claude".into());
-        // The scan still holds the old command's result; Detected checked the saved one.
-        let text = enabled_subtitle(driver, &ready, Some(&not_found));
+        // The scan still holds the old command's result; Detected checked the saved one since.
+        let text = enabled_subtitle(driver, (1, &ready), Some((2, &not_found)));
         assert!(!text.starts_with("Ready"), "{text}");
         assert!(text.starts_with("Not found"), "{text}");
-        // Detected found it while the scan says missing: not "Not found" either.
+        // Detected found it after the scan said missing: not "Not found" either.
         let found: Result<String, String> = Ok("Installed at /opt/claude · 2.1".into());
-        let text = enabled_subtitle(driver, &Availability::Missing, Some(&found));
+        let text = enabled_subtitle(driver, (1, &Availability::Missing), Some((2, &found)));
         assert!(!text.starts_with("Not found"), "{text}");
         assert!(text.contains("/opt/claude"), "{text}");
         // Agreement, a check still running, or an agent turned off: the scan's own words.
         assert_eq!(
-            enabled_subtitle(driver, &ready, Some(&found)),
+            enabled_subtitle(driver, (1, &ready), Some((2, &found))),
             ready.describe(driver)
         );
         assert_eq!(
-            enabled_subtitle(driver, &ready, None),
+            enabled_subtitle(driver, (1, &ready), None),
             ready.describe(driver)
         );
         assert_eq!(
-            enabled_subtitle(driver, &Availability::Disabled, Some(&not_found)),
+            enabled_subtitle(driver, (1, &Availability::Disabled), Some((2, &not_found))),
             Availability::Disabled.describe(driver)
+        );
+    }
+
+    #[test]
+    fn the_link_stamps_a_scan_only_when_its_state_changes() {
+        let link = DetectedLink::default();
+        let ready = Availability::Ready("/usr/bin/claude".into());
+        let first = link.scanned_at(&ready);
+        link.set(Some(Err("Not found: x".into())));
+        // Another agent's scan fires the signal again: the same state keeps its stamp, so the
+        // newer check still speaks.
+        assert_eq!(link.scanned_at(&ready), first);
+        let checked = link.detected.borrow().as_ref().map(|(at, _)| *at).unwrap();
+        assert!(checked > first);
+        // A real rescan result is newer than that check.
+        assert!(link.scanned_at(&Availability::Detecting) > checked);
+    }
+
+    #[test]
+    fn an_older_detected_answer_never_overrides_a_newer_scan() {
+        let driver = Driver::Claude;
+        let ready = Availability::Ready("/usr/bin/claude".into());
+        let not_found: Result<String, String> = Err("Not found: /nonexistent/claude".into());
+        let found: Result<String, String> = Ok("Installed at /opt/claude · 2.1".into());
+        // The Settings row checked the command at 1; the agent was installed and rescanned at 2.
+        assert_eq!(
+            enabled_subtitle(driver, (2, &ready), Some((1, &not_found))),
+            ready.describe(driver),
+            "a stale Not found overrode a newer Ready"
+        );
+        // And the other way round: a stale Installed never hides a newer Missing.
+        assert_eq!(
+            enabled_subtitle(driver, (2, &Availability::Missing), Some((1, &found))),
+            Availability::Missing.describe(driver),
+            "a stale Ready overrode a newer Not found"
         );
     }
 
