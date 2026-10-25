@@ -871,7 +871,8 @@ fn report_load_problem(problem: String) {
 /// replaced is kept rather than lost. `None` if the copy failed.
 ///
 /// An identical copy already kept is reused, so a file that stays broken
-/// across launches leaves one copy rather than one per launch.
+/// across launches leaves one copy rather than one per launch. The copy is
+/// written `0600`, like the config itself.
 fn keep_copy(path: &Path, tag: &str) -> Option<PathBuf> {
     let content = match fs::read(path) {
         Ok(content) => content,
@@ -900,7 +901,9 @@ fn keep_copy(path: &Path, tag: &str) -> Option<PathBuf> {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
     let copy = path.with_file_name(format!("{prefix}{nanos}"));
-    match fs::write(&copy, &content) {
+    // The config can hold tokens (profile env, indicator commands): the copy is as private as
+    // the file it keeps, never left to the umask.
+    match agent_kit::fsutil::write_private_atomic(&copy, &content) {
         Ok(()) => Some(copy),
         Err(err) => {
             warn!("Could not keep a copy of {}: {err}", path.display());
@@ -2686,6 +2689,42 @@ mod tests {
             "writing the new file would make the old one unadoptable"
         );
         assert_eq!(std::fs::read(&legacy).unwrap(), b"{ broken");
+    }
+
+    #[test]
+    fn a_kept_copy_of_a_private_config_is_private_too() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        // A 0600 config holding a token, broken by a hand edit, under a umask that would make a
+        // plain write 0644: the copy kept before defaults replace it must stay 0600.
+        std::fs::write(&path, br#"{ "env": {"TOKEN": "s3cret"}, oops }"#).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        TerminalConfig::load_from(&path);
+        let _ = take_load_problem();
+        let copies = kept_copies(dir.path(), "invalid");
+        assert_eq!(copies.len(), 1, "{copies:?}");
+        let mode = std::fs::metadata(dir.path().join(&copies[0]))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "kept copy is {:o}", mode & 0o777);
+
+        // The copy kept of an edit made behind a save's back, too.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let config = TerminalConfig::default();
+        config.save_to(&path);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&path, br#"{"scrollback_lines": 1234}"#).unwrap();
+        config.save_to(&path);
+        let copies = kept_copies(dir.path(), "external");
+        assert_eq!(copies.len(), 1, "{copies:?}");
+        let mode = std::fs::metadata(dir.path().join(&copies[0]))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "kept copy is {:o}", mode & 0o777);
     }
 
     #[test]
