@@ -290,15 +290,11 @@ fn reject_workspace_agents_hooks(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Where agy reads workspace hooks: the same model as the delegation guard's. In a repository,
+/// the physical cwd up to its toplevel; outside one, or under a toplevel that is not an ancestor,
+/// every ancestor up to `/`.
 fn hook_directories(cwd: &Path, toplevel: Option<&Path>) -> Vec<PathBuf> {
-    match toplevel.filter(|root| cwd.starts_with(root)) {
-        Some(root) => cwd
-            .ancestors()
-            .take_while(|dir| dir.starts_with(root))
-            .map(Path::to_path_buf)
-            .collect(),
-        None => vec![cwd.to_path_buf()],
-    }
+    agent_core::delegation::agy_guard::l2_directories(cwd, toplevel)
 }
 
 fn repository_toplevel(
@@ -1130,19 +1126,44 @@ mod tests {
         let outside = outer.path().join("outside/deeper");
         std::fs::create_dir_all(&outside).expect("outside");
         assert!(
-            check_target(&self::target(home.path(), Some(&outside))).is_ok(),
-            "without a repository only the thread directory is checked"
+            check_target(&self::target(home.path(), Some(&outside))).is_err(),
+            "without a repository every ancestor is checked, the hook above included"
         );
     }
 
     #[test]
-    fn hook_search_without_a_known_ancestor_stays_in_the_thread_directory() {
+    fn a_non_git_thread_refuses_an_ancestor_workspace_hook() {
+        let outer = tempfile::tempdir().expect("outer directory");
+        let cwd = outer.path().join("outside/deeper");
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+        let home = installed_home();
+        let target = target(home.path(), Some(&cwd));
+        assert!(check_target(&target).is_ok());
+        for hook in [
+            outer.path().join("outside/.agents/hooks.json"),
+            outer.path().join(".agents/hooks.json"),
+            outer.path().join(".agents/plugins/p/hooks.json"),
+        ] {
+            std::fs::create_dir_all(hook.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&hook, GOOD).expect("ancestor hook");
+            let why = check_target(&target).expect_err("a non-git ancestor hook must fail closed");
+            assert!(why.contains(&hook.to_string_lossy().into_owned()), "{why}");
+            std::fs::remove_file(&hook).expect("remove ancestor hook");
+            assert!(check_target(&target).is_ok());
+        }
+    }
+
+    #[test]
+    fn hook_search_without_a_known_ancestor_reaches_the_root() {
         let cwd = Path::new("/repo/sub/deeper");
-        assert_eq!(hook_directories(cwd, None), vec![cwd.to_path_buf()]);
-        assert_eq!(
-            hook_directories(cwd, Some(Path::new("/another"))),
-            vec![cwd.to_path_buf()]
-        );
+        let all: Vec<PathBuf> = vec![
+            cwd.to_path_buf(),
+            "/repo/sub".into(),
+            "/repo".into(),
+            "/".into(),
+        ];
+        assert_eq!(hook_directories(cwd, None), all);
+        assert_eq!(hook_directories(cwd, Some(Path::new("/another"))), all);
         assert_eq!(
             hook_directories(cwd, Some(Path::new("/repo"))),
             vec![cwd.to_path_buf(), "/repo/sub".into(), "/repo".into()]
