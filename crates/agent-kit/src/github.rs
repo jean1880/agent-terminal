@@ -201,21 +201,33 @@ pub fn pr_state(dir: &Path) -> Result<PrOutcome, String> {
     let remotes: Vec<String> = line(top, &["remote"])
         .map(|r| r.lines().map(str::to_owned).collect())
         .unwrap_or_default();
-    let in_remotes = |r: String| remotes.contains(&r).then_some(r);
     // git's own order: branch.<b>.pushRemote, remote.pushDefault, branch.<b>.remote, origin.
+    // A configured push remote that is not a remote's name (a URL, say) is never replaced by
+    // another repository.
+    for key in [
+        format!("branch.{branch}.pushRemote"),
+        "remote.pushDefault".to_owned(),
+    ] {
+        if let Some(name) = line(top, &["config", "--get", &key]) {
+            if !remotes.contains(&name) {
+                return Ok(PrOutcome::Unavailable(format!(
+                    "{key} is set to \"{name}\", which is not one of this repository's remotes"
+                )));
+            }
+        }
+    }
+    let in_remotes = |r: String| remotes.contains(&r).then_some(r);
+    let tracked_remote = line(
+        top,
+        &["config", "--get", &format!("branch.{branch}.remote")],
+    )
+    .and_then(in_remotes);
     let remote = line(
         top,
         &["config", "--get", &format!("branch.{branch}.pushRemote")],
     )
-    .and_then(in_remotes)
-    .or_else(|| line(top, &["config", "--get", "remote.pushDefault"]).and_then(in_remotes))
-    .or_else(|| {
-        line(
-            top,
-            &["config", "--get", &format!("branch.{branch}.remote")],
-        )
-        .and_then(in_remotes)
-    })
+    .or_else(|| line(top, &["config", "--get", "remote.pushDefault"]))
+    .or_else(|| tracked_remote.clone())
     .or_else(|| remotes.iter().find(|r| *r == "origin").cloned())
     .or_else(|| remotes.first().cloned());
     let Some(remote) = remote else {
@@ -223,28 +235,23 @@ pub fn pr_state(dir: &Path) -> Result<PrOutcome, String> {
             "This repository has no remote to open a pull request on".to_owned(),
         ));
     };
-    let url = line(top, &["remote", "get-url", "--push", "--", &remote])
-        .or_else(|| line(top, &["remote", "get-url", "--", &remote]))
-        .unwrap_or_default();
-    let github = parse_remote(&url);
+    let fetch_url = line(top, &["remote", "get-url", "--", &remote]);
+    let push_url = line(top, &["remote", "get-url", "--push", "--", &remote]);
+    // Remote-tracking refs describe the fetch repository; they say nothing of a different push one.
+    let push_elsewhere = push_url != fetch_url;
+    let github = parse_remote(&push_url.or(fetch_url).unwrap_or_default());
 
-    let upstream = line(
-        top,
-        &[
-            "rev-parse",
-            "--abbrev-ref",
-            "--symbolic-full-name",
-            &format!("{branch}@{{upstream}}"),
-        ],
-    );
+    // The upstream's branch, read from the config exactly (never by splitting `origin/a/b`).
+    let upstream_branch = if tracked_remote.as_deref() == Some(remote.as_str()) {
+        line(top, &["config", "--get", &format!("branch.{branch}.merge")])
+            .and_then(|m| m.strip_prefix("refs/heads/").map(str::to_owned))
+    } else {
+        None
+    };
     let follows_upstream = matches!(
         line(top, &["config", "--get", "push.default"]).as_deref(),
         Some("upstream" | "tracking")
     );
-    let upstream_branch = upstream
-        .as_deref()
-        .and_then(|u| u.strip_prefix(&format!("{remote}/")))
-        .map(str::to_owned);
     let base = line(
         top,
         &[
@@ -271,22 +278,29 @@ pub fn pr_state(dir: &Path) -> Result<PrOutcome, String> {
     // The upstream names the remote branch only when git's push would follow it, and never when
     // that is the base branch of a feature branch: `checkout -b feat origin/main` tracks main.
     let remote_branch = upstream_branch
-        .filter(|u| follows_upstream && (base.as_deref() != Some(u.as_str()) || *u == branch))
+        .filter(|u| {
+            // A differently named destination needs a known base that it is not.
+            follows_upstream && (*u == branch || base.as_deref().is_some_and(|b| b != u))
+        })
         .unwrap_or_else(|| branch.clone());
     // Whether the push target has every commit, judged by its own remote-tracking ref.
-    let push = match line(
-        top,
-        &[
-            "rev-list",
-            "--count",
-            &format!("refs/remotes/{remote}/{remote_branch}..{branch}"),
-        ],
-    )
-    .and_then(|n| n.parse::<u32>().ok())
-    {
-        Some(0) => PushState::UpToDate,
-        Some(n) => PushState::Ahead(n),
-        None => PushState::NoUpstream,
+    let push = if push_elsewhere {
+        PushState::NoUpstream
+    } else {
+        match line(
+            top,
+            &[
+                "rev-list",
+                "--count",
+                &format!("refs/remotes/{remote}/{remote_branch}..{branch}"),
+            ],
+        )
+        .and_then(|n| n.parse::<u32>().ok())
+        {
+            Some(0) => PushState::UpToDate,
+            Some(n) => PushState::Ahead(n),
+            None => PushState::NoUpstream,
+        }
     };
     let uncommitted = line(top, &["status", "--porcelain", "--untracked-files=no"]).is_some();
     Ok(PrOutcome::Ready(PrState {
@@ -595,6 +609,116 @@ mod tests {
             assert_ne!(s.remote_branch, "main");
             assert_eq!(s.remote_branch, "feat");
             assert!(!s.on_base());
+        }
+
+        #[test]
+        fn an_unknown_base_never_lets_the_upstream_name_the_destination() {
+            let Some((_tmp, work)) = new_clone() else {
+                return;
+            };
+            sh(&work, &["remote", "set-head", "origin", "-d"]);
+            sh(
+                &work,
+                &["update-ref", "refs/remotes/origin/develop", "HEAD"],
+            );
+            sh(&work, &["update-ref", "-d", "refs/remotes/origin/main"]);
+            sh(&work, &["checkout", "-q", "-b", "feat", "origin/develop"]);
+            commit_file(&work, "b.txt");
+            sh(&work, &["config", "push.default", "upstream"]);
+            let s = ready(&work);
+            assert_eq!(s.base, None);
+            assert_eq!(s.remote_branch, "feat");
+        }
+
+        #[test]
+        fn a_push_remote_that_is_a_url_is_unavailable() {
+            let Some((_tmp, work)) = new_clone() else {
+                return;
+            };
+            sh(&work, &["switch", "-q", "-c", "feat"]);
+            sh(&work, &["config", "branch.feat.remote", "origin"]);
+            sh(
+                &work,
+                &[
+                    "config",
+                    "branch.feat.pushRemote",
+                    "https://github.com/me/fork.git",
+                ],
+            );
+            assert!(matches!(pr_state(&work), Ok(PrOutcome::Unavailable(_))));
+            sh(&work, &["config", "--unset", "branch.feat.pushRemote"]);
+            sh(&work, &["config", "remote.pushDefault", "nowhere"]);
+            assert!(matches!(pr_state(&work), Ok(PrOutcome::Unavailable(_))));
+        }
+
+        #[test]
+        fn the_upstream_is_read_from_config_not_split_from_its_name() {
+            let Some((tmp, work)) = new_clone() else {
+                return;
+            };
+            let other = tmp.path().join("release.git");
+            fs::create_dir_all(&other).unwrap();
+            sh(&other, &["init", "-q", "--bare"]);
+            // `git remote add` refuses the name, but a hand-edited config can hold it.
+            sh(
+                &work,
+                &[
+                    "config",
+                    "remote.origin/release.url",
+                    other.to_str().unwrap(),
+                ],
+            );
+            sh(&work, &["switch", "-q", "-c", "feat"]);
+            commit_file(&work, "b.txt");
+            sh(
+                &work,
+                &[
+                    "config",
+                    "remote.origin/release.fetch",
+                    "+refs/heads/*:refs/remotes/origin/release/*",
+                ],
+            );
+            sh(
+                &work,
+                &["update-ref", "refs/remotes/origin/release/3.4", "HEAD"],
+            );
+            sh(&work, &["config", "branch.feat.remote", "origin/release"]);
+            sh(&work, &["config", "branch.feat.merge", "refs/heads/3.4"]);
+            sh(&work, &["config", "branch.feat.pushRemote", "origin"]);
+            sh(&work, &["config", "push.default", "upstream"]);
+            let s = ready(&work);
+            assert_eq!(s.remote, "origin");
+            assert_eq!(s.remote_branch, "feat", "the upstream is on another remote");
+
+            sh(&work, &["config", "--unset", "branch.feat.pushRemote"]);
+            let s = ready(&work);
+            assert_eq!(s.remote, "origin/release");
+            assert_eq!(s.remote_branch, "feat", "no base is known on that remote");
+        }
+
+        #[test]
+        fn a_different_push_url_is_never_up_to_date() {
+            let Some((tmp, work)) = new_clone() else {
+                return;
+            };
+            sh(&work, &["switch", "-q", "-c", "feat"]);
+            commit_file(&work, "b.txt");
+            sh(&work, &["update-ref", "refs/remotes/origin/feat", "HEAD"]);
+            assert_eq!(ready(&work).push, PushState::UpToDate);
+            let fork = tmp.path().join("fork.git");
+            fs::create_dir_all(&fork).unwrap();
+            sh(&fork, &["init", "-q", "--bare"]);
+            sh(
+                &work,
+                &[
+                    "remote",
+                    "set-url",
+                    "--push",
+                    "origin",
+                    fork.to_str().unwrap(),
+                ],
+            );
+            assert_ne!(ready(&work).push, PushState::UpToDate);
         }
 
         #[test]
