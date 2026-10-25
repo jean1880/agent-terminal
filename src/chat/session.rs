@@ -436,6 +436,12 @@ struct Inner {
     closing: Cell<bool>,
     /// Bumped by every rollback of a switch's new agent to the old one (`roll_back`).
     rollbacks: Cell<u64>,
+    /// A switch installed its new agent, which has not reported that it started (no session
+    /// or turn yet): what was written for it may go to it, and stays marked until it starts.
+    switch_confirming: Cell<Option<Driver>>,
+    /// That agent rolled back before it started: the marked messages are held, with a notice,
+    /// once they are back in the queue ([`Inner::announce_failed_switch`]).
+    switch_failed: Cell<Option<Driver>>,
     /// Set while [`Inner::suspend`] stops the process: its exit is not the thread's news, so the
     /// adapter's exit envelopes reach neither the view nor the store.
     quiet_exit: Cell<bool>,
@@ -902,6 +908,8 @@ impl ChatSession {
             switch_held: Cell::new(false),
             closing: Cell::new(false),
             rollbacks: Cell::new(0),
+            switch_confirming: Cell::new(None),
+            switch_failed: Cell::new(None),
             quiet_exit: Cell::new(false),
             suspended: Cell::new(false),
             reported: Cell::new(false),
@@ -1003,7 +1011,13 @@ impl ChatSession {
     /// for the thread, or did not go ahead and holds them. Closing the thread would lose them,
     /// so the close asks first, as for an unsent draft.
     pub(crate) fn has_unsent_held(&self) -> bool {
-        self.inner.switch_marked() > 0
+        let starting = self
+            .inner
+            .starting
+            .borrow()
+            .as_ref()
+            .is_some_and(|p| p.prompts.iter().any(|q| q.for_switch));
+        self.inner.switch_marked() > 0 || starting
     }
 
     pub fn shutdown(&self, keep_read: bool) {
@@ -1226,6 +1240,7 @@ impl Inner {
                 *self.rollback.borrow_mut() = None;
                 self.provider_session_up.set(Some(self.generation.get()));
                 self.confirm_carried();
+                self.confirm_switch();
                 self.mark_up();
                 if !native_id.is_empty() {
                     let pt = self.provider_thread.borrow().clone();
@@ -1264,6 +1279,7 @@ impl Inner {
                 // an exit from here on is an ordinary one, not a failed switch.
                 *self.rollback.borrow_mut() = None;
                 self.confirm_carried();
+                self.confirm_switch();
                 self.mark_up();
                 if let Some(m) = model {
                     self.set_model(m);
@@ -1598,6 +1614,38 @@ impl Inner {
     fn switch_went_ahead(&self) {
         self.switch_to.set(None);
         self.release_switch_hold();
+    }
+
+    /// The switch installed its new agent `to`, and started it: what was written for it may
+    /// go to it now, but stays marked until it reports that it started
+    /// ([`Self::confirm_switch`]); a rollback before then holds it ([`Self::roll_back`]).
+    fn switch_installed(&self, to: Driver) {
+        self.switch_to.set(None);
+        self.switch_held.set(false);
+        self.switch_failed.set(None);
+        self.switch_confirming.set(Some(to));
+    }
+
+    /// The new agent of a switch reported that it started (a session or a turn): nothing
+    /// written for it is held any more.
+    fn confirm_switch(&self) {
+        if self.switch_confirming.take().is_some() {
+            self.release_switch_hold();
+        }
+    }
+
+    /// A switch's new agent rolled back before it started: once its marked messages are back
+    /// in the queue (at once, or when its unspawned start gives them back), they are held with
+    /// the notice. Called from both places; says it once.
+    fn announce_failed_switch(&self) {
+        let Some(to) = self.switch_failed.get() else {
+            return;
+        };
+        if self.switch_marked() == 0 {
+            return; // not back yet: the start that never spawned gives them back
+        }
+        self.switch_failed.set(None);
+        self.hold_for_switch(Some(to), "failed");
     }
 
     /// The user wrote again, or the switch went ahead: nothing is held any more.
@@ -2083,6 +2131,8 @@ impl Inner {
                 )
             },
         }));
+        // Among them, any written for a switch whose new agent rolled back: held, and said so.
+        self.announce_failed_switch();
     }
 
     /// A binding taken for a start that ended without a process (refused, failed to spawn, or
@@ -3846,8 +3896,9 @@ impl Inner {
         if self.stopping.get()
             || self.dispatching_queue.get()
             || self.switch_reading.get()
-            // Written for a switch's new agent: sent only once it went ahead or the user acts.
-            || self.switch_marked() > 0
+            // Written for a switch's new agent: sent only to that agent once it is installed
+            // (`switch_confirming`), or once the user acts.
+            || self.switch_marked() > 0 && self.switch_confirming.get().is_none()
             || self.state.borrow().running_turn
         {
             return;
@@ -4561,7 +4612,9 @@ impl Inner {
                 inner.hand_off_to(driver, model, effort, from, &factory, handoff)
             };
             if switched {
-                inner.switch_went_ahead();
+                // Not yet "went ahead": its start may still fail (a hook proof still out, then
+                // a spawn that fails), so the marks stay until the agent reports it started.
+                inner.switch_installed(driver);
             } else {
                 // Failed or rolled back: what was written for the new agent is held, never sent
                 // to the agent the thread is on.
@@ -4760,6 +4813,11 @@ impl Inner {
     /// new agent was owed is withdrawn: the old agent has the history in its own session.
     fn roll_back(self: &Rc<Self>, previous: Previous, reason: &str) {
         self.rollbacks.set(self.rollbacks.get().wrapping_add(1));
+        // What was written for the agent that never started goes to neither: held, with the
+        // notice, once it is back in the queue (here, or as its unspawned start gives it back).
+        if let Some(to) = self.switch_confirming.take() {
+            self.switch_failed.set(Some(to));
+        }
         let failed = self.adapter.borrow().driver().info().long_label;
         let back = previous.driver.info().long_label;
         let factory = self.factory.borrow().clone();
@@ -4818,6 +4876,7 @@ impl Inner {
         // old agent gets them as they were written.
         let carried = self.carried_unsent.take();
         self.keep_unsent_prompts(carried);
+        self.announce_failed_switch();
     }
 
     fn status(&self) -> SessionStatus {

@@ -545,3 +545,111 @@ fn a_close_drops_a_waiting_switch_without_a_notice() {
         assert!(!s.sent_anywhere("for Claude"));
     });
 }
+
+// ---- a new agent whose start is asynchronous: a hooked agy waits for its fresh hook proof ----
+
+/// A factory whose agy is hooked (an approval socket under `dir`) and, if `spawnable` is false,
+/// cannot be spawned; every other agent is an ordinary fake.
+fn hooked_agy_factory(dir: &Path, new_log: &Log, spawnable: bool) -> AdapterFactory {
+    let dir = dir.to_owned();
+    let log = new_log.clone();
+    Rc::new(move |d| {
+        if d != Driver::Agy {
+            return launch_of(FakeAdapter::boxed(d, &log));
+        }
+        let adapter = if spawnable {
+            FakeAdapter::boxed(d, &log)
+        } else {
+            FakeAdapter::unspawnable(d, &log)
+        };
+        let mut launch = launch_of(adapter)?;
+        launch.approval = Ok(bound_handle(&dir));
+        Ok(launch)
+    })
+}
+
+/// A busy Claude switches to a hooked agy; Enter queues a message for agy while the thread is
+/// read. agy's start waits for its fresh hook proof, which fails, and then agy cannot spawn, so
+/// the switch rolls back to Claude after it had seemed to go ahead. The message is held, with
+/// the notice, and never sent to Claude, not even when Claude's turn ends.
+#[test]
+fn a_new_agent_that_fails_after_its_deferred_hook_proof_holds_what_was_written_for_it() {
+    in_loop(|ctx| {
+        set_test_hook_check(std::sync::Arc::new(|_| {
+            std::thread::sleep(Duration::from_millis(200));
+            Err("planted for the test".to_owned())
+        }));
+        let s = slow(Driver::Claude);
+        s.session
+            .set_adapter_factory(hooked_agy_factory(s._tmp.path(), &s.new_log, false));
+        ChatBackend::send_prompt(&*s.session, "the task");
+        assert!(s.session.status().running_turn);
+        s.hold_writer(300);
+        s.session
+            .switch(Driver::Agy, Some("gemini-flash".into()), None);
+        ChatBackend::queue_prompt(&*s.session, "for agy");
+        let failed = format!(
+            "The switch to {} failed, so 1 message",
+            Driver::Agy.info().long_label
+        );
+        assert!(
+            pump_until(ctx, 10, || notice_starting(&s.seen, &failed)),
+            "not held after the rollback: {:?}",
+            s.seen
+                .borrow()
+                .iter()
+                .filter_map(|e| match &e.event {
+                    Event::Notice { text } | Event::Error { message: text } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(s.session.status().driver, Driver::Claude, "rolled back");
+        end_turn(&s.session);
+        assert!(
+            !pump_until(ctx, 1, || s.sent_anywhere("for agy")),
+            "a message for agy went to Claude"
+        );
+        assert!(s.session.has_unsent_held());
+        s.session.shutdown(false);
+    });
+}
+
+/// An idle switch to a hooked agy whose start still waits for its proof: the message written
+/// for agy has gone into that start, and is not in the composer, so closing the thread before
+/// agy reports that it started must ask.
+#[test]
+fn a_message_in_a_new_agents_unproven_start_still_asks_before_closing() {
+    in_loop(|ctx| {
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let wait = std::sync::Mutex::new(wait);
+        set_test_hook_check(std::sync::Arc::new(move |_| {
+            let _ = wait
+                .lock()
+                .expect("lock")
+                .recv_timeout(Duration::from_secs(10));
+            Ok(())
+        }));
+        let s = slow(Driver::Claude);
+        s.session
+            .set_adapter_factory(hooked_agy_factory(s._tmp.path(), &s.new_log, true));
+        s.hold_writer(200);
+        s.session
+            .switch(Driver::Agy, Some("gemini-flash".into()), None);
+        ChatBackend::send_prompt(&*s.session, "for agy");
+        assert!(
+            pump_until(ctx, 5, || s.session.status().driver == Driver::Agy
+                && s.session.inner.queued_prompts.borrow().is_empty()),
+            "the message never went to agy's start"
+        );
+        // No turn has started (the page's own `running`, which the close reads, is still
+        // false): only the held message makes the close ask.
+        assert!(!has(&s.seen, |e| matches!(e, Event::TurnStarted { .. })));
+        assert!(
+            s.session.has_unsent_held(),
+            "a close before agy started would lose the message unasked"
+        );
+        let _ = release.send(());
+        s.session.shutdown(false);
+    });
+}
