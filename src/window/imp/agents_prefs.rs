@@ -114,6 +114,14 @@ impl EditDebounce {
         *self.pending.borrow_mut() = Some(std::boxed::Box::new(then));
     }
 
+    /// The row's window became active (`true`) or stopped being so: a held edit commits when
+    /// the window loses focus, so a valid edit left in a focused row survives a crash.
+    fn window_focus_changed(&self, active: bool) {
+        if !active {
+            self.flush();
+        }
+    }
+
     fn schedule(self: &Rc<Self>, then: impl FnOnce() + 'static) {
         self.cancel();
         *self.pending.borrow_mut() = Some(std::boxed::Box::new(then));
@@ -2002,6 +2010,52 @@ impl AgentTerminalWindow {
         let focus = gtk4::EventControllerFocus::new();
         focus.connect_leave(move |_| commit_now());
         args.add_controller(focus);
+        // The window the row is in (the app's, or the dialog's own when it floats) losing focus
+        // commits too, and writes the config at once: a valid edit left in a focused row is not
+        // lost if the app is then killed. Followed while the row is mapped.
+        type WindowWatch = Option<(glib::WeakRef<gtk4::Window>, glib::SignalHandlerId)>;
+        let window_watch: Rc<RefCell<WindowWatch>> = Rc::default();
+        args.connect_map(glib::clone!(
+            #[weak]
+            obj,
+            #[strong]
+            args_timer,
+            #[strong]
+            window_watch,
+            move |row| {
+                let Some(window) = row.root().and_downcast::<gtk4::Window>() else {
+                    return;
+                };
+                let id = window.connect_is_active_notify(glib::clone!(
+                    #[weak]
+                    obj,
+                    #[strong]
+                    args_timer,
+                    move |window| {
+                        args_timer.window_focus_changed(window.is_active());
+                        if !window.is_active() {
+                            obj.imp().flush_pending_save();
+                        }
+                    }
+                ));
+                if let Some((old, old_id)) = window_watch.replace(Some((window.downgrade(), id))) {
+                    if let Some(old) = old.upgrade() {
+                        old.disconnect(old_id);
+                    }
+                }
+            }
+        ));
+        args.connect_unmap(glib::clone!(
+            #[strong]
+            window_watch,
+            move |_| {
+                if let Some((window, id)) = window_watch.take() {
+                    if let Some(window) = window.upgrade() {
+                        window.disconnect(id);
+                    }
+                }
+            }
+        ));
         group.add(&args);
         group.add(&args_error);
 
@@ -2726,6 +2780,25 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn a_held_edit_commits_when_its_window_loses_focus() {
+        let commits = Rc::new(std::cell::Cell::new(0));
+        let timer = EditDebounce::default();
+        let seen = commits.clone();
+        timer.hold(move || seen.set(seen.get() + 1));
+        timer.window_focus_changed(true);
+        assert_eq!(
+            commits.get(),
+            0,
+            "the window becoming active commits nothing"
+        );
+        // The user switches to another app with the valid edit still in the focused row.
+        timer.window_focus_changed(false);
+        assert_eq!(commits.get(), 1, "the edit was left uncommitted");
+        timer.window_focus_changed(false);
+        assert_eq!(commits.get(), 1);
+    }
+
+    #[test]
     fn a_held_commit_runs_only_on_flush_and_an_invalid_edit_drops_it() {
         let commits = Rc::new(std::cell::Cell::new(0));
         let timer = EditDebounce::default();
@@ -2961,6 +3034,10 @@ pub(super) mod tests {
                 .iter()
                 .find(|row| row.title() == title)
                 .expect("entry row");
+            if title == "Extra Arguments" {
+                // It saves only on commit, so the commit must be visible.
+                assert!(field.shows_apply_button(), "no apply button on {title}");
+            }
             let original = field.text();
             field.set_text(bad);
             assert!(field.has_css_class("error"));
