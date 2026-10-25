@@ -2500,8 +2500,7 @@ fn the_thinking_retry_never_replays_news_given_back_by_a_live_message() {
             "the kept copy is the user's own text"
         );
 
-        assert!(pump_until(ctx, 10, || prompts()
-            .contains("steered before init")));
+        assert!(pump_until(ctx, 10, || prompts().contains("steered before init")));
         assert!(!prompts().contains("held news"), "{}", prompts());
         assert_eq!(notices(), 0);
         session.shutdown(false);
