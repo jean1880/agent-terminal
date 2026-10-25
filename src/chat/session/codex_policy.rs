@@ -335,13 +335,7 @@ pub(super) fn judge_check(check: &Check) -> Verdict {
                 if let Some(p) = path {
                     f.reaches(Path::new(p), &homes_known, &codex_known, false);
                 }
-                let place = match name {
-                    "temp" => "the temp folder",
-                    "slash_tmp" => "/tmp",
-                    "minimal" => "system libraries",
-                    "root" => "the whole filesystem",
-                    _ => "a place",
-                };
+                let place = crate::chat::view::permission::special_words(name).unwrap_or("a place");
                 f.scope(format!("{place} is a place Codex resolves itself"));
                 continue;
             }

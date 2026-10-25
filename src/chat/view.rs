@@ -30,7 +30,7 @@ pub(crate) mod markdown;
 pub mod model;
 mod panels;
 mod payload;
-mod permission;
+pub(crate) mod permission;
 mod quick_replies;
 mod subagent_shelf;
 mod subagents;
