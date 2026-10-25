@@ -750,6 +750,9 @@ fn process(store: &Store, shared: &Shared, ops: Vec<Op>, stop: &mut Vec<Sender<(
             }
             Op::Barrier(done) => {
                 wrote |= commit(store, shared, &mut writes);
+                // What its streams hold, for a hand-off read on another connection once this
+                // barrier answers (`Store::transcript_messages`).
+                store.publish_held();
                 let _ = done.send(());
             }
             Op::Shutdown(done) => {
@@ -1792,6 +1795,94 @@ mod tests {
         let check = Store::open(&path).expect("open");
         let all = serde_json::to_string(&check.events(&t, None, 100).expect("ev")).expect("json");
         assert!(!all.contains(a) && !all.contains(b), "{all}");
+    }
+
+    /// A hand-off reads the transcript through the handle while the writer still holds the
+    /// unfinished line: the read has it, redacted, from the reader's connection too.
+    #[test]
+    fn a_read_mid_turn_has_the_unfinished_line_redacted() {
+        let (_dir, path, handle) = setup();
+        let t = create(&handle);
+        let secret = format!("ghp_{}", "abcdefghijklmnopqrstuvwxyz0123");
+        let line = format!("the key is {}", &secret[..24]);
+        for env in [
+            Envelope::new(Event::ItemStarted {
+                kind: ItemKind::AssistantMessage,
+                title: String::new(),
+                input: None,
+                parent: None,
+            })
+            .item("a1"),
+            Envelope::new(Event::ContentDelta {
+                stream: StreamKind::Assistant,
+                text: line.clone(),
+            })
+            .item("a1"),
+        ] {
+            handle.append_event(&t, None, &env).expect("queued");
+        }
+        // The part still being judged (the token) shows as the placeholder, never as text.
+        let expected = format!("the key is {}", crate::store::HELD_PLACEHOLDER);
+        let read = handle
+            .read(|s| s.transcript_messages(&t))
+            .expect("caught up")
+            .expect("msgs");
+        assert_eq!(read[0].text, expected);
+        // A worker's own connection, after a barrier, reads the same.
+        assert!(handle
+            .writer()
+            .expect("writer")
+            .flush(Duration::from_secs(10)));
+        let other = Store::open(&path).expect("open");
+        assert_eq!(
+            other.transcript_messages(&t).expect("msgs")[0].text,
+            expected
+        );
+        assert!(
+            !serde_json::to_string(&other.events(&t, None, 10).expect("ev"))
+                .expect("json")
+                .contains(&secret[..12])
+        );
+    }
+
+    /// A delta committed after the barrier that published the held text (the rest of the same
+    /// line) does not erase it: a read still shows the line in progress.
+    #[test]
+    fn a_write_after_a_barrier_keeps_the_held_line_in_a_read() {
+        let (_dir, path, handle) = setup();
+        let writer = handle.writer().expect("writer").clone();
+        let t = create(&handle);
+        let delta = |text: &str| {
+            Envelope::new(Event::ContentDelta {
+                stream: StreamKind::Assistant,
+                text: text.into(),
+            })
+            .item("a1")
+        };
+        let start = Envelope::new(Event::ItemStarted {
+            kind: ItemKind::AssistantMessage,
+            title: String::new(),
+            input: None,
+            parent: None,
+        })
+        .item("a1");
+        handle.append_event(&t, None, &start).expect("queued");
+        handle
+            .append_event(&t, None, &delta("hello wor"))
+            .expect("queued");
+        assert!(writer.flush(Duration::from_secs(10)), "barrier");
+        handle.append_event(&t, None, &delta("ld")).expect("queued");
+        // Committed with no barrier after it: a job's answer comes once its batch commits.
+        writer
+            .call("wait", |_| ())
+            .recv_timeout(Duration::from_secs(10))
+            .expect("committed");
+        let other = Store::open(&path).expect("open");
+        let text = other.transcript_messages(&t).expect("msgs")[0].text.clone();
+        assert!(
+            text == "hello world" || text == "hello …",
+            "the held line was lost: {text:?}"
+        );
     }
 
     #[test]
