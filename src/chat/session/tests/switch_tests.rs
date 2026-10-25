@@ -359,3 +359,189 @@ fn a_switch_on_a_long_thread_never_holds_the_main_loop() {
         s.session.shutdown(false);
     });
 }
+
+// ---- the composer's own paths: steer_prompt and queue_prompt ----
+
+fn steered(log: &Log, needle: &str) -> bool {
+    log.borrow()
+        .iter()
+        .any(|c| matches!(c, Command::Steer { text } if text.contains(needle)))
+}
+
+fn end_turn(session: &ChatSession) {
+    session.inner.emit(Envelope::new(Event::TurnCompleted {
+        state: TurnState::Completed,
+        error: None,
+        usage: None,
+        cost_usd: None,
+    }));
+}
+
+fn notice_starting(seen: &Seen, start: &str) -> bool {
+    has(
+        seen,
+        |e| matches!(e, Event::Notice { text } if text.starts_with(start)),
+    )
+}
+
+/// The composer's mid-turn path to an agent that takes live input (`steer_prompt`): while a
+/// switch waits, the message is for the new agent and is never written into the outgoing one,
+/// even in dangerous permissive mode; when the switch is cancelled or fails it is held.
+#[test]
+fn a_message_steered_while_a_switch_waits_never_reaches_the_outgoing_agent() {
+    for fails in [false, true] {
+        in_loop(|ctx| {
+            let s = slow(Driver::Claude);
+            s.session.confirm_mode(Mode::Bypass);
+            ChatBackend::send_prompt(&*s.session, "the task");
+            assert!(s.session.status().running_turn);
+            if fails {
+                s.session
+                    .set_adapter_factory(Rc::new(|_| Err("agy is not ready".into())));
+            }
+            s.hold_writer(300);
+            s.session
+                .switch(Driver::Agy, Some("gemini-flash".into()), None);
+            ChatBackend::steer_prompt(&*s.session, "for agy");
+            assert!(
+                !steered(&s.log, "for agy"),
+                "steered into Claude (fails: {fails})"
+            );
+            if !fails {
+                ChatBackend::interrupt(&*s.session);
+            }
+            let start = if fails {
+                "The switch to Antigravity failed, so 1 message"
+            } else {
+                "The switch to Antigravity was cancelled, so 1 message"
+            };
+            let label = Driver::Agy.info().long_label;
+            let start = start.replace("Antigravity", label);
+            assert!(
+                pump_until(ctx, 5, || notice_starting(&s.seen, &start)),
+                "not held (fails: {fails})"
+            );
+            end_turn(&s.session);
+            assert!(!pump_until(ctx, 1, || steered(&s.log, "for agy")
+                || prompts(&s.log).iter().any(|p| p.contains("for agy"))));
+            assert!(s.session.has_unsent_held(), "a close would lose it");
+            s.session.shutdown(false);
+        });
+    }
+}
+
+/// The composer's path for a busy agent without live input (`queue_prompt`): a message queued
+/// while a switch waits is the new agent's, and is held if the switch does not happen, not sent
+/// to the old agent when its turn ends. The same for a failed busy model switch on one agent.
+#[test]
+fn a_message_queued_while_a_switch_waits_is_held_if_the_switch_does_not_happen() {
+    use agent_kit::store_writer::Shutdown;
+    for same_agent in [false, true] {
+        in_loop(|ctx| {
+            let s = slow(if same_agent {
+                Driver::Claude
+            } else {
+                Driver::Agy
+            });
+            ChatBackend::send_prompt(&*s.session, "the task");
+            assert!(s.session.status().running_turn);
+            if same_agent {
+                assert_eq!(s.writer.shutdown(Duration::from_secs(5)), Shutdown::Drained);
+                s.session.switch(Driver::Claude, Some("opus".into()), None);
+            } else {
+                s.hold_writer(300);
+                s.session.switch(Driver::Claude, Some("opus".into()), None);
+            }
+            ChatBackend::queue_prompt(&*s.session, "for the new one");
+            if same_agent {
+                assert!(
+                    pump_until(ctx, 5, || failed_notice(&s)),
+                    "a failed model switch did not hold it"
+                );
+            } else {
+                ChatBackend::interrupt(&*s.session);
+                assert!(s.cancelled_notice(), "a cancelled switch did not hold it");
+            }
+            end_turn(&s.session);
+            assert!(
+                !pump_until(ctx, 1, || s.sent_anywhere("for the new one")),
+                "the old agent got it when its turn ended (same agent: {same_agent})"
+            );
+            s.session.shutdown(false);
+        });
+    }
+}
+
+/// A new agent that cannot even be spawned rolls back to the old one at once: that switch
+/// failed, so what was written for the new agent is held, not drained to the old one.
+#[test]
+fn a_switch_whose_new_agent_cannot_spawn_holds_what_was_written_for_it() {
+    in_loop(|ctx| {
+        let s = slow(Driver::Agy);
+        let new_log = s.new_log.clone();
+        s.session.set_adapter_factory(Rc::new(move |d| {
+            launch_of(FakeAdapter::unspawnable(d, &new_log))
+        }));
+        s.hold_writer(300);
+        s.session.switch(Driver::Claude, Some("opus".into()), None);
+        ChatBackend::send_prompt(&*s.session, "for Claude");
+        assert!(
+            pump_until(ctx, 5, || failed_notice(&s)),
+            "the rollback was taken for a switch that went ahead"
+        );
+        assert_eq!(s.session.status().driver, Driver::Agy, "rolled back");
+        assert!(
+            !pump_until(ctx, 1, || s.sent_anywhere("for Claude")),
+            "drained to agy: {:?}",
+            prompts(&s.log)
+        );
+        s.session.shutdown(false);
+    });
+}
+
+/// Held messages count as unsent for the close (`has_unsent_held`), and a later message from
+/// the user, steered mid-turn, releases them like a send: they then go as usual.
+#[test]
+fn held_messages_block_a_silent_close_and_a_steer_releases_them() {
+    in_loop(|ctx| {
+        let s = slow(Driver::Claude);
+        ChatBackend::send_prompt(&*s.session, "the task");
+        s.hold_writer(300);
+        s.session
+            .switch(Driver::Agy, Some("gemini-flash".into()), None);
+        ChatBackend::queue_prompt(&*s.session, "written for agy");
+        assert!(s.session.has_unsent_held(), "unsent while the switch waits");
+        ChatBackend::interrupt(&*s.session);
+        assert!(s.session.has_unsent_held(), "held after the cancel");
+        // The user writes again mid-turn: the hold ends, the steer goes live.
+        ChatBackend::steer_prompt(&*s.session, "carry on");
+        assert!(steered(&s.log, "carry on"));
+        assert!(!s.session.has_unsent_held());
+        end_turn(&s.session);
+        assert!(
+            pump_until(ctx, 5, || s.sent_anywhere("written for agy")),
+            "the released message never went"
+        );
+        s.session.shutdown(false);
+    });
+}
+
+/// Closing the thread drops a waiting switch without a "cancelled" notice: the close is not
+/// news (it asked first about what was held).
+#[test]
+fn a_close_drops_a_waiting_switch_without_a_notice() {
+    in_loop(|ctx| {
+        let s = slow(Driver::Agy);
+        s.hold_writer(300);
+        s.session.switch(Driver::Claude, Some("opus".into()), None);
+        ChatBackend::send_prompt(&*s.session, "for Claude");
+        ChatBackend::queue_prompt(&*s.session, "and this");
+        s.session.shutdown(false);
+        pump_until(ctx, 1, || false);
+        assert!(
+            !notice_starting(&s.seen, "The switch to Claude"),
+            "a close posted a cancelled-switch notice"
+        );
+        assert!(!s.sent_anywhere("for Claude"));
+    });
+}
