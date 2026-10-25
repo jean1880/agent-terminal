@@ -256,6 +256,12 @@ fn read_capped(path: &Path, max: usize) -> Option<Vec<u8>> {
     if !std::fs::metadata(path).ok()?.is_file() {
         return None;
     }
+    #[cfg(test)]
+    tests::BEFORE_OPEN.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook();
+        }
+    });
     // `O_NONBLOCK` and a re-check of the opened handle close the swap between the two.
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -830,6 +836,66 @@ mod tests {
         let got = rx
             .recv_timeout(Duration::from_secs(5))
             .expect("read_capped blocked on a FIFO");
+        assert_eq!(got, None);
+    }
+
+    thread_local! {
+        /// Runs between `read_capped`'s file check and its open, to swap the path.
+        pub(super) static BEFORE_OPEN: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    fn mkfifo(path: &Path) -> bool {
+        std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    fn returns_without_blocking(
+        job: impl FnOnce() -> Option<Vec<u8>> + Send + 'static,
+    ) -> Option<Vec<u8>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(job());
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("read_capped blocked")
+    }
+
+    #[test]
+    fn a_symlink_to_a_fifo_is_skipped_not_waited_on() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let fifo = dir.path().join("pipe");
+        if !mkfifo(&fifo) {
+            return;
+        }
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&fifo, &link).expect("link");
+        assert_eq!(
+            returns_without_blocking(move || read_capped(&link, editdiff::MAX_SIDE_BYTES)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_file_swapped_for_a_fifo_after_the_check_is_not_waited_on() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("f");
+        std::fs::write(&path, "x\n").expect("file");
+        if !mkfifo(&dir.path().join("probe")) {
+            return;
+        }
+        let swap = path.clone();
+        let got = returns_without_blocking(move || {
+            BEFORE_OPEN.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    std::fs::remove_file(&swap).expect("rm");
+                    assert!(mkfifo(&swap));
+                }));
+            });
+            read_capped(&path, editdiff::MAX_SIDE_BYTES)
+        });
         assert_eq!(got, None);
     }
 

@@ -214,9 +214,18 @@ impl DiffSource for ThreadDiffs {
                 return;
             };
             let name = tool.name.clone();
+            // Resolving `dir` touches the filesystem, so it runs on a worker.
+            let path =
+                match off_main("resolving the path", move || Ok(path_to_open(&dir, &path))).await {
+                    Ok(path) => path,
+                    Err(why) => {
+                        (me.toast)(&why);
+                        return;
+                    }
+                };
             let request = OpenRequest {
                 toplevel: base.toplevel.clone(),
-                path: path_to_open(&dir, &path),
+                path,
                 old_rev: base.rev.clone(),
                 new_side: NewSide::Working,
             };
