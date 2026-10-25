@@ -5925,15 +5925,8 @@ impl AgentTerminalWindow {
             PushState::UpToDate => String::new(),
         };
         let body = format!(
-            "{what}\n\ngit push{} {} {}:{}\n\nThe push is never forced.{}",
-            if state.push == PushState::NoUpstream {
-                " --set-upstream"
-            } else {
-                ""
-            },
-            state.remote,
-            state.branch,
-            state.remote_branch,
+            "{what}\n\ngit {}\n\nThe push is never forced.{}",
+            agent_kit::github::push_args(&state).join(" "),
             if state.uncommitted {
                 " Uncommitted changes stay here and are not part of the pull request."
             } else {

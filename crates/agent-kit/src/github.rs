@@ -10,6 +10,11 @@
 //! - The pull request opens on the repository of the branch's push remote. A fork workflow
 //!   (push to `origin`, open against `upstream`) gets the fork's own compare page, where GitHub
 //!   offers to switch the base repository.
+//! - The base is read from remote-tracking refs, never from the network. When a remote has no
+//!   `HEAD` and no `main`/`master` ref, it stays unknown and only the destination rules (never a
+//!   differently named branch) protect it. A repository reached by two different SSH host aliases
+//!   reads as two repositories, so its push state is `Unknown` and a default-named branch is
+//!   refused.
 //! - Only `github.com`, GitHub Enterprise Cloud (`*.ghe.com`) and hosts named `github.*` are
 //!   recognised. An SSH host alias (`github-work:o/r`) is not read through `~/.ssh/config`.
 
@@ -257,10 +262,21 @@ pub fn pr_state(dir: &Path) -> Result<PrOutcome, String> {
         ));
     };
     let fetch_url = line(top, &["remote", "get-url", "--", &remote]);
-    let push_url = line(top, &["remote", "get-url", "--push", "--", &remote]);
-    // Remote-tracking refs describe the fetch repository; they say nothing of a different push one.
-    let push_elsewhere = push_url != fetch_url;
-    let github = parse_remote(&push_url.or(fetch_url).unwrap_or_default());
+    // A push goes to every push URL, so all of them are read.
+    let push_urls: Vec<String> = line(
+        top,
+        &["remote", "get-url", "--push", "--all", "--", &remote],
+    )
+    .map(|u| u.lines().map(str::to_owned).collect())
+    .unwrap_or_default();
+    // Remote-tracking refs describe the fetch repository; they say nothing of a different push
+    // one. The same repository over another scheme (https fetch, ssh push) is not a different one.
+    let fetch_identity = fetch_url.as_deref().map(repo_identity);
+    let push_elsewhere = push_urls.len() > 1
+        || push_urls
+            .first()
+            .is_some_and(|p| Some(repo_identity(p)) != fetch_identity);
+    let github = parse_remote(push_urls.first().or(fetch_url.as_ref()).map_or("", |s| s));
 
     // The upstream's branch, read from the config exactly (never by splitting `origin/a/b`).
     let upstream_branch = if tracked_remote.as_deref() == Some(remote.as_str()) {
@@ -298,7 +314,18 @@ pub fn pr_state(dir: &Path) -> Result<PrOutcome, String> {
     });
     // The remote-tracking refs describe the fetch repository: when the push goes elsewhere, the
     // base read from them is not the push repository's, so it is unknown.
+    let fetch_base = base.clone();
     let base = if push_elsewhere { None } else { base };
+    // With the push repository's base unknown, a branch that is, or is named like, a default
+    // branch could be pushed straight onto it. No request is made to find out.
+    if push_elsewhere
+        && (fetch_base.as_deref() == Some(branch.as_str())
+            || ["main", "master", "trunk", "develop"].contains(&branch.as_str()))
+    {
+        return Ok(PrOutcome::Unavailable(
+            "Can't tell this repository's base branch; push from a feature branch".to_owned(),
+        ));
+    }
     // The upstream names the remote branch only when git's push would follow it, and never when
     // that is the base branch of a feature branch: `checkout -b feat origin/main` tracks main.
     let remote_branch = upstream_branch
@@ -342,6 +369,31 @@ pub fn pr_state(dir: &Path) -> Result<PrOutcome, String> {
     }))
 }
 
+/// The arguments of the `git` command [`push_branch`] runs, and the one a confirmation shows:
+/// never forced, with the fully qualified refspec. Only a branch with no upstream gets one
+/// (`pr_state` reports a tracked branch as `Unknown`).
+pub fn push_args(state: &PrState) -> Vec<String> {
+    let mut args = vec!["push".to_owned()];
+    if state.push == PushState::NoUpstream {
+        args.push("--set-upstream".to_owned());
+    }
+    args.push(state.remote.clone());
+    args.push(format!(
+        "refs/heads/{}:refs/heads/{}",
+        state.branch, state.remote_branch
+    ));
+    args
+}
+
+/// A repository's identity from its URL: `host/owner/name` for a GitHub one, whatever the scheme
+/// (https, ssh, scp-style) or `.git` suffix; the trimmed URL otherwise.
+fn repo_identity(url: &str) -> String {
+    match parse_remote(url) {
+        Some(r) => format!("{}/{}", r.host, r.slug()).to_ascii_lowercase(),
+        None => url.trim().to_owned(),
+    }
+}
+
 /// Pushes `state`'s branch to its remote, never forced. A branch with no upstream gets one
 /// (`--set-upstream`); one with an upstream pushes to it. Blocking. Git's own message on failure,
 /// with anything secret-shaped in it masked.
@@ -353,16 +405,8 @@ pub fn push_branch(dir: &Path, state: &PrState) -> Result<(), String> {
     ] {
         crate::worktree::precheck_name(name, what)?;
     }
-    let refspec = format!(
-        "refs/heads/{}:refs/heads/{}",
-        state.branch, state.remote_branch
-    );
-    let mut args = vec!["push"];
-    // Only a branch with no upstream gets one; `pr_state` reports a tracked branch as `Unknown`.
-    if state.push == PushState::NoUpstream {
-        args.push("--set-upstream");
-    }
-    args.extend([state.remote.as_str(), refspec.as_str()]);
+    let args = push_args(state);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
     git_raw(dir, &args, &[], PUSH_TIMEOUT_SECS)
         .map(|_| ())
         .map_err(|why| agent_core::redact::redact(&why))
@@ -803,6 +847,94 @@ mod tests {
             assert_eq!(s.branch, "main");
             assert_eq!(s.remote_branch, "topic");
             assert!(!s.on_base());
+        }
+
+        /// Points `origin` at GitHub: fetched over https, pushed over each of `pushes`.
+        fn github_origin(work: &Path, pushes: &[&str]) {
+            sh(
+                work,
+                &["remote", "set-url", "origin", "https://github.com/o/r.git"],
+            );
+            for (i, p) in pushes.iter().enumerate() {
+                let add: &[&str] = if i == 0 {
+                    &["remote", "set-url", "--push", "origin", p]
+                } else {
+                    &["remote", "set-url", "--add", "--push", "origin", p]
+                };
+                sh(work, add);
+            }
+        }
+
+        #[test]
+        fn https_fetch_and_ssh_push_of_one_repository_keep_the_base() {
+            let Some((_tmp, work)) = new_clone() else {
+                return;
+            };
+            github_origin(&work, &["git@github.com:o/r.git"]);
+            let s = ready(&work);
+            assert_eq!(s.base.as_deref(), Some("main"));
+            assert!(s.on_base(), "main is the base, so the action is off");
+        }
+
+        #[test]
+        fn a_different_push_repository_refuses_a_default_named_branch_only() {
+            let Some((tmp, work)) = new_clone() else {
+                return;
+            };
+            let fork = tmp.path().join("fork.git");
+            fs::create_dir_all(&fork).unwrap();
+            sh(&fork, &["init", "-q", "--bare"]);
+            sh(
+                &work,
+                &[
+                    "remote",
+                    "set-url",
+                    "--push",
+                    "origin",
+                    fork.to_str().unwrap(),
+                ],
+            );
+            assert!(matches!(pr_state(&work), Ok(PrOutcome::Unavailable(_))));
+            sh(&work, &["switch", "-q", "-c", "feat"]);
+            assert_eq!(ready(&work).remote_branch, "feat");
+        }
+
+        #[test]
+        fn every_push_url_counts() {
+            let Some((_tmp, work)) = new_clone() else {
+                return;
+            };
+            sh(&work, &["switch", "-q", "-c", "feat"]);
+            commit_file(&work, "b.txt");
+            sh(&work, &["update-ref", "refs/remotes/origin/feat", "HEAD"]);
+            github_origin(
+                &work,
+                &["https://github.com/o/r.git", "git@github.com:o/r.git"],
+            );
+            let s = ready(&work);
+            assert_eq!(s.push, PushState::Unknown);
+            assert_eq!(s.base, None);
+        }
+
+        #[test]
+        fn the_confirmation_and_the_push_share_one_command() {
+            let mut s = super::state(PushState::NoUpstream);
+            s.branch = "feat".into();
+            s.remote_branch = "topic".into();
+            assert_eq!(
+                push_args(&s),
+                [
+                    "push",
+                    "--set-upstream",
+                    "origin",
+                    "refs/heads/feat:refs/heads/topic"
+                ]
+            );
+            s.push = PushState::Unknown;
+            assert_eq!(
+                push_args(&s),
+                ["push", "origin", "refs/heads/feat:refs/heads/topic"]
+            );
         }
 
         #[test]
