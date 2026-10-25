@@ -12,6 +12,7 @@ pub fn run_command(
     timeout_secs: u64,
 ) -> Result<std::process::Output, String> {
     use std::io::Read;
+    use std::os::fd::AsRawFd;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -33,7 +34,8 @@ pub fn run_command(
     //
     // Once this function returns (by any path) `StopOnDrop` raises `stop`, and
     // a drain that wakes up for more output drops its pipe and exits instead
-    // of buffering a surviving job's output without bound.
+    // of buffering a surviving job's output without bound. The drain polls its
+    // pipe in 100 ms slices, so it sees `stop` even when the job never writes.
     struct StopOnDrop(Arc<AtomicBool>);
     impl Drop for StopOnDrop {
         fn drop(&mut self) {
@@ -43,15 +45,38 @@ pub fn run_command(
     let stop = Arc::new(AtomicBool::new(false));
     let _stop_on_return = StopOnDrop(Arc::clone(&stop));
     type Drained = (Arc<Mutex<Vec<u8>>>, mpsc::Receiver<()>);
-    let drain = |pipe: Option<Box<dyn Read + Send>>| -> Drained {
+    let drain = |pipe: Option<(Box<dyn Read + Send>, i32)>| -> Drained {
         let buffer = Arc::new(Mutex::new(Vec::new()));
         let (done, finished) = mpsc::channel();
         let sink = Arc::clone(&buffer);
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
-            if let Some(mut pipe) = pipe {
+            if let Some((mut pipe, fd)) = pipe {
                 let mut chunk = [0u8; 8192];
                 loop {
+                    // Wait for output in short slices so a pipe a descendant
+                    // holds open without writing still sees `stop`.
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let mut pfd = libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    // SAFETY: `pfd` is a valid, live pollfd and `fd` stays
+                    // open while `pipe` (owned by this thread) is alive.
+                    let ready = unsafe { libc::poll(&mut pfd, 1, 100) };
+                    if ready == 0 {
+                        continue;
+                    }
+                    if ready < 0 {
+                        if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                        {
+                            continue;
+                        }
+                        break;
+                    }
                     match pipe.read(&mut chunk) {
                         Ok(0) | Err(_) => break,
                         Ok(_) if stop.load(Ordering::Relaxed) => break,
@@ -71,13 +96,15 @@ pub fn run_command(
         child
             .stdout
             .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+            .map(|p| (p.as_raw_fd(), Box::new(p) as Box<dyn Read + Send>))
+            .map(|(fd, p)| (p, fd)),
     );
     let stderr = drain(
         child
             .stderr
             .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+            .map(|p| (p.as_raw_fd(), Box::new(p) as Box<dyn Read + Send>))
+            .map(|(fd, p)| (p, fd)),
     );
 
     let deadline = Instant::now() + Duration::from_secs(timeout_secs.max(1));
@@ -119,29 +146,32 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    /// A background job outlives the command and keeps writing into its
-    /// stdout. After `run_command` returns, the drain must let go of the pipe
-    /// (the job's next write then fails) instead of buffering the rest forever.
+    /// A background job outlives the command, holds its stdout open and stays
+    /// silent until the test says go (a file created only after `run_command`
+    /// returned). The drain must then have let go of the pipe, so the job's
+    /// write fails. Nothing depends on how fast the processes run: the job
+    /// writes nothing before the signal, and its wait and retries are bounded.
     #[test]
-    fn a_leftover_background_writer_is_not_drained_after_return() {
+    fn a_silent_background_holder_is_released_after_return() {
         let dir = tempfile::tempdir().unwrap();
+        let go = dir.path().join("go");
         let marker = dir.path().join("pipe-closed");
-        // The writer is bounded by itself: at most 100 x 64 KiB over ~5 s. It
-        // ignores SIGPIPE so a closed pipe shows up as a failed write.
         let script = format!(
-            "( trap '' PIPE; i=0; while [ $i -lt 100 ]; do \
-               head -c 65536 /dev/zero || {{ touch '{}'; exit 0; }}; \
+            "( trap '' PIPE; i=0; \
+               while [ ! -e '{go}' ] && [ $i -lt 500 ]; do sleep 0.02; i=$((i+1)); done; \
+               i=0; while [ $i -lt 100 ]; do \
+               head -c 1 /dev/zero || {{ touch '{marker}'; exit 0; }}; \
                sleep 0.05; i=$((i+1)); done ) & echo hi",
-            marker.display()
+            go = go.display(),
+            marker = marker.display()
         );
         let mut cmd = std::process::Command::new("sh");
         cmd.arg("-c").arg(script);
         let out = run_command(cmd, "sh", 10).unwrap();
-        assert_eq!(
-            String::from_utf8_lossy(&out.stdout).trim_start()[..2],
-            *"hi"
-        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "hi\n");
 
+        // Only now may the job write.
+        std::fs::write(&go, "").unwrap();
         let deadline = Instant::now() + Duration::from_secs(8);
         while !marker.exists() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
