@@ -128,6 +128,30 @@ impl EditDebounce {
     }
 }
 
+/// What an agent's Detected row last found for the saved command, shared with its Enabled row
+/// so the two rows never contradict each other ([`enabled_subtitle`]).
+#[derive(Default)]
+struct DetectedLink {
+    /// `None` while a check runs.
+    detected: RefCell<Option<Result<String, String>>>,
+    /// Redraws the Enabled row; gone once its dialog closed.
+    refresh: RefCell<Option<std::rc::Weak<dyn Fn()>>>,
+}
+
+impl DetectedLink {
+    fn set(&self, found: Option<Result<String, String>>) {
+        *self.detected.borrow_mut() = found;
+        let refresh = self
+            .refresh
+            .borrow()
+            .as_ref()
+            .and_then(std::rc::Weak::upgrade);
+        if let Some(refresh) = refresh {
+            refresh();
+        }
+    }
+}
+
 impl Drop for EditDebounce {
     fn drop(&mut self) {
         self.flush();
@@ -1485,7 +1509,8 @@ impl AgentTerminalWindow {
             .title(driver.info().long_label)
             .description(format!("Profile “{}”", profile.name))
             .build();
-        group.add(&self.agent_enabled_row(driver, dialog.upcast_ref()));
+        let (enabled, detected) = self.agent_enabled_row_linked(driver, dialog.upcast_ref());
+        group.add(&enabled);
         group.add(&self.agent_account_row(driver, dialog.upcast_ref()));
         let subtitle = if driver == Driver::Agy {
             "This agent only (the switch under Cross-agent delegation sets every agent). Turning it on reviews Antigravity's managed registration; turning it off offers to remove it."
@@ -1511,7 +1536,7 @@ impl AgentTerminalWindow {
             }
         ));
         group.add(&delegation);
-        self.add_agent_detail_rows(&group, driver, &profile, dialog);
+        self.add_agent_detail_rows_linked(&group, driver, &profile, dialog, Some(detected));
         group
     }
 
@@ -1589,7 +1614,18 @@ impl AgentTerminalWindow {
     /// `driver`'s on/off switch, saying what detection found (ready and where, missing and how to
     /// install, or off). Follows the scan until `dialog` closes.
     pub(super) fn agent_enabled_row(&self, driver: Driver, dialog: &adw::Dialog) -> adw::SwitchRow {
+        self.agent_enabled_row_linked(driver, dialog).0
+    }
+
+    /// [`Self::agent_enabled_row`], with what the Detected row found (set it, then call the
+    /// returned refresh) so the two never disagree.
+    fn agent_enabled_row_linked(
+        &self,
+        driver: Driver,
+        dialog: &adw::Dialog,
+    ) -> (adw::SwitchRow, Rc<DetectedLink>) {
         let obj = self.obj();
+        let link = Rc::new(DetectedLink::default());
         let profile = self.agent_profile_now(driver);
         let enabled = adw::SwitchRow::builder()
             .title("Enabled")
@@ -1619,20 +1655,32 @@ impl AgentTerminalWindow {
                 imp.refresh_agent_data(super::threads::Probes::Force);
             }
         ));
-        // The row says what detection found: ready (where), missing (how to install), or off.
-        let state_id = AgentAvailability::shared().connect_changed(glib::clone!(
+        // The row says what detection found: ready (where), missing (how to install), or off;
+        // the Detected row's own check of the saved command wins when the two disagree.
+        let show: Rc<dyn Fn()> = Rc::new(glib::clone!(
             #[weak]
             enabled,
             #[weak]
             get_it,
+            #[strong]
+            link,
             move || {
                 let state = AgentAvailability::shared().get(driver);
-                enabled.set_subtitle(&state.describe(driver));
-                get_it.set_visible(state == Availability::Missing);
+                let detected = link.detected.borrow();
+                let text = enabled_subtitle(driver, &state, detected.as_ref());
+                get_it.set_visible(text == Availability::Missing.describe(driver));
+                enabled.set_subtitle(&text);
             }
         ));
+        *link.refresh.borrow_mut() = Some(Rc::downgrade(&show));
+        show();
+        let state_id = AgentAvailability::shared().connect_changed({
+            let show = show.clone();
+            move || show()
+        });
         dialog.connect_closed(move |_| AgentAvailability::shared().disconnect(state_id));
-        enabled
+        // The availability handler keeps `show` (and with it the link) alive with the dialog.
+        (enabled, link)
     }
 
     /// Who is signed in to `driver`, with Sign In (then Check Again) when nobody is: an installed
@@ -1725,12 +1773,27 @@ impl AgentTerminalWindow {
         timer
     }
 
+    /// The detail rows alone, with no Enabled row to tell: for tests.
+    #[cfg(test)]
     fn add_agent_detail_rows(
         &self,
         group: &adw::PreferencesGroup,
         driver: Driver,
         profile: &Profile,
         dialog: &adw::PreferencesDialog,
+    ) {
+        self.add_agent_detail_rows_linked(group, driver, profile, dialog, None);
+    }
+
+    /// [`Self::add_agent_detail_rows`], telling the agent's Enabled row (through `enabled`)
+    /// what the Detected row finds.
+    fn add_agent_detail_rows_linked(
+        &self,
+        group: &adw::PreferencesGroup,
+        driver: Driver,
+        profile: &Profile,
+        dialog: &adw::PreferencesDialog,
+        enabled: Option<Rc<DetectedLink>>,
     ) {
         let obj = self.obj();
         // Command, with what detection makes of it.
@@ -1752,11 +1815,23 @@ impl AgentTerminalWindow {
             move |command: String| {
                 let current = generation.next();
                 status.set_subtitle("Checking…");
+                if let Some(link) = &enabled {
+                    link.set(None);
+                }
                 let generation = generation.clone();
+                let enabled = enabled.clone();
                 glib::MainContext::default().spawn_local(async move {
                     let found = off_main("the check", move || detect_agent(&command)).await;
                     if !generation.is_current(current) {
                         return;
+                    }
+                    if let Some(link) = &enabled {
+                        // A check that failed to run (it panicked) found nothing either way.
+                        let answer = found.as_ref().map_or_else(
+                            |e| e.starts_with("Not found").then(|| found.clone()),
+                            |_| Some(found.clone()),
+                        );
+                        link.set(answer);
                     }
                     match found {
                         Ok(text) => {
@@ -2399,6 +2474,24 @@ fn catalogue_efforts(driver: Driver) -> Vec<String> {
     out
 }
 
+/// The Enabled row's subtitle: the shared scan's `state`, unless the Detected row's own check
+/// of the saved command (`detected`, `None` while it runs) disagrees with it. The two rows
+/// never contradict each other.
+fn enabled_subtitle(
+    driver: Driver,
+    state: &Availability,
+    detected: Option<&Result<String, String>>,
+) -> String {
+    match (state, detected) {
+        (Availability::Disabled, _) | (_, None) => state.describe(driver),
+        (Availability::Ready(_), Some(Err(_))) => Availability::Missing.describe(driver),
+        (Availability::Missing | Availability::Detecting, Some(Ok(found))) => {
+            format!("Ready: {}", found.trim_start_matches("Installed at "))
+        }
+        _ => state.describe(driver),
+    }
+}
+
 /// "Installed at <path> · <version>", or why not. Blocking: locate + `--version`.
 fn detect_agent(command: &str) -> Result<String, String> {
     let (path, home, shell) = env_triplet();
@@ -2494,6 +2587,32 @@ pub(super) mod tests {
         *timer.pending.borrow_mut() = Some(std::boxed::Box::new(move || seen.set(true)));
         drop(timer);
         assert!(saved.get());
+    }
+
+    #[test]
+    fn the_enabled_row_never_says_ready_when_detected_says_not_found() {
+        let driver = Driver::Claude;
+        let ready = Availability::Ready("/usr/bin/claude".into());
+        let not_found: Result<String, String> = Err("Not found: /nonexistent/claude".into());
+        // The scan still holds the old command's result; Detected checked the saved one.
+        let text = enabled_subtitle(driver, &ready, Some(&not_found));
+        assert!(!text.starts_with("Ready"), "{text}");
+        assert!(text.starts_with("Not found"), "{text}");
+        // Detected found it while the scan says missing: not "Not found" either.
+        let found: Result<String, String> = Ok("Installed at /opt/claude · 2.1".into());
+        let text = enabled_subtitle(driver, &Availability::Missing, Some(&found));
+        assert!(!text.starts_with("Not found"), "{text}");
+        assert!(text.contains("/opt/claude"), "{text}");
+        // Agreement, a check still running, or an agent turned off: the scan's own words.
+        assert_eq!(
+            enabled_subtitle(driver, &ready, Some(&found)),
+            ready.describe(driver)
+        );
+        assert_eq!(enabled_subtitle(driver, &ready, None), ready.describe(driver));
+        assert_eq!(
+            enabled_subtitle(driver, &Availability::Disabled, Some(&not_found)),
+            Availability::Disabled.describe(driver)
+        );
     }
 
     #[test]
