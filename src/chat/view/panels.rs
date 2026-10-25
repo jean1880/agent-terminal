@@ -12,7 +12,7 @@ use agent_core::catalog::{group_for_picker, CatalogModel};
 use gtk4::glib;
 use serde_json::Value;
 
-use super::cards::{accent_class, brand_image, label};
+use super::cards::{accent_class, brand_image, label, wrapped_text};
 use super::header::gauge_text;
 use super::model::{format_tokens, Gauge};
 use super::payload;
@@ -170,12 +170,50 @@ fn replace_page(stack: &gtk4::Stack, name: &str, widget: &impl IsA<gtk4::Widget>
     stack.set_visible_child_name(name);
 }
 
-fn scrolled(child: &impl IsA<gtk4::Widget>) -> gtk4::ScrolledWindow {
+pub(super) fn scrolled(child: &impl IsA<gtk4::Widget>) -> gtk4::ScrolledWindow {
     let s = gtk4::ScrolledWindow::new();
     s.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
     s.set_vexpand(true);
     s.set_child(Some(child));
     s
+}
+
+/// A popover listing rows (a `subagent-list`, nothing selected), as tall as its rows up to
+/// `max_height` and then scrolling. Returns the list to fill and the popover.
+pub(super) fn popover_list(max_height: i32) -> (gtk4::ListBox, gtk4::Popover) {
+    let list = gtk4::ListBox::new();
+    list.add_css_class("subagent-list");
+    list.set_selection_mode(gtk4::SelectionMode::None);
+    let scroller = gtk4::ScrolledWindow::new();
+    scroller.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+    scroller.set_propagate_natural_height(true);
+    // Its natural width, not its minimum: the popover is sized from the scroller, and the
+    // minimum gave every name one character per line.
+    scroller.set_propagate_natural_width(true);
+    scroller.set_max_content_height(max_height);
+    scroller.set_child(Some(&list));
+    let popover = gtk4::Popover::new();
+    popover.set_child(Some(&scroller));
+    (list, popover)
+}
+
+/// A dialog of `width` by `height` titled `title`, showing `content` under a header bar: what
+/// follows one sub-agent or task until closed.
+pub(super) fn follow_dialog(
+    title: &str,
+    width: i32,
+    height: i32,
+    content: &impl IsA<gtk4::Widget>,
+) -> adw::Dialog {
+    let dialog = adw::Dialog::new();
+    dialog.set_content_width(width);
+    dialog.set_content_height(height);
+    dialog.set_title(title);
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&adw::HeaderBar::new());
+    toolbar.set_content(Some(content));
+    dialog.set_child(Some(&toolbar));
+    dialog
 }
 
 fn boxed_list() -> gtk4::ListBox {
@@ -185,7 +223,7 @@ fn boxed_list() -> gtk4::ListBox {
     l
 }
 
-fn padded(child: &impl IsA<gtk4::Widget>) -> gtk4::Box {
+pub(super) fn padded(child: &impl IsA<gtk4::Widget>) -> gtk4::Box {
     let b = gtk4::Box::new(gtk4::Orientation::Vertical, 14);
     b.set_margin_top(12);
     b.set_margin_bottom(18);
@@ -308,9 +346,7 @@ fn model_list(
         column.append(&heading);
         let notes = caveats(driver);
         if !notes.is_empty() {
-            let note = label(&notes.join(" "), &["dim-label", "switch-caveats"]);
-            note.set_wrap(true);
-            note.set_xalign(0.0);
+            let note = wrapped_text(&notes.join(" "), &["dim-label", "switch-caveats"]);
             note.set_margin_start(6);
             note.set_margin_end(6);
             column.append(&note);
@@ -416,10 +452,8 @@ fn picker_footer(source: &Rc<dyn ModelSource>, picker: &adw::Dialog) -> Option<g
     footer.set_margin_start(18);
     footer.set_margin_end(18);
     footer.set_margin_bottom(10);
-    let text = label("", &["dim-label", "model-footer-text"]);
+    let text = wrapped_text("", &["dim-label", "model-footer-text"]);
     text.set_hexpand(true);
-    text.set_xalign(0.0);
-    text.set_wrap(true);
     let button = gtk4::Button::with_label("Refresh");
     button.add_css_class("flat");
     button.set_tooltip_text(Some("Fetch every agent's model list again"));
@@ -507,11 +541,14 @@ fn confirm_busy_switch(
     then: impl Fn() + 'static,
 ) {
     let (title, body, confirm) = busy_switch_text(from, to, caveats);
-    let dialog = adw::AlertDialog::new(Some(&title), Some(&body));
-    dialog.add_responses(&[("cancel", "Keep Waiting"), ("switch", confirm)]);
-    dialog.set_response_appearance("switch", adw::ResponseAppearance::Destructive);
-    dialog.set_default_response(Some("cancel"));
-    dialog.set_close_response("cancel");
+    let dialog = crate::dialogs::confirm_dialog(
+        &title,
+        &body,
+        ("cancel", "Keep Waiting"),
+        ("switch", confirm),
+        adw::ResponseAppearance::Destructive,
+        false,
+    );
     dialog.connect_response(None, move |_, response| {
         if response == "switch" {
             then();
@@ -529,21 +566,21 @@ pub fn confirm_bypass(parent: &impl IsA<gtk4::Widget>, driver: Driver, then: imp
     } else {
         ""
     };
-    let dialog = adw::AlertDialog::new(
-        Some("Turn On Dangerous Permissive Mode?"),
-        Some(&format!(
+    let dialog = crate::dialogs::confirm_dialog(
+        "Turn On Dangerous Permissive Mode?",
+        &format!(
             "Every request {agent} makes in this thread will be approved without asking you: \
              shell commands, file edits and deletions anywhere your account can reach, network \
              access and MCP tools.{sandbox} Nothing will stop a mistaken or harmful step before \
              it runs.\n\nIt lasts for this agent session only: reopening the thread, restarting \
              the app, forking it or switching agent turns it off. Only continue if you trust \
              this agent with your files and accounts."
-        )),
+        ),
+        ("cancel", "Cancel"),
+        ("bypass", "Approve Everything"),
+        adw::ResponseAppearance::Destructive,
+        false,
     );
-    dialog.add_responses(&[("cancel", "Cancel"), ("bypass", "Approve Everything")]);
-    dialog.set_response_appearance("bypass", adw::ResponseAppearance::Destructive);
-    dialog.set_default_response(Some("cancel"));
-    dialog.set_close_response("cancel");
     dialog.connect_response(None, move |_, response| {
         if response == "bypass" {
             then();
@@ -567,13 +604,11 @@ pub fn model_picker(ctx: &PanelCtx) {
     let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
     outer.append(&search);
     // How a choice is made: nothing in a list of rows says a click commits.
-    let hint = label(
+    let hint = wrapped_text(
         "Click a model to switch to it. Set its effort first, or press Apply to change only \
          the effort.",
         &["dim-label", "model-picker-hint"],
     );
-    hint.set_wrap(true);
-    hint.set_xalign(0.0);
     hint.set_margin_start(18);
     hint.set_margin_end(18);
     outer.append(&hint);

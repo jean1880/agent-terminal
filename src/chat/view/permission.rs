@@ -70,7 +70,10 @@ pub(super) fn plain(s: &str) -> bool {
     !agent_core::text::has_control_or_bidi(s, &[])
 }
 
-fn special_words(name: &str) -> Option<&'static str> {
+/// How a Codex special place (`project`, `temp`, `slash_tmp`, `root`, `minimal`) reads, the same
+/// on the card and in the policy's warnings; `None` for a name it does not know, which each
+/// caller words in its own way.
+pub(crate) fn special_words(name: &str) -> Option<&'static str> {
     Some(match name {
         "project" => "the project",
         "temp" => "the temp folder",

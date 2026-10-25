@@ -14,7 +14,7 @@ use agent_core::event::{Envelope, Event};
 use agent_kit::store::ThreadId;
 use tracing::{info, warn};
 
-use super::{Approval, ChatSession, Inner, LaunchEnv, SessionStore};
+use super::{Approval, ChatSession, InFlight, Inner, LaunchEnv, SessionStore};
 use crate::agent_proc::{ExitWatch, StopPhase};
 use crate::chat::{ChatBackend, EnvelopeSink};
 use crate::delegation::seam::{DelegatedInput, DelegatedOutcome, InputSource, SessionOptions};
@@ -281,12 +281,7 @@ impl Inner {
                 "the agent's input failed",
             ),
             (self.prompt_in_flight.get(), "a prompt is in flight"),
-            (self.starting.borrow().is_some(), "the agent is starting"),
-            (self.stopping.get(), "the agent is stopping"),
-            (self.rebinding.get(), "a rebind is under way"),
-            (self.delivering.get(), "an event is being delivered"),
-            (self.dispatching_queue.get(), "the queue is being sent"),
-            (self.queued_dispatch_pending.get(), "the queue is due"),
+            InFlight::reason(self.work_in_flight(), InFlight::wake_reason),
             (
                 !self.queued_prompts.borrow().is_empty(),
                 "prompts are queued",
@@ -463,9 +458,7 @@ impl Inner {
             return WakeOutcome::Busy;
         }
         info!("waking the agent with its sub-agents' news");
-        self.prompt_in_flight.set(true);
-        if !self.dispatch_sent_prompt(text, None) {
-            self.prompt_in_flight.set(false);
+        if !self.dispatch_in_flight(text, None) {
             return WakeOutcome::Busy;
         }
         // Started only on positive evidence, as held news is spent: the line went to a process
@@ -568,11 +561,9 @@ impl Inner {
         info!(plan = ?input.plan, "delivering delegated input");
         match input.plan {
             DeliveryPlan::StartTurn => {
-                self.prompt_in_flight.set(true);
-                if self.dispatch_sent_prompt(&text, None) {
+                if self.dispatch_in_flight(&text, None) {
                     DelegatedOutcome::TurnStarted
                 } else {
-                    self.prompt_in_flight.set(false);
                     DelegatedOutcome::Refused(ErrorCode::InternalError)
                 }
             }
@@ -623,12 +614,7 @@ impl Inner {
         }
         let held: Vec<String> = self.held_permissions.borrow_mut().drain().collect();
         for wire in held {
-            self.command(Command::Approve {
-                request: wire,
-                decision: agent_core::event::Decision::Deny,
-                updated_input: None,
-                message: Some(message.clone()),
-            });
+            self.deny_request(wire, message.as_str());
         }
         let open: Vec<String> = self.open_approvals.borrow().clone();
         for shown in open {
@@ -639,12 +625,7 @@ impl Inner {
                 .map_or_else(|| shown.clone(), |card| card.wire.clone());
             self.pending_rules.borrow_mut().remove(&shown);
             self.codex_permissions.borrow_mut().remove(&shown);
-            let denied = self.command(Command::Approve {
-                request: wire,
-                decision: agent_core::event::Decision::Deny,
-                updated_input: None,
-                message: Some(message.clone()),
-            });
+            let denied = self.deny_request(wire, message.as_str());
             let ended = if denied {
                 Event::ApprovalResolved {
                     decision: agent_core::event::Decision::Deny,

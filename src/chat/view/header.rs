@@ -7,26 +7,21 @@ use std::rc::Rc;
 use adw::prelude::*;
 use agent_core::adapter::{Driver, Mode};
 
-use super::cards::{accent_class, label};
+use super::cards::{accent_class, label, wrapped_text};
 use super::model::{format_tokens, Activity, Gauge};
 
 /// Hookless agy cannot enforce a new policy mid-turn without interrupting it.
 pub fn confirm_mode_switch(parent: &impl IsA<gtk4::Widget>, then: impl Fn() + 'static) {
-    let dialog = adw::AlertDialog::new(
-        Some("Change Antigravity mode now?"),
-        Some(
-            "Antigravity is still working without its approval hook. Changing mode interrupts \
-              this turn and continues the unfinished task in the selected mode. Any approval \
-              or question waiting for your answer is cancelled; the new turn can ask again.",
-        ),
-    );
-    dialog.add_responses(&[
+    let dialog = crate::dialogs::confirm_dialog(
+        "Change Antigravity mode now?",
+        "Antigravity is still working without its approval hook. Changing mode interrupts \
+          this turn and continues the unfinished task in the selected mode. Any approval \
+          or question waiting for your answer is cancelled; the new turn can ask again.",
         ("cancel", "Keep Waiting"),
         ("switch", "Switch and Continue"),
-    ]);
-    dialog.set_response_appearance("switch", adw::ResponseAppearance::Destructive);
-    dialog.set_default_response(Some("cancel"));
-    dialog.set_close_response("cancel");
+        adw::ResponseAppearance::Destructive,
+        false,
+    );
     dialog.connect_response(None, move |_, response| {
         if response == "switch" {
             then();
@@ -255,8 +250,7 @@ impl Header {
         let mode_box = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
         mode_box.set_valign(gtk4::Align::Center);
         mode_box.append(&mode);
-        let pending_mode = label("", &["dim-label"]);
-        pending_mode.set_wrap(true);
+        let pending_mode = wrapped_text("", &["dim-label"]);
         pending_mode.set_max_width_chars(18);
         pending_mode.set_visible(false);
         mode_box.append(&pending_mode);
@@ -277,8 +271,7 @@ impl Header {
         let access_text = label("Extra access", &["extra-access-text"]);
         access_inner.append(&access_text);
         access.set_child(Some(&access_inner));
-        let access_list = label("", &["extra-access-list"]);
-        access_list.set_wrap(true);
+        let access_list = wrapped_text("", &["extra-access-list"]);
         access_list.set_max_width_chars(48);
         access_list.set_selectable(false);
         let access_pop_box = gtk4::Box::new(gtk4::Orientation::Vertical, 6);

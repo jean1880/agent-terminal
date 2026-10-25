@@ -30,6 +30,28 @@ impl StripInner {
         }
         self.started_at.set(None);
     }
+
+    /// The timer's second: the status again with the time it has run, or, once there is nothing
+    /// to say, the strip hidden and the timer ended.
+    fn tick(&self) -> glib::ControlFlow {
+        let elapsed = self.started_at.get().map(|t| t.elapsed().as_secs());
+        let text = status_text(
+            &self.current_activity.borrow(),
+            &self.current_agent.borrow(),
+            elapsed,
+        );
+        match text {
+            Some(text) => {
+                self.label.set_text(&text);
+                glib::ControlFlow::Continue
+            }
+            None => {
+                self.revealer.set_reveal_child(false);
+                self.timer_source.take();
+                glib::ControlFlow::Break
+            }
+        }
+    }
 }
 
 impl Drop for StripInner {
@@ -118,24 +140,8 @@ impl ThinkingStrip {
                     let weak = Rc::downgrade(&self.inner);
                     let source =
                         glib::timeout_add_local(std::time::Duration::from_secs(1), move || {
-                            if let Some(inner) = weak.upgrade() {
-                                let elapsed = inner.started_at.get().map(|t| t.elapsed().as_secs());
-                                let act = inner.current_activity.borrow().clone();
-                                let ag = inner.current_agent.borrow().clone();
-                                match status_text(&act, &ag, elapsed) {
-                                    Some(t) => {
-                                        inner.label.set_text(&t);
-                                        glib::ControlFlow::Continue
-                                    }
-                                    None => {
-                                        inner.revealer.set_reveal_child(false);
-                                        inner.timer_source.take();
-                                        glib::ControlFlow::Break
-                                    }
-                                }
-                            } else {
-                                glib::ControlFlow::Break
-                            }
+                            weak.upgrade()
+                                .map_or(glib::ControlFlow::Break, |inner| inner.tick())
                         });
                     *self.inner.timer_source.borrow_mut() = Some(source);
                 }

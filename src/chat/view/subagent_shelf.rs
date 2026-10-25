@@ -18,7 +18,7 @@ use gtk4::prelude::*;
 use super::cards::label;
 use super::model::{Body, SubagentSummary, ToolStatus, Transcript};
 use super::payload;
-use super::subagents::set_if_changed;
+use super::subagents::{brand_slot, counts, set_if_changed};
 
 /// The card's one-line summary: the running ones, then the finished ones still docked.
 pub fn title_text(running: usize, finished: usize, unknown: usize) -> String {
@@ -41,16 +41,6 @@ pub fn title_text(running: usize, finished: usize, unknown: usize) -> String {
         (0, n) => format!("{n} workers unknown"),
         (_, n) => format!("{known} · {n} unknown"),
     }
-}
-
-fn counts(shown: &[&SubagentSummary]) -> (usize, usize, usize) {
-    let running = shown.iter().filter(|a| a.active()).count();
-    let finished = shown.iter().filter(|a| a.finished()).count();
-    (
-        running,
-        finished,
-        shown.len().saturating_sub(running + finished),
-    )
 }
 
 /// What sub-agent `id` is doing now: its running step, else its latest one (`None`: no step
@@ -101,8 +91,7 @@ impl Row {
         let b = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
         b.add_css_class("subagent-shelf-row");
         let top = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-        let brand = gtk4::Image::new();
-        brand.set_pixel_size(14);
+        let brand = brand_slot(14);
         top.append(&brand);
         let spinner = gtk4::Spinner::builder().spinning(true).build();
         spinner.add_css_class("thread-background");
@@ -273,7 +262,7 @@ impl SubagentShelf {
         if shown.is_empty() {
             return;
         }
-        let (running, finished, unknown) = counts(&shown);
+        let (running, finished, unknown) = counts(shown.iter().copied());
         set_if_changed(&self.title, &title_text(running, finished, unknown));
         self.clear.set_visible(finished > 0);
         let same = {
@@ -360,7 +349,7 @@ pub(crate) mod tests {
         let t = transcript(&[subagent("s1", "Explore")]);
         let mut worker = t.subagents().remove(0);
         worker.lifecycle = Some(agent_core::event::WorkerState::Unknown);
-        let (running, finished, unknown) = counts(&[&worker]);
+        let (running, finished, unknown) = counts([&worker]);
         assert_eq!((running, finished, unknown), (0, 0, 1));
         assert_eq!(title_text(running, finished, unknown), "1 worker unknown");
         assert_eq!(

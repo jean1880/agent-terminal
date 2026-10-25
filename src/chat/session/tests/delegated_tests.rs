@@ -2424,6 +2424,89 @@ fn the_thinking_retry_never_replays_news_that_was_given_back() {
     });
 }
 
+/// The same as a live message: one written mid-turn into Claude's refused `--thinking-display`
+/// start gives its news back, and the restart replays the user's own text only.
+#[test]
+fn the_thinking_retry_never_replays_news_given_back_by_a_live_message() {
+    in_loop(|ctx| {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let thread = fresh(&store, &dir.path().to_string_lossy());
+        let (sink, seen) = make_sink();
+        let open = scripted(
+            dir.path(),
+            "IFS= read -r handshake\n\
+             case \"$*\" in *--thinking-display*) \
+             echo \"error: unknown option '--thinking-display'\" >&2; sleep 4 & exit 1;; esac\n\
+             echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\",\"model\":\"m\",\"claude_code_version\":\"2.1.293\"}'\n\
+             echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'\n\
+             while IFS= read -r line; do printf '%s\\n' \"$line\" >> \"$D/prompts.log\"; \
+             case \"$line\" in *'\"type\":\"user\"'*) \
+             echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}';; esac; done",
+        );
+        crate::claude_probe::note_version(&open.program, "2.1.293 (Claude Code)");
+        let session = ChatSession::with_env(
+            Box::new(agent_core::claude::ClaudeAdapter::new()),
+            open,
+            store,
+            thread,
+            sink,
+            Err(None),
+            minimal_env(dir.path()),
+        );
+        let prompts =
+            || std::fs::read_to_string(dir.path().join("prompts.log")).unwrap_or_default();
+        let notices = || {
+            seen.borrow()
+                .iter()
+                .filter(
+                    |e| matches!(&e.event, Event::Notice { text } if text.contains("held news")),
+                )
+                .count()
+        };
+        let exited = |s: &ChatSession| {
+            s.inner
+                .proc
+                .borrow()
+                .as_ref()
+                .is_some_and(|p| !p.is_alive())
+        };
+        assert!(pump_until(ctx, 10, || exited(&session)));
+        assert!(
+            session.status().alive,
+            "the refusal's exit is not handled yet"
+        );
+
+        session.confirm_mode(Mode::Bypass);
+        // A turn counts as running, so the message goes as live input.
+        session.inner.state.borrow_mut().running_turn = true;
+        let news = Rc::new(FakeNews::default());
+        *news.text.borrow_mut() = Some("[agent-terminal] held news".into());
+        session.hold_news_for_user(news.clone());
+        session.steer_prompt("steered before init");
+        assert_eq!(news.taken.get(), 1);
+        assert_eq!(
+            news.given_back.get(),
+            1,
+            "the dropped message gives it back"
+        );
+        assert!(
+            session
+                .inner
+                .pre_init_prompts
+                .borrow()
+                .iter()
+                .all(|kept| !kept.text.contains("held news")),
+            "the kept copy is the user's own text"
+        );
+
+        assert!(pump_until(ctx, 10, || prompts().contains("steered before init")));
+        assert!(!prompts().contains("held news"), "{}", prompts());
+        assert_eq!(notices(), 0);
+        session.shutdown(false);
+    });
+}
+
 /// A message the user writes while a turn runs (live input) carries held news like any other:
 /// framed ahead of it, shown as the app's notice, and taken from the supervisor.
 #[test]

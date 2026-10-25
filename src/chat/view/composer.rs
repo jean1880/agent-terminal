@@ -28,7 +28,7 @@ use gtk4::prelude::*;
 use gtk4::{gdk, glib};
 use sourceview5::prelude::*;
 
-use super::cards::label;
+use super::cards::{label, wrap_words};
 use super::typeahead::{apply_completion, Key, KeyOutcome, LatestRequest, Popup};
 
 /// Debounce for `@file` suggestions (a round trip to the agent CLI).
@@ -875,8 +875,7 @@ fn entry_row(entry: &Entry) -> gtk4::ListBoxRow {
             b.append(&name);
             if let Some(h) = &item.hint {
                 let hint = label(h, &["typeahead-hint"]);
-                hint.set_wrap(true);
-                hint.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+                wrap_words(&hint);
                 hint.set_max_width_chars(18);
                 b.append(&hint);
             }

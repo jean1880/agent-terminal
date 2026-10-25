@@ -14,7 +14,7 @@ use agent_core::event::QuotaWindow;
 use agent_core::quota::{parse_rfc3339, resets_in_text};
 use gtk4::prelude::*;
 
-use super::cards::{accent_class, brand_image, label};
+use super::cards::{accent_class, brand_image, label, wrapped_text};
 use crate::account_status::{AccountStatus, Snapshot};
 use crate::availability::AgentAvailability;
 use crate::freshness::{
@@ -474,10 +474,8 @@ fn detail_form(driver: Driver, snap: &Snapshot, now: i64) -> gtk4::Box {
         let l = label("Not signed in", &["usage-text", "usage-crit"]);
         l.set_halign(gtk4::Align::Start);
         section.append(&l);
-        let hint = label(driver.info().sign_in_hint, &["dim-label", "usage-account"]);
+        let hint = wrapped_text(driver.info().sign_in_hint, &["dim-label", "usage-account"]);
         hint.set_halign(gtk4::Align::Start);
-        hint.set_wrap(true);
-        hint.set_xalign(0.0);
         section.append(&hint);
         return section;
     }
@@ -494,10 +492,8 @@ fn detail_form(driver: Driver, snap: &Snapshot, now: i64) -> gtk4::Box {
     let state = reading_freshness(snap, now);
     let aging = state == Freshness::Aging || (state == Freshness::Fresh && snap.refresh_failed);
     if let Some(text) = reading_text(snap, now) {
-        let l = label(&text, &["dim-label", "usage-resets"]);
+        let l = wrapped_text(&text, &["dim-label", "usage-resets"]);
         l.set_halign(gtk4::Align::Start);
-        l.set_wrap(true);
-        l.set_xalign(0.0);
         section.append(&l);
     }
     // Expired: the could-not-read state; values that old are not shown as current.
