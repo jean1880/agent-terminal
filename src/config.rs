@@ -2778,7 +2778,9 @@ mod tests {
         assert_eq!(claude.command, "/opt/bin/claude-nightly");
         assert_eq!(profile_driver(claude), Some(Driver::Claude));
         assert_eq!(
-            loaded.thread_profile(Some(&id), Driver::Claude).map(|p| &p.id),
+            loaded
+                .thread_profile(Some(&id), Driver::Claude)
+                .map(|p| &p.id),
             Some(&id)
         );
 

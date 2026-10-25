@@ -2644,7 +2644,10 @@ pub(super) mod tests {
             enabled_subtitle(driver, &ready, Some(&found)),
             ready.describe(driver)
         );
-        assert_eq!(enabled_subtitle(driver, &ready, None), ready.describe(driver));
+        assert_eq!(
+            enabled_subtitle(driver, &ready, None),
+            ready.describe(driver)
+        );
         assert_eq!(
             enabled_subtitle(driver, &Availability::Disabled, Some(&not_found)),
             Availability::Disabled.describe(driver)
