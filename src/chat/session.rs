@@ -172,6 +172,24 @@ struct RefusedHook {
     text: String,
 }
 
+/// The HOME a process launched with `env` set after `unset` sees: the last HOME it sets, else
+/// `inherited` (the app's) unless it unsets HOME.
+fn launch_home(
+    env: &[(String, String)],
+    unset: &[String],
+    inherited: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    env.iter()
+        .rev()
+        .find(|(name, _)| name == "HOME")
+        .map(|(_, value)| PathBuf::from(value))
+        .or_else(|| {
+            (!unset.iter().any(|name| name == "HOME"))
+                .then(|| inherited.map(PathBuf::from))
+                .flatten()
+        })
+}
+
 /// The hooked tool names a started item of this kind can be. `None`: not watched (see
 /// [`Inner::watch_tool_step`]).
 fn canary_tools(kind: ItemKind) -> Option<&'static [&'static str]> {
@@ -1746,17 +1764,7 @@ impl Inner {
             return;
         };
         use agent_core::delegation::agy_guard::CONFIG_REDIRECT_VARS;
-        let home = spec
-            .env
-            .iter()
-            .rev()
-            .find(|(name, _)| name == "HOME")
-            .map(|(_, value)| PathBuf::from(value))
-            .or_else(|| {
-                (!spec.unset.iter().any(|name| name == "HOME"))
-                    .then(|| std::env::var_os("HOME").map(PathBuf::from))
-                    .flatten()
-            });
+        let home = launch_home(&spec.env, &spec.unset, std::env::var_os("HOME"));
         let redirects = delegation_redirect_names(&spec);
         // Freeze inherited safety inputs across the asynchronous guard. Redirects are never
         // allowed by a delegated launch, so absence is fixed explicitly in the final spec.
@@ -2104,13 +2112,18 @@ impl Inner {
         }
         if !stderr {
             if let Some(job) = self.agy_enrich_job(line) {
-                if let Ok(home) = std::env::var("HOME") {
+                // agy keeps its transcript under the HOME it runs with: the profile's, if set.
+                let home = {
+                    let launch = self.launch_env.borrow();
+                    launch_home(&launch.env, &launch.unset, std::env::var_os("HOME"))
+                };
+                if let Some(home) = home {
                     self.agy_reading.set(Some(generation));
                     let me = Rc::clone(self);
                     glib::spawn_future_local(async move {
                         let (conv_id, step_index) = (job.conv_id.clone(), job.step_index);
                         let record = gtk4::gio::spawn_blocking(move || {
-                            agy_transcript::read_step(Path::new(&home), &conv_id, step_index)
+                            agy_transcript::read_step(&home, &conv_id, step_index)
                         })
                         .await
                         .unwrap_or_default();
@@ -11078,6 +11091,81 @@ mod tests {
             assert!(unknown < exit, "the held line comes before the exit");
             assert!(session.inner.agy_deferred_exit.get().is_none());
         });
+    }
+
+    /// agy writes its transcript under the HOME it was started with: the profile's own when its
+    /// environment sets one, not the app's.
+    #[test]
+    fn the_agy_transcript_is_read_from_the_profiles_home() {
+        let profile_home = tempfile::tempdir().expect("profile home");
+        let app_home = tempfile::tempdir().expect("app home");
+        let _home = HomeGuard::set(app_home.path());
+        let logs = profile_home
+            .path()
+            .join(".gemini/antigravity-cli/brain/cv/.system_generated/logs");
+        std::fs::create_dir_all(&logs).expect("mkdir");
+        std::fs::write(
+            logs.join("transcript.jsonl"),
+            "{\"step_index\":2,\"thinking\":\"pondering\"}\n",
+        )
+        .expect("write");
+        in_loop(|ctx| {
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let (session, seen) = harness(
+                Box::new(agent_core::agy::AgyAdapter::new("agy")),
+                OpenSession {
+                    mode: Mode::Plan,
+                    ..open_session("unused", Vec::new(), "/")
+                },
+                &store,
+                &thread,
+            );
+            *session.inner.launch_env.borrow_mut() = LaunchEnv {
+                env: vec![(
+                    "HOME".into(),
+                    profile_home.path().to_string_lossy().into_owned(),
+                )],
+                unset: vec![],
+            };
+            let frame = r#"{"event":"step_update","step_update":{"conversation_id":"cv","state":"ACTIVE","step_index":2,"step_type":"tool","tool_name":"view_file"}}"#;
+            session
+                .inner
+                .on_line(session.inner.generation.get(), frame, false);
+            assert!(
+                pump_until(ctx, 5, || reasoning_started(&seen)),
+                "the step's thinking was not read from the profile's HOME"
+            );
+        });
+    }
+
+    /// The HOME a process launched with an environment sees: its own setting, else the app's
+    /// unless the launch unsets it.
+    #[test]
+    fn the_launch_home_is_the_profiles_then_the_apps_unless_unset() {
+        let env = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect()
+        };
+        let app = Some(std::ffi::OsString::from("/home/app"));
+        assert_eq!(
+            launch_home(&env(&[("HOME", "/p1"), ("HOME", "/p2")]), &[], app.clone()),
+            Some(PathBuf::from("/p2")),
+            "the last setting wins, as the launcher applies them"
+        );
+        assert_eq!(
+            launch_home(&env(&[("HOME", "/p")]), &["HOME".into()], app.clone()),
+            Some(PathBuf::from("/p")),
+            "set after the unset"
+        );
+        assert_eq!(
+            launch_home(&env(&[("PATH", "/bin")]), &[], app.clone()),
+            Some(PathBuf::from("/home/app"))
+        );
+        assert_eq!(launch_home(&[], &["HOME".into()], app), None);
+        assert_eq!(launch_home(&[], &[], None), None);
     }
 
     #[test]
