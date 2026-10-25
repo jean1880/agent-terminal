@@ -130,6 +130,12 @@ pub struct Profile {
     /// Existing profiles remain unavailable until the user enables them in Settings.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub available_for_delegation: bool,
+    /// The chat agent this profile was made for, recorded by Preferences → Agents (and
+    /// [`new_agent_profile`]) so a command whose file name is not the agent's (a half-typed
+    /// name, `claude-nightly`) keeps the profile that agent's. `None` (hand-written and older
+    /// profiles): judged by the command's file name alone. See [`profile_driver`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<agent_core::adapter::Driver>,
 }
 
 /// A blank profile with a fresh id, so the invariant holds for `..Profile::default()` too.
@@ -156,6 +162,7 @@ impl Default for Profile {
             default_effort: None,
             disabled: false,
             available_for_delegation: false,
+            driver: None,
         }
     }
 }
@@ -191,11 +198,20 @@ pub fn new_profile_id() -> String {
 }
 
 /// The chat driver a profile's command runs, judged by the command's file
-/// name: `claude` or `agy`, wherever it is installed. Anything else (Gemini,
-/// a wrapper script) has no adapter and runs as a Terminal thread only.
+/// name: `claude`, `agy` or `codex`, wherever it is installed. A file name that
+/// names no agent falls back to the agent the profile records ([`Profile::driver`]),
+/// so `claude-nightly` set in Preferences → Agents stays Claude's. Anything else
+/// (Gemini, a hand-written wrapper script) has no adapter and runs as a Terminal
+/// thread only. A file name that names another agent wins over the record, so a
+/// hand edit to another CLI never runs it under the wrong adapter.
 pub fn profile_driver(profile: &Profile) -> Option<agent_core::adapter::Driver> {
+    command_driver(&profile.command).or(profile.driver)
+}
+
+/// The driver whose default command is `command`'s file name.
+fn command_driver(command: &str) -> Option<agent_core::adapter::Driver> {
     use agent_core::adapter::Driver;
-    let name = Path::new(profile.command.trim())
+    let name = Path::new(command.trim())
         .file_name()
         .map(|n| n.to_string_lossy().to_lowercase())?;
     Driver::ALL
@@ -210,6 +226,7 @@ pub fn new_agent_profile(driver: agent_core::adapter::Driver) -> Profile {
     let mut profile = Profile {
         name: info.profile_name.to_string(),
         command: info.default_command.to_string(),
+        driver: Some(driver),
         ..Profile::default()
     };
     apply_known_settings(&mut profile);
@@ -255,14 +272,7 @@ pub fn agent_settings_model(
 
 /// The model configured in the settings file of the agent running `command`.
 pub fn agent_settings_model_for_command(command: &str, home: Option<&Path>) -> Option<String> {
-    use agent_core::adapter::Driver;
-    let name = Path::new(command.trim())
-        .file_name()
-        .map(|n| n.to_string_lossy().to_lowercase())?;
-    let driver = Driver::ALL
-        .into_iter()
-        .find(|d| d.info().default_command == name)?;
-    agent_settings_model(driver, home)
+    agent_settings_model(command_driver(command)?, home)
 }
 
 fn claude_settings_model(home: &Path) -> Option<String> {
@@ -1383,12 +1393,31 @@ impl TerminalConfig {
         self.profiles.iter().find(|p| p.id == id)
     }
 
-    /// The position of the profile that defines `driver`'s chat agent: the
-    /// first whose command runs it. Preferences → Agents edits this profile.
+    /// The position of the profile that defines `driver`'s chat agent: the first that records
+    /// it as its agent ([`Profile::driver`]) while it still runs it, else the first whose
+    /// command runs it. Preferences → Agents edits this profile.
     pub fn agent_profile_index(&self, driver: agent_core::adapter::Driver) -> Option<usize> {
+        let runs = |p: &Profile| profile_driver(p) == Some(driver);
         self.profiles
             .iter()
-            .position(|p| profile_driver(p) == Some(driver))
+            .position(|p| p.driver == Some(driver) && runs(p))
+            .or_else(|| self.profiles.iter().position(runs))
+    }
+
+    /// The position of the profile Preferences → Agents edits for `driver`, created when there
+    /// is none. The profile found records `driver` as its agent, so an edit that gives its
+    /// command another file name (typing, a wrapper) keeps it `driver`'s rather than detaching
+    /// it and making the next edit create a duplicate.
+    pub fn agent_profile_slot(&mut self, driver: agent_core::adapter::Driver) -> usize {
+        let index = match self.agent_profile_index(driver) {
+            Some(i) => i,
+            None => {
+                self.profiles.push(new_agent_profile(driver));
+                self.profiles.len() - 1
+            }
+        };
+        self.profiles[index].driver = Some(driver);
+        index
     }
 
     /// The profile that defines `driver`'s chat agent, if one does.
@@ -2689,6 +2718,81 @@ mod tests {
             "writing the new file would make the old one unadoptable"
         );
         assert_eq!(std::fs::read(&legacy).unwrap(), b"{ broken");
+    }
+
+    #[test]
+    fn editing_an_agents_command_to_another_name_keeps_its_profile() {
+        use agent_core::adapter::Driver;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut config = TerminalConfig::default();
+        let first = config.agent_profile_slot(Driver::Claude);
+        let id = config.profiles[first].id.clone();
+        let count = config.profiles.len();
+        // Typing in Settings → Agents → Claude → Command: a half-typed name, a wrapper with
+        // another basename, then back to the plain name. Each debounced save edits the slot.
+        for command in ["claud", "/opt/bin/claude-nightly", "claude"] {
+            let slot = config.agent_profile_slot(Driver::Claude);
+            assert_eq!(config.profiles[slot].id, id, "{command}: another profile");
+            config.profiles[slot].command = command.into();
+        }
+        assert_eq!(config.profiles.len(), count, "a duplicate Claude profile");
+
+        // A non-standard command survives a save and a load as Claude's.
+        let slot = config.agent_profile_slot(Driver::Claude);
+        config.profiles[slot].command = "/opt/bin/claude-nightly".into();
+        config.save_to(&path);
+        let loaded = TerminalConfig::load_from(&path);
+        let claude = loaded.agent_profile(Driver::Claude).expect("claude");
+        assert_eq!(claude.id, id);
+        assert_eq!(claude.command, "/opt/bin/claude-nightly");
+        assert_eq!(profile_driver(claude), Some(Driver::Claude));
+        assert_eq!(
+            loaded.thread_profile(Some(&id), Driver::Claude).map(|p| &p.id),
+            Some(&id)
+        );
+
+        // A hand-written wrapper profile that names no agent still runs as a terminal only.
+        let wrapper = Profile {
+            command: "/opt/bin/claude-wrapper".into(),
+            ..Profile::default()
+        };
+        assert_eq!(profile_driver(&wrapper), None);
+    }
+
+    #[test]
+    fn a_profiles_recorded_agent_round_trips_and_older_files_need_no_migration() {
+        use agent_core::adapter::Driver;
+        // A file from before the field: judged by the command's name, exactly as before.
+        let old: Profile =
+            serde_json::from_str(r#"{"id":"p-1","name":"Claude","command":"claude"}"#).unwrap();
+        assert_eq!(old.driver, None);
+        assert_eq!(profile_driver(&old), Some(Driver::Claude));
+        // An unrecorded profile writes no field, so the file stays what an older build reads.
+        assert!(!serde_json::to_string(&old).unwrap().contains("driver"));
+
+        let recorded = Profile {
+            command: "claude-nightly".into(),
+            driver: Some(Driver::Claude),
+            ..Profile::default()
+        };
+        let json = serde_json::to_string(&recorded).unwrap();
+        assert!(json.contains(r#""driver":"claude""#), "{json}");
+        let back: Profile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, recorded);
+        assert_eq!(profile_driver(&back), Some(Driver::Claude));
+
+        // A command that names another agent wins over the record: never the wrong adapter.
+        let moved = Profile {
+            command: "/usr/bin/codex".into(),
+            ..recorded
+        };
+        assert_eq!(profile_driver(&moved), Some(Driver::Codex));
+        assert_eq!(
+            new_agent_profile(Driver::Agy).driver,
+            Some(Driver::Agy),
+            "a profile made for an agent records it"
+        );
     }
 
     #[test]

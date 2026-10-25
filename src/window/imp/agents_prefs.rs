@@ -584,19 +584,12 @@ impl AgentTerminalWindow {
         });
     }
 
-    /// Applies `edit` to `driver`'s profile (created when missing) and schedules the save.
+    /// Applies `edit` to `driver`'s profile (created when missing, and recorded as `driver`'s so
+    /// a command edit never detaches it) and schedules the save.
     fn edit_agent_profile(&self, driver: Driver, edit: impl FnOnce(&mut Profile)) {
         let profile_id = {
             let mut config = self.config.borrow_mut();
-            let index = match config.agent_profile_index(driver) {
-                Some(i) => i,
-                None => {
-                    config
-                        .profiles
-                        .push(crate::config::new_agent_profile(driver));
-                    config.profiles.len() - 1
-                }
-            };
+            let index = config.agent_profile_slot(driver);
             config.profiles.get_mut(index).map(|profile| {
                 edit(profile);
                 profile.id.clone()
