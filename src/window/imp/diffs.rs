@@ -15,7 +15,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -38,7 +38,13 @@ fn path_to_open(dir: &str, path: &str) -> String {
     if p.is_absolute() {
         path.to_owned()
     } else {
-        Path::new(dir).join(p).to_string_lossy().into_owned()
+        // A relative `dir` is the process's: made absolute first, or the repository root would
+        // read the joined path as its own.
+        let dir = Path::new(dir)
+            .canonicalize()
+            .or_else(|_| std::env::current_dir().map(|cwd| cwd.join(dir)))
+            .unwrap_or_else(|_| PathBuf::from(dir));
+        dir.join(p).to_string_lossy().into_owned()
     }
 }
 
@@ -235,6 +241,20 @@ mod tests {
         assert_eq!(path_to_open("/repo/sub", "a.rs"), "/repo/sub/a.rs");
         assert_eq!(path_to_open("/repo/sub", "x/a.rs"), "/repo/sub/x/a.rs");
         assert_eq!(path_to_open("/repo/sub", "/repo/b.rs"), "/repo/b.rs");
+    }
+
+    #[test]
+    fn a_relative_thread_dir_gives_an_absolute_path_to_the_right_file() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let got = path_to_open(".", "a.rs");
+        assert!(Path::new(&got).is_absolute(), "{got}");
+        assert_eq!(
+            Path::new(&got),
+            cwd.canonicalize().expect("canon").join("a.rs")
+        );
+        // A relative dir that does not exist still anchors at the working directory.
+        let got = path_to_open("no/such/dir", "a.rs");
+        assert_eq!(Path::new(&got), cwd.join("no/such/dir/a.rs"));
     }
 
     #[test]

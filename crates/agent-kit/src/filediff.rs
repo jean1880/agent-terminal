@@ -251,7 +251,17 @@ pub fn read_working(file: &RepoFile) -> Result<Side, String> {
 /// before reading and the read itself is bounded, so a huge (or growing) file is never loaded.
 fn read_capped(path: &Path, max: usize) -> Option<Vec<u8>> {
     use std::io::Read;
-    let file = std::fs::File::open(path).ok()?;
+    use std::os::unix::fs::OpenOptionsExt;
+    // Only a regular file is ever opened: opening a FIFO with no writer would block.
+    if !std::fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
+    // `O_NONBLOCK` and a re-check of the opened handle close the swap between the two.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
     let meta = file.metadata().ok()?;
     if !meta.is_file() || meta.len() > max as u64 {
         return None;
@@ -803,6 +813,24 @@ mod tests {
             read_capped(&small, editdiff::MAX_SIDE_BYTES),
             Some(b"hi\n".to_vec())
         );
+    }
+
+    #[test]
+    fn a_fifo_with_no_writer_is_skipped_not_waited_on() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let fifo = dir.path().join("pipe");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        if !made.is_ok_and(|s| s.success()) {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_capped(&fifo, editdiff::MAX_SIDE_BYTES));
+        });
+        let got = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("read_capped blocked on a FIFO");
+        assert_eq!(got, None);
     }
 
     #[test]
