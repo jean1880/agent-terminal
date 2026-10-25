@@ -2612,6 +2612,9 @@ pub fn format_tokens(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat::view::permission::tests::{
+        path as permission_path, request_input as permission_input,
+    };
     use serde_json::json;
 
     fn ev(e: Event) -> Envelope {
@@ -4384,13 +4387,12 @@ mod tests {
     }
 
     fn permission_request(request: &str, entries: Value, renderable: bool) -> Envelope {
+        let mut input = permission_input(entries, json!(true), true);
+        input["renderable"] = json!(renderable);
         ev(Event::ApprovalRequested {
             tool: "codex_permissions".into(),
             title: None,
-            input: json!({
-                "cwd": "/w", "reason": null, "renderable": renderable, "entries": entries,
-                "network": true, "session_allowed": true, "warning": null, "requested": {}
-            }),
+            input,
             reason: None,
             options: vec![
                 Decision::Allow,
@@ -4429,7 +4431,7 @@ mod tests {
     /// forgets the lot.
     #[test]
     fn extra_access_follows_session_grants_until_the_session_ends() {
-        let entries = json!([{"access": "write", "target": {"kind": "path", "path": "/w/out"}}]);
+        let entries = json!([permission_path("write", "/w/out")]);
         let resolve = |t: &mut Transcript, request: &str, decision| {
             t.apply(
                 &ev(Event::ApprovalResolved { decision }).request(request),
@@ -4473,7 +4475,7 @@ mod tests {
         assert!(t.extra_access().is_empty(), "a new process forgets it");
 
         t.apply(&permission_request("e", json!([]), true), Driver::Codex);
-        let more = json!([{"access": "read", "target": {"kind": "path", "path": "/r"}}]);
+        let more = json!([permission_path("read", "/r")]);
         t.apply(&permission_request("f", more, true), Driver::Codex);
         resolve(&mut t, "f", Decision::AllowForSession);
         assert_eq!(t.extra_access(), ["Read: /r", "Network access"]);
