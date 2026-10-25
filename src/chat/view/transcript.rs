@@ -178,11 +178,15 @@ pub struct TranscriptView {
     /// A card a jump built just now: it has no position until the next layout, so
     /// [`Self::settle`] scrolls to it then.
     jump_to: RefCell<Option<String>>,
-    /// The frame the pending jump started waiting at (see [`Self::jump_gives_up`]).
+    /// The frame time (µs) the pending jump started waiting for its layout at (see
+    /// [`Self::jump_gives_up`]); not counted while a card it sits in is still opening.
     jump_since: Cell<Option<i64>>,
     /// Tests: the content never counts as laid out, as if a layout never came.
     #[cfg(test)]
     never_laid_out: Cell<bool>,
+    /// Tests: added to the frame clock's time, so a wait can be aged without a display.
+    #[cfg(test)]
+    clock_offset: Cell<i64>,
     /// The pending jump also brings the card's focused control into view (an interruption
     /// shelf jump focuses the card's first answer).
     reveal_after_jump: Cell<bool>,
@@ -306,6 +310,8 @@ impl TranscriptView {
             jump_since: Cell::new(None),
             #[cfg(test)]
             never_laid_out: Cell::new(false),
+            #[cfg(test)]
+            clock_offset: Cell::new(0),
             reveal_after_jump: Cell::new(false),
         });
         view.connect_scrolling();
@@ -485,7 +491,12 @@ impl TranscriptView {
             // In a card still opening: placed once it has opened. Gone meanwhile (evicted,
             // removed), or hidden (never allocated): nothing to jump to, whatever the layout.
             let waiting = match &row {
-                Some(w) if self.opening(w) => true,
+                // Opening takes its own time (a revealer's transition): the wait for a layout
+                // only starts once it has opened, so no display rate cuts it short.
+                Some(w) if self.opening(w) => {
+                    self.jump_since.set(None);
+                    return;
+                }
                 Some(w) if w.is_mapped() => {
                     // The value moved since the content was last allocated (its bounds would
                     // mix the old layout with the new value), or the row was built since the
@@ -954,24 +965,34 @@ impl TranscriptView {
         self.jump_since.set(None);
     }
 
-    /// Frames a pending jump waits for its layout before it gives up.
-    const JUMP_PATIENCE: i64 = 30;
+    /// How long (µs of frame-clock time) a pending jump waits for its layout before it gives
+    /// up. Time, not frames: a fast display runs many frames in the time a slow one runs few.
+    const JUMP_PATIENCE_US: i64 = 2_000_000;
 
-    /// A pending jump still waiting: true once it has waited [`Self::JUMP_PATIENCE`] frames,
-    /// when it is dropped (with a debug log), so no layout that never comes leaves one hanging.
+    /// The frame clock's time in µs (plus the tests' offset), `None` with no clock.
+    fn clock_us(&self) -> Option<i64> {
+        let now = self.scroller.frame_clock()?.frame_time();
+        #[cfg(test)]
+        let now = now + self.clock_offset.get();
+        Some(now)
+    }
+
+    /// A pending jump still waiting: true once it has waited [`Self::JUMP_PATIENCE_US`] for
+    /// its layout, when it is dropped (with a debug log), so no layout that never comes leaves
+    /// one hanging.
     fn jump_gives_up(&self, id: &str) -> bool {
-        let Some(frame) = self.scroller.frame_clock().map(|c| c.frame_counter()) else {
+        let Some(now) = self.clock_us() else {
             return false;
         };
         match self.jump_since.get() {
             None => {
-                self.jump_since.set(Some(frame));
+                self.jump_since.set(Some(now));
                 false
             }
-            Some(since) if frame - since > Self::JUMP_PATIENCE => {
+            Some(since) if now - since > Self::JUMP_PATIENCE_US => {
                 tracing::debug!(
                     id,
-                    frames = frame - since,
+                    waited_ms = (now - since) / 1000,
                     "chat transcript: gave up a jump"
                 );
                 self.clear_jump();
@@ -1997,10 +2018,24 @@ impl TranscriptView {
         self.jump_to.borrow().is_some()
     }
 
+    /// Whether the pending jump's row sits in a card that is still opening (tests).
+    #[cfg(test)]
+    pub fn jump_opening(&self) -> bool {
+        let id = self.jump_to.borrow().clone();
+        id.and_then(|id| self.rows.borrow().get(&id).map(Row::widget))
+            .is_some_and(|w| self.opening(&w))
+    }
+
     /// Makes the content never count as laid out, as if its layout never came (tests).
     #[cfg(test)]
     pub fn set_never_laid_out(&self, never: bool) {
         self.never_laid_out.set(never);
+    }
+
+    /// Moves the transcript's view of the frame clock on by `us` (tests).
+    #[cfg(test)]
+    pub fn age_clock(&self, us: i64) {
+        self.clock_offset.set(self.clock_offset.get() + us);
     }
 
     /// Rows built as widgets, nested ones included (tests and measurements).

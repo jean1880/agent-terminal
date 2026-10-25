@@ -3465,22 +3465,79 @@ pub(crate) mod tests {
         t.settle_now();
         assert!(!t.jump_pending(), "a gone row ends its jump");
 
-        // A layout that never comes: the jump gives up after a bounded wait.
+        // A layout that never comes: the jump gives up after a bounded wait, measured in
+        // frame-clock time (aged here, so no display rate decides it).
         t.scroll_to_card("s30");
         assert!(t.jump_pending());
-        let from = t.frames();
-        assert!(
-            crate::testutil::pump_until(&ctx, 15, || !t.jump_pending()),
-            "the jump never gave up"
-        );
-        assert!(t.frames() - from >= 30, "it waited its frames first");
+        t.settle_now();
+        assert!(t.jump_pending(), "the wait has only started");
+        t.age_clock(1_000_000);
+        t.settle_now();
+        assert!(t.jump_pending(), "not before its patience is spent");
+        t.age_clock(2_000_000);
+        t.settle_now();
+        assert!(!t.jump_pending(), "the jump gave up: {}", t.scroll_debug());
         t.set_never_laid_out(false);
+        window.destroy();
+    }
+
+    /// A jump into a card still opening is never given up while it opens, however long the
+    /// revealer's transition runs against the display's frame rate.
+    pub(crate) fn a_jump_into_an_opening_card_waits_for_it() {
+        use agent_core::event::ItemKind;
+        let ctx = glib::MainContext::default();
+        let (view, window, inner) = live_window();
+        let t = &inner.transcript;
+        let settings = gtk4::Settings::default().expect("settings");
+        let animations = settings.is_gtk_enable_animations();
+        settings.set_gtk_enable_animations(true);
+        view.apply(&Envelope::item_started(
+            "agent",
+            ItemKind::Subagent,
+            "Agent",
+            None,
+            None,
+        ));
+        for i in 0..5 {
+            live_step(&view, &format!("c{i}"), Some("agent"));
+        }
+        inner.row_event(RowEvent::Toggle {
+            id: "agent".into(),
+            expanded: false,
+        });
+        for i in 0..40 {
+            live_step(&view, &format!("s{i}"), None);
+        }
+        assert!(crate::testutil::pump_until(&ctx, 10, || {
+            t.row_bounds_in_viewport("s39")
+                .is_some_and(|(b, _)| b.height() > 0.0)
+        }));
+        t.scroll_to_card("c2");
+        assert!(t.jump_pending(), "{}", t.scroll_debug());
+        // However much time passes while the card opens, the jump is kept.
+        if t.jump_opening() {
+            t.age_clock(10_000_000);
+            t.settle_now();
+            assert!(t.jump_pending(), "kept while its card opens");
+        }
+        assert!(
+            crate::testutil::pump_until(&ctx, 10, || !t.jump_pending()),
+            "the jump never landed: {}",
+            t.scroll_debug()
+        );
+        assert!(
+            t.row_bounds_in_viewport("c2").is_some(),
+            "landed on its step: {}",
+            t.scroll_debug()
+        );
+        settings.set_gtk_enable_animations(animations);
         window.destroy();
     }
 
     pub(crate) fn ui_checks() {
         replay_fills_the_window_in_steps();
         a_pending_jump_lands_or_ends();
+        a_jump_into_an_opening_card_waits_for_it();
         a_jump_to_a_built_row_moves_once_onto_it();
         a_focused_later_steps_button_hands_focus_on_back_at_the_end();
         live_append_keeps_the_window_bounded();
