@@ -470,31 +470,43 @@ const GREP_LONG_VALUE: &[&str] = &[
 /// [`GREP_LONG_FLAGS`] and [`GREP_LONG_VALUE`]: recursion (`-r`, `--rec…`), directory or device
 /// actions, or an option this does not know. Such a call is never covered by a session read
 /// pattern ([`Context::args_contained`]).
+///
+/// Read left to right as grep does: an option whose value is the next word takes that word,
+/// whatever it is, before a `--` could end the options (`grep -e -- --rec .` searches for `--`,
+/// recursively). `--color`/`--colour` take only an attached value.
 fn grep_option_unlisted(argv: &[String]) -> bool {
     if argv.first().map(|w| basename(w)) != Some("grep") {
         return false;
     }
-    for word in argv.iter().skip(1) {
+    let mut words = argv.iter().skip(1);
+    while let Some(word) = words.next() {
         if word == "--" {
             break;
         }
-        if let Some(long) = word.strip_prefix("--") {
-            let listed = match long.split_once('=') {
-                Some((name, _)) => GREP_LONG_VALUE.contains(&name),
-                None => GREP_LONG_FLAGS.contains(&long) || GREP_LONG_VALUE.contains(&long),
-            };
-            if !listed {
-                return true;
+        let takes_next = if let Some(long) = word.strip_prefix("--") {
+            match long.split_once('=') {
+                Some((name, _)) if GREP_LONG_VALUE.contains(&name) => false,
+                None if GREP_LONG_FLAGS.contains(&long) => false,
+                None if GREP_LONG_VALUE.contains(&long) => !matches!(long, "color" | "colour"),
+                _ => return true,
             }
         } else if let Some(short) = word.strip_prefix('-').filter(|s| !s.is_empty()) {
-            for letter in short.chars() {
+            let mut takes_next = false;
+            for (i, letter) in short.char_indices() {
                 if GREP_SHORT_VALUE.contains(letter) {
+                    takes_next = i + letter.len_utf8() == short.len();
                     break;
                 }
                 if !GREP_SHORT_FLAGS.contains(letter) {
                     return true;
                 }
             }
+            takes_next
+        } else {
+            false
+        };
+        if takes_next {
+            words.next();
         }
     }
     false
@@ -549,6 +561,9 @@ const RG_FLAGS_LONG: &[&str] = &[
 /// pattern with its value attached (`-eneedle`, `-ie…`, `-f…`, `--regexp=…`, `--file=…`). Any
 /// other option (`-g '!x'`, `-t rust`, `-m 1`, `-e needle`) may make the next word its value, the
 /// path after it the pattern, and the cwd the search, so it counts as searching a folder.
+///
+/// Since no listed option takes the next word, a `--` here is never an option's value
+/// (`rg -e -- -u .` asks at `-e`), so it always ends the options.
 ///
 /// The words left (those not starting with `-`, and every word after `--`) are then exactly
 /// rg's positionals: the first is the pattern unless an option gave one, and every other one must
@@ -670,7 +685,9 @@ pub fn session_folder(action: &Action, ctx: &Context) -> Option<PathBuf> {
             return None;
         }
     }
-    crate::approval_server::folder_auto_matchable(&full, &folder, Some(home)).then_some(folder)
+    (folder_identity(&folder).is_some()
+        && crate::approval_server::folder_auto_matchable(&full, &folder, Some(home)))
+    .then_some(folder)
 }
 
 /// The device and inode of `folder`, when it is a real directory whose path resolves to itself
@@ -684,6 +701,54 @@ fn folder_identity(folder: &Path) -> Option<[u64; 2]> {
     let meta = std::fs::symlink_metadata(folder).ok()?;
     meta.is_dir().then(|| [meta.dev(), meta.ino()])
 }
+
+/// The folder opened (`O_DIRECTORY | O_NOFOLLOW`) and its identity as that handle sees it, when
+/// [`folder_identity`] takes one and the handle is the same folder.
+fn open_folder(folder: &Path) -> Option<([u64; 2], FolderHandle)> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let identity = folder_identity(folder)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(folder)
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    let held = [meta.dev(), meta.ino()];
+    (held == identity).then(|| (identity, FolderHandle(Some(std::sync::Arc::new(file)))))
+}
+
+/// Whether a folder grant still holds: the identity of its held handle, of its path now, and
+/// the one kept at grant time are all known and equal.
+fn folder_still_granted(
+    handle: Option<[u64; 2]>,
+    path: Option<[u64; 2]>,
+    kept: Option<[u64; 2]>,
+) -> bool {
+    kept.is_some() && handle == kept && path == kept
+}
+
+/// An open handle on a granted folder, held for the grant's lifetime so its inode cannot be
+/// freed and reused by another folder while the grant exists. Never serialised: a grant read
+/// back has none, and grants nothing. Ignored by equality (the folder and identity say which
+/// grant it is).
+#[derive(Debug, Clone, Default)]
+pub struct FolderHandle(Option<std::sync::Arc<std::fs::File>>);
+
+impl FolderHandle {
+    fn identity(&self) -> Option<[u64; 2]> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = self.0.as_ref()?.metadata().ok()?;
+        Some([meta.dev(), meta.ino()])
+    }
+}
+
+impl PartialEq for FolderHandle {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for FolderHandle {}
 
 /// `/`, the home folder, or a folder above it: never a folder grant, typed or not.
 fn folder_too_broad(folder: &Path, home: &Path) -> bool {
@@ -1233,13 +1298,17 @@ pub enum Target {
     /// Session only ([`Rule::check`]); matched through
     /// [`crate::approval_server::folder_auto_matchable`] (no `..`, no link out, not sensitive).
     ///
-    /// `identity` is the folder's device and inode when the grant was made ([`folder_identity`]);
-    /// a rule matches only while `dir` still resolves to itself and is that same folder, so a
-    /// folder replaced by a link or another folder grants nothing. `None` matches nothing.
+    /// `identity` is the folder's device and inode when the grant was made ([`folder_identity`]),
+    /// and `handle` holds the folder open from then on ([`FolderHandle`]). A rule matches only
+    /// while `dir` still resolves to itself and it, the handle and `identity` are the same folder
+    /// ([`folder_still_granted`]), so a folder replaced by a link or another folder grants
+    /// nothing. No identity or no handle matches nothing.
     Dir {
         dir: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         identity: Option<[u64; 2]>,
+        #[serde(skip)]
+        handle: FolderHandle,
     },
     /// One MCP server's tool (`*`: any tool of that server).
     Mcp { server: String, tool: String },
@@ -1319,6 +1388,7 @@ impl Rule {
                 Target::Dir {
                     dir: dir.to_owned(),
                     identity: None,
+                    handle: FolderHandle::default(),
                 }
             }
             ActionKind::Edit | ActionKind::Read => {
@@ -1442,9 +1512,13 @@ impl Rule {
 
     /// An exact edit rule made the session folder rule for `folder` ([`session_folder`]).
     fn into_folder(mut self, folder: &Path) -> Self {
+        // Held open for the grant's lifetime; a folder that cannot be opened grants nothing.
+        let (identity, handle) =
+            open_folder(folder).map_or((None, FolderHandle::default()), |(id, h)| (Some(id), h));
         self.target = Target::Dir {
             dir: folder.to_string_lossy().into_owned(),
-            identity: folder_identity(folder),
+            identity,
+            handle,
         };
         self
     }
@@ -1465,20 +1539,33 @@ impl Rule {
             let canonical = crate::approval_server::canonical_target(Path::new(p));
             *p = canonical.to_string_lossy().into_owned();
         }
-        if let Target::Dir { dir, identity } = &mut self.target {
-            *identity = folder_identity(Path::new(dir));
-        }
         // A typed folder is the user's choice, but never `/`, home or above it, and never without
-        // the home folder known (the dotfile protections need it).
-        if let Target::Dir { dir, .. } = &self.target {
+        // the home folder known (the dotfile protections need it). It is held open from here
+        // ([`open_folder`]); one that cannot be is refused rather than kept granting nothing.
+        if let Target::Dir {
+            dir,
+            identity,
+            handle,
+        } = &mut self.target
+        {
             let home = ctx
                 .home
                 .ok_or("a folder rule needs the home folder known; keep the one file instead")?;
-            if folder_too_broad(Path::new(dir), home) {
+            let folder = Path::new(dir.as_str());
+            if folder_too_broad(folder, home) {
                 return Err(format!(
                     "{dir}/ is `/`, your home folder or above it: too wide for a folder rule"
                 ));
             }
+            let (id, held) = open_folder(folder).ok_or_else(|| {
+                if std::fs::symlink_metadata(folder).is_err() {
+                    format!("{dir}/ does not exist yet; create it first")
+                } else {
+                    format!("{dir}/ is not a plain folder (a link, or not a folder at all)")
+                }
+            })?;
+            *identity = Some(id);
+            *handle = held;
         }
         Ok(self)
     }
@@ -1609,17 +1696,21 @@ impl Rule {
             }
             // No home known: the home-dotfile protections cannot apply, so nothing matches.
             // The folder granted, still the same folder at the same canonical path.
-            (Target::Dir { dir, identity }, Action::Edit { .. }) => {
-                match (&probe.named_path, &probe.home) {
-                    (Some(p), Some(home)) => {
-                        let dir = Path::new(dir);
-                        identity.is_some()
-                            && folder_identity(dir) == *identity
-                            && crate::approval_server::folder_auto_matchable(p, dir, Some(home))
-                    }
-                    _ => false,
+            (
+                Target::Dir {
+                    dir,
+                    identity,
+                    handle,
+                },
+                Action::Edit { .. },
+            ) => match (&probe.named_path, &probe.home) {
+                (Some(p), Some(home)) => {
+                    let dir = Path::new(dir);
+                    folder_still_granted(handle.identity(), folder_identity(dir), *identity)
+                        && crate::approval_server::folder_auto_matchable(p, dir, Some(home))
                 }
-            }
+                _ => false,
+            },
             (Target::Mcp { server, tool }, Action::Mcp { server: s, tool: t }) => {
                 server == s && (tool == "*" || tool == t)
             }
@@ -4537,6 +4628,8 @@ mod tests {
             "rg --color always README.md",
             "rg --max-count 1 README.md",
             "rg -nz needle README.md",
+            "rg -e -- -u .",
+            "rg --regexp -- -u .",
         ]
         .into_iter()
         .filter(|call| rg.matches(&shell(call), &c))
@@ -4594,6 +4687,83 @@ mod tests {
         assert!(covered.is_empty(), "covered unasked: {covered:?}");
     }
 
+    /// A folder grant holds its folder open, so the inode cannot be recycled while it lives, and
+    /// matches only while that handle, the path and the identity kept at grant time agree. A
+    /// grant without its handle (one read back from JSON) or for a folder that is not there yet
+    /// grants nothing.
+    #[test]
+    fn a_session_folder_grant_is_bound_to_an_open_handle() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = std::fs::canonicalize(tmp.path()).expect("canon");
+        let ws = root.join("ws");
+        let src = ws.join("src");
+        let home = root.join("home");
+        for d in [&src, &home] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        let ws_s = ws.to_string_lossy().into_owned();
+        let c = Context {
+            driver: "claude",
+            workspace: &ws,
+            cwd: Some(&ws_s),
+            home: Some(&home),
+        };
+        let edit = |p: &Path| Action::Edit {
+            path: p.to_string_lossy().into_owned(),
+        };
+        let rule =
+            decide(Some(&edit(&src.join("a.rs"))), None, Scope::Session, &c).expect("session rule");
+        assert!(rule.matches(&edit(&src.join("b.rs")), &c));
+        let mut problems = Vec::new();
+        // Read back without its handle: the identity alone is no proof.
+        let json = serde_json::to_string(&rule).expect("serialise");
+        let reread: Rule = serde_json::from_str(&json).expect("deserialise");
+        if reread.matches(&edit(&src.join("b.rs")), &c) {
+            problems.push("a grant read back without its handle still matches");
+        }
+        // Deleted and recreated at the same path (the held handle keeps the old inode alive).
+        std::fs::remove_dir(&src).expect("delete");
+        std::fs::create_dir(&src).expect("recreate");
+        if rule.matches(&edit(&src.join("b.rs")), &c) {
+            problems.push("a recreated folder still matches");
+        }
+        // A typed folder that does not exist yet is refused, with a reason, not kept dead.
+        let missing = ws.join("later");
+        match Rule::new("", "Edit", format!("{}/", missing.display())).complete(&c) {
+            Ok(_) => problems.push("a missing typed folder was kept"),
+            Err(why) if !why.contains("does not exist yet; create it first") => {
+                problems.push("a missing typed folder was refused without the reason")
+            }
+            Err(_) => {}
+        }
+        // A file in a folder not created yet keeps the exact file.
+        if session_folder(&edit(&ws.join("new/dir/c.rs")), &c).is_some() {
+            problems.push("a folder that is not there yet was offered");
+        }
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    /// The comparison a folder grant makes: the held handle, the path now and the identity kept
+    /// at grant time must all be known and agree.
+    #[test]
+    fn a_folder_grant_needs_handle_path_and_identity_to_agree() {
+        let id = Some([1, 2]);
+        assert!(folder_still_granted(id, id, id));
+        for (handle, path, kept) in [
+            (None, id, id),
+            (id, None, id),
+            (id, id, None),
+            (Some([1, 3]), id, id),
+            (id, Some([1, 3]), id),
+            (id, id, Some([9, 2])),
+        ] {
+            assert!(
+                !folder_still_granted(handle, path, kept),
+                "{handle:?} {path:?} {kept:?}"
+            );
+        }
+    }
+
     /// GNU grep and git take any unambiguous prefix of a long option, so an abbreviation is the
     /// option itself: `grep --rec` recurses, `git diff --ext` runs the external diff.
     #[test]
@@ -4623,6 +4793,7 @@ mod tests {
             (&grep, "grep -inw -A 3 needle README.md"),
             (&grep, "grep --ignore-case --max-count=5 needle README.md"),
             (&grep, "grep -e needle -- README.md"),
+            (&grep, "grep -e -- README.md"),
             (&diff, "git diff --stat"),
             (&log, "git log --oneline -5"),
         ] {
@@ -4639,6 +4810,11 @@ mod tests {
             (&diff, "git diff --textc"),
             (&log, "git log --outp=x"),
             (&log, "git log --show-sig"),
+            // A `--` that is an option's value is not the end of the options.
+            (&grep, "grep -v -e -- --dereference-recurs ."),
+            (&grep, "grep -l -e -- --rec dir"),
+            (&grep, "grep -m -- -r needle ."),
+            (&grep, "grep --regexp -- --rec ."),
         ]
         .into_iter()
         .filter(|(rule, call)| rule.matches(&shell(call), &c))
@@ -4896,6 +5072,7 @@ mod tests {
             Target::Dir {
                 dir: src.to_string_lossy().into_owned(),
                 identity: folder_identity(&src),
+                handle: FolderHandle::default(),
             }
         );
         assert!(folder_identity(&src).is_some());
