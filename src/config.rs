@@ -931,10 +931,15 @@ fn keep_copy(path: &Path, tag: &str) -> Option<PathBuf> {
                 p.file_name()
                     .is_some_and(|n| n.to_string_lossy().starts_with(&prefix))
             })
+            .filter(|p| reusable_copy(p))
             .find(|p| fs::read(p).is_ok_and(|kept| kept == content))
     });
-    if existing.is_some() {
-        return existing;
+    if let Some(existing) = existing {
+        // An older build wrote its copies with the umask (0644): narrow one before reusing it.
+        // A copy that cannot be narrowed is not reused; a fresh private one is written.
+        if make_private(&existing) {
+            return Some(existing);
+        }
     }
 
     let nanos = std::time::SystemTime::now()
@@ -950,6 +955,37 @@ fn keep_copy(path: &Path, tag: &str) -> Option<PathBuf> {
             None
         }
     }
+}
+
+/// Whether a file named as a kept copy may be reused: a regular file (not a symlink, so neither
+/// its contents nor a mode change reach another file) owned by this user.
+fn reusable_copy(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    fs::symlink_metadata(path)
+        .is_ok_and(|m| m.file_type().is_file() && m.uid() == agent_kit::fsutil::effective_uid())
+}
+
+/// Narrows a kept copy to `0600` when it is wider, through a handle opened without following a
+/// symlink, so the mode change lands on the very file checked. `false` when it cannot be done.
+fn make_private(path: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    let Ok(file) = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    else {
+        return false;
+    };
+    let Ok(meta) = file.metadata() else {
+        return false;
+    };
+    if !meta.file_type().is_file() || meta.uid() != agent_kit::fsutil::effective_uid() {
+        return false;
+    }
+    meta.permissions().mode() & 0o077 == 0
+        || file
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .is_ok()
 }
 
 thread_local! {
@@ -2863,6 +2899,41 @@ mod tests {
             field_change(parse("--verbose"), &saved, true),
             FieldChange::Keep
         );
+    }
+
+    #[test]
+    fn an_older_builds_0644_backup_is_made_private_when_reused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let broken = br#"{ "env": {"TOKEN": "s3cret"}, oops }"#;
+        std::fs::write(&path, broken).unwrap();
+        // An identical copy an older build left world-readable.
+        let old = dir.path().join("config.json.invalid-1");
+        std::fs::write(&old, broken).unwrap();
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let kept = keep_copy(&path, "invalid").expect("kept");
+        let mode = std::fs::metadata(&kept).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "kept copy is {:o}", mode & 0o777);
+        let mode = std::fs::metadata(&old).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "the old copy is {:o}", mode & 0o777);
+
+        // A symlink with the copy's name is never reused (nor its target's mode changed).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, broken).unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::write(&elsewhere, broken).unwrap();
+        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = dir.path().join("config.json.invalid-1");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+        let kept = keep_copy(&path, "invalid").expect("kept");
+        assert_ne!(kept, link, "a symlink was reused");
+        let meta = std::fs::symlink_metadata(&kept).unwrap();
+        assert!(meta.file_type().is_file());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        let mode = std::fs::metadata(&elsewhere).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o644, "the link's target was touched");
     }
 
     #[test]
