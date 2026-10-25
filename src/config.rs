@@ -806,6 +806,36 @@ pub fn parse_permission_sources(text: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+/// What a free-text settings row does with its text ([`field_change`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldChange<T> {
+    /// The text does not parse: show why. The saved value stays in use.
+    Invalid(String),
+    /// Valid, and nothing is to be written now.
+    Keep,
+    /// Valid and different from the saved value: write it.
+    Persist(T),
+}
+
+/// The rule for a free-text settings row: validate on every change, persist only on commit.
+///
+/// `parsed` is the row's text as parsed. `saved` is the value in use, and `commit` says
+/// whether the user committed the text (Enter, the apply button, focus leaving the row, or the
+/// dialog closing) rather than still typing. A valid draft is never written while it is being
+/// typed, so a half-typed value never reaches the config (or restarts an agent). An invalid
+/// text is reported both while typing and on commit, and the saved value is kept.
+pub fn field_change<T: PartialEq>(
+    parsed: Result<T, String>,
+    saved: &T,
+    commit: bool,
+) -> FieldChange<T> {
+    match parsed {
+        Err(reason) => FieldChange::Invalid(reason),
+        Ok(value) if commit && value != *saved => FieldChange::Persist(value),
+        Ok(_) => FieldChange::Keep,
+    }
+}
+
 impl TerminalConfig {
     /// [`Self::permission_sources`] as paths (`~/` expanded), for the import and export code.
     pub fn permission_source_paths(&self) -> Vec<PathBuf> {
@@ -2792,6 +2822,44 @@ mod tests {
             new_agent_profile(Driver::Agy).driver,
             Some(Driver::Agy),
             "a profile made for an agent records it"
+        );
+    }
+
+    #[test]
+    fn a_half_typed_setting_is_validated_but_saved_only_on_commit() {
+        let saved = vec!["--verbose".to_string()];
+        let parse = |text: &str| -> Result<Vec<String>, String> {
+            if text.matches('\'').count() % 2 == 1 {
+                Err("Unfinished quote".into())
+            } else {
+                Ok(text.split_whitespace().map(str::to_owned).collect())
+            }
+        };
+        // Typing `--model opus` into Extra Arguments: every keystroke is a valid draft, and
+        // none of them is written while the user types.
+        for typed in ["-", "--m", "--model", "--model o", "--model opus"] {
+            assert_eq!(
+                field_change(parse(typed), &saved, false),
+                FieldChange::Keep,
+                "{typed:?} was saved while typing"
+            );
+        }
+        // Enter (or focus leaving, or the dialog closing) writes the finished value.
+        assert_eq!(
+            field_change(parse("--model opus"), &saved, true),
+            FieldChange::Persist(vec!["--model".to_string(), "opus".to_string()])
+        );
+        // An unfinished quote is reported while typing and on commit; the saved value stays.
+        for commit in [false, true] {
+            assert_eq!(
+                field_change(parse("--model 'op"), &saved, commit),
+                FieldChange::Invalid("Unfinished quote".into())
+            );
+        }
+        // Committing the value already in use writes nothing.
+        assert_eq!(
+            field_change(parse("--verbose"), &saved, true),
+            FieldChange::Keep
         );
     }
 

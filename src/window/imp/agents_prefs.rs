@@ -12,7 +12,7 @@ use agent_core::adapter::{Driver, Mode};
 
 use super::*;
 use crate::availability::{AgentAvailability, Availability};
-use crate::config::Profile;
+use crate::config::{FieldChange, Profile};
 use crate::model_catalog::ModelCatalog;
 
 mod delegation;
@@ -105,6 +105,13 @@ impl EditDebounce {
         if let Some(pending) = pending {
             pending();
         }
+    }
+
+    /// Keeps `then` until [`Self::flush`] (a commit, the dialog or the window closing) with no
+    /// timer: for a row that persists only on commit.
+    fn hold(&self, then: impl FnOnce() + 'static) {
+        self.cancel();
+        *self.pending.borrow_mut() = Some(std::boxed::Box::new(then));
     }
 
     fn schedule(self: &Rc<Self>, then: impl FnOnce() + 'static) {
@@ -1823,24 +1830,72 @@ impl AgentTerminalWindow {
                 .collect::<Vec<_>>()
                 .join(" "),
         );
+        // Validated on every change, saved only on commit (Enter, the apply button, focus
+        // leaving the row, or the dialog or window closing): a half-typed argument list is
+        // never written, and never restarts the agent.
+        args.set_show_apply_button(true);
+        let args_timer = self.agent_edit_timer(dialog);
+        let commit_args = Rc::new(glib::clone!(
+            #[weak]
+            obj,
+            #[weak]
+            args,
+            #[weak]
+            args_error,
+            move || {
+                let imp = obj.imp();
+                let saved = imp.agent_profile_now(driver).args;
+                match crate::config::field_change(parse_args(&args.text()), &saved, true) {
+                    FieldChange::Invalid(reason) => {
+                        show_validation(&args, &args_error, ARGS_HELP, Some(&reason));
+                    }
+                    FieldChange::Keep => {}
+                    FieldChange::Persist(parsed) => {
+                        imp.edit_agent_profile(driver, |p| p.args = parsed);
+                    }
+                }
+            }
+        ));
         args.connect_changed(glib::clone!(
             #[weak]
             obj,
             #[weak]
             args_error,
-            move |row| match parse_args(&row.text()) {
-                Ok(parsed) => {
-                    show_validation(row, &args_error, ARGS_HELP, None);
-                    let imp = obj.imp();
-                    if imp.agent_profile_now(driver).args != parsed {
-                        imp.edit_agent_profile(driver, |p| p.args = parsed);
+            #[strong]
+            args_timer,
+            #[strong]
+            commit_args,
+            move |row| {
+                let saved = obj.imp().agent_profile_now(driver).args;
+                match crate::config::field_change(parse_args(&row.text()), &saved, false) {
+                    FieldChange::Invalid(reason) => {
+                        args_timer.cancel();
+                        show_validation(row, &args_error, ARGS_HELP, Some(&reason));
                     }
-                }
-                Err(reason) => {
-                    show_validation(row, &args_error, ARGS_HELP, Some(&reason));
+                    FieldChange::Keep | FieldChange::Persist(_) => {
+                        show_validation(row, &args_error, ARGS_HELP, None);
+                        let commit = commit_args.clone();
+                        args_timer.hold(move || commit());
+                    }
                 }
             }
         ));
+        let commit_now = glib::clone!(
+            #[strong]
+            args_timer,
+            move || args_timer.flush()
+        );
+        args.connect_apply({
+            let commit_now = commit_now.clone();
+            move |_| commit_now()
+        });
+        args.connect_entry_activated({
+            let commit_now = commit_now.clone();
+            move |_| commit_now()
+        });
+        let focus = gtk4::EventControllerFocus::new();
+        focus.connect_leave(move |_| commit_now());
+        args.add_controller(focus);
         group.add(&args);
         group.add(&args_error);
 
@@ -2439,6 +2494,24 @@ pub(super) mod tests {
         *timer.pending.borrow_mut() = Some(std::boxed::Box::new(move || seen.set(true)));
         drop(timer);
         assert!(saved.get());
+    }
+
+    #[test]
+    fn a_held_commit_runs_only_on_flush_and_an_invalid_edit_drops_it() {
+        let commits = Rc::new(std::cell::Cell::new(0));
+        let timer = EditDebounce::default();
+        let seen = commits.clone();
+        timer.hold(move || seen.set(seen.get() + 1));
+        assert_eq!(commits.get(), 0, "a draft is not saved while typing");
+        timer.flush(); // Enter, focus leaving, or the dialog or window closing
+        assert_eq!(commits.get(), 1);
+        timer.flush();
+        assert_eq!(commits.get(), 1, "one commit per draft");
+        let seen = commits.clone();
+        timer.hold(move || seen.set(seen.get() + 1));
+        timer.cancel(); // the text turned invalid
+        drop(timer);
+        assert_eq!(commits.get(), 1);
     }
 
     #[test]
