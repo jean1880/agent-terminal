@@ -2241,26 +2241,12 @@ impl AgentTerminalWindow {
                     ),
                 )
                 .await;
-                let badge = crate::hook_config::badge(&probe, bound);
-                crate::hook_config::log_verdict(badge, &probe, bound);
-                let (text, class) = match badge {
-                    crate::hook_config::HookBadge::Ready => (
-                        "Ready: Hook entry present and runtime directory available.",
-                        None,
-                    ),
-                    crate::hook_config::HookBadge::Missing => (
-                        "Not installed: Antigravity cannot ask before acting until the entry below is added.",
-                        Some("error"),
-                    ),
-                    crate::hook_config::HookBadge::Unreadable => (
-                        "Could not verify the approval hook for a thread. Treat Antigravity as ungated.",
-                        Some("warning"),
-                    ),
-                };
-                let detail = match &probe {
-                    crate::hook_config::HookProbe::Unreadable(why) => format!("Could not verify: {why}"),
-                    _ => text.to_owned(),
-                };
+                crate::hook_config::log_verdict(
+                    crate::hook_config::badge(&probe, bound),
+                    &probe,
+                    bound,
+                );
+                let (detail, class) = hook_status(&probe, bound);
                 let detail = format!(
                     "{detail}\nAny other Antigravity hooks file (home or plugin) must also route \
                      through this app's approval hook, or Antigravity runs without skipping permissions."
@@ -2273,6 +2259,37 @@ impl AgentTerminalWindow {
                 }
             }
         ));
+    }
+}
+
+/// The Approval Hook row's text and style class for a probe of the hooks file and whether the
+/// approval socket can be bound. Every state that is not Ready says why.
+fn hook_status(
+    probe: &crate::hook_config::HookProbe,
+    socket_bound: bool,
+) -> (String, Option<&'static str>) {
+    use crate::hook_config::{HookBadge, HookProbe};
+    match crate::hook_config::badge(probe, socket_bound) {
+        HookBadge::Ready => (
+            "Ready: Hook entry present and runtime directory available.".to_owned(),
+            None,
+        ),
+        HookBadge::Missing => (
+            "Not installed: Antigravity cannot ask before acting until the entry below is added."
+                .to_owned(),
+            Some("error"),
+        ),
+        HookBadge::Unreadable => {
+            let text = match probe {
+                HookProbe::Unreadable(why) => format!("Could not verify: {why}"),
+                // The badge's only other unverified case: installed, with no socket to bind.
+                _ => "Could not verify: the hook entry is present, but no approval socket can \
+                      be bound ($XDG_RUNTIME_DIR is unset or not a directory). Treat \
+                      Antigravity as ungated."
+                    .to_owned(),
+            };
+            (text, Some("warning"))
+        }
     }
 }
 
@@ -2587,6 +2604,25 @@ pub(super) mod tests {
         *timer.pending.borrow_mut() = Some(std::boxed::Box::new(move || seen.set(true)));
         drop(timer);
         assert!(saved.get());
+    }
+
+    #[test]
+    fn a_hook_with_no_bindable_socket_says_why_it_is_unverified() {
+        use crate::hook_config::HookProbe;
+        // The entry is installed, but $XDG_RUNTIME_DIR is unusable, so no socket can be bound.
+        let (text, class) = hook_status(&HookProbe::Installed, false);
+        assert_eq!(class, Some("warning"));
+        assert!(text.contains("socket"), "no reason given: {text}");
+        assert!(text.contains("XDG_RUNTIME_DIR"), "no reason given: {text}");
+        assert!(text.contains("ungated"), "{text}");
+        // An unreadable file still names its own reason; ready and missing are unchanged.
+        let (text, _) = hook_status(&HookProbe::Unreadable("permission denied".into()), true);
+        assert_eq!(text, "Could not verify: permission denied");
+        assert_eq!(hook_status(&HookProbe::Installed, true).1, None);
+        assert_eq!(
+            hook_status(&HookProbe::Missing("no entry".into()), true).1,
+            Some("error")
+        );
     }
 
     #[test]
