@@ -616,20 +616,24 @@ fn git_sub(sub: &str, rest: &[String]) -> GitAction {
                 _ => "Read repository information",
             };
             let mut a = new(Inspect, ReadOnly, words);
-            let args = parse(rest, NO_OPTIONS);
+            let spec = if sub == "grep" {
+                GREP_VALUES
+            } else {
+                NO_OPTIONS
+            };
+            let args = parse(rest, spec);
             a.list("Of", &args.targets());
             // `--output` writes a file; `--ext-diff`/`--textconv` run configured programs.
-            // `git grep -O`/`--open-files-in-pager` opens the matches in a program.
-            let opens_pager = sub == "grep"
-                && args
-                    .opts
-                    .iter()
-                    .any(|(n, _)| n == "-O" || n.starts_with("--open-files-in-pager"));
+            // `git grep -O`/`--open-files-in-pager` opens the matches in a program. Git takes
+            // any unambiguous prefix of a long option.
+            let opens_pager = sub == "grep" && args.opts.iter().any(|(n, _)| n == "-O");
             if opens_pager
-                || args
-                    .opts
-                    .iter()
-                    .any(|(n, _)| ["--output", "--ext-diff", "--textconv"].contains(&n.as_str()))
+                || args.opts.iter().any(|(n, _)| {
+                    long_option_is(
+                        n,
+                        &["open-files-in-pager", "textconv", "ext-diff", "output"],
+                    )
+                })
             {
                 a.reach = Local;
                 a.warn("An option here writes a file or runs a configured program.");
@@ -1160,6 +1164,40 @@ fn git_branch(rest: &[String]) -> GitAction {
     a
 }
 
+/// `git grep`'s options that take a value, so a pattern such as `-O` is not read as an option.
+const GREP_VALUES: Spec<'static> = Spec {
+    values: &[
+        "-e",
+        "-f",
+        "-A",
+        "-B",
+        "-C",
+        "-m",
+        "--regexp",
+        "--file",
+        "--after-context",
+        "--before-context",
+        "--context",
+        "--max-count",
+        "--max-depth",
+        "--threads",
+    ],
+    flags: &[],
+    optional: &[],
+};
+
+/// Whether `name` (`--x`, as parsed) is `--x` for an `x` that is at least three characters and
+/// a prefix of one of `full`: git accepts any unambiguous abbreviation of a long option.
+fn long_option_is(name: &str, full: &[&str]) -> bool {
+    name.strip_prefix("--")
+        .is_some_and(|x| x.len() >= 3 && full.iter().any(|f| f.starts_with(x)))
+}
+
+/// A word that cannot be taken for a revision: `.`, or anything with a `/` or an extension.
+fn looks_like_path(word: &str) -> bool {
+    word.contains('/') || word.contains('.')
+}
+
 fn git_checkout(rest: &[String]) -> GitAction {
     let mut a = GitAction::new(Tool::Git, Kind::Switch, Reach::Local, "Check out");
     let args = parse_for(
@@ -1206,15 +1244,16 @@ fn git_checkout(rest: &[String]) -> GitAction {
         || args.positionals.iter().any(|p| p == ".")
     {
         a.kind = Kind::Restore;
-        let files = args.targets();
-        // Without `--`, two or more positionals are `<rev> <file>...`.
-        let source = (!args.paths.is_empty() || args.positionals.len() >= 2)
+        // Without `--`, two or more positionals are `<rev> <file>...`, unless the first looks
+        // like a path (`.`, `src/`, `a.rs`): git then takes every word as a pathspec.
+        let first_is_path = args.positionals.first().is_some_and(|p| looks_like_path(p));
+        let source = (!args.paths.is_empty() || (args.positionals.len() >= 2 && !first_is_path))
             .then(|| args.positionals.first().cloned())
             .flatten();
         let files: Vec<String> = match &source {
             Some(_) if !args.paths.is_empty() => args.paths.clone(),
             Some(_) => args.positionals[1..].to_vec(),
-            None => files,
+            None => args.targets(),
         };
         a.title = match &source {
             Some(rev) => format!("Replace files with their version in {rev}"),
@@ -1222,7 +1261,7 @@ fn git_checkout(rest: &[String]) -> GitAction {
         };
         a.list("Files", &files);
         a.warn("Overwrites these files in the working tree; their uncommitted changes are lost.");
-        if args.paths.is_empty() && args.positionals.len() >= 2 {
+        if args.paths.is_empty() && source.is_some() {
             a.detail(
                 "Note",
                 "read as <revision> <files>; if the first word is a file, all of them are discarded",
@@ -2935,14 +2974,71 @@ mod tests {
         assert_eq!(a.title, "Replace files with their version in HEAD~1");
         assert!(a.destructive());
         assert!(a.warnings.iter().any(|w| w.contains("Overwrites")));
-        // Two files and no rev is not possible without `--`, so the first is still a rev.
         let a = read(&["git", "checkout", "main", "a.rs", "b.rs"]);
+        assert_eq!(detail(&a, "Files"), Some("a.rs, b.rs"));
         assert_eq!(a.kind, Kind::Restore);
         assert!(a.destructive());
         // `-b` keeps its meaning: the second positional is a start point only.
         let a = read(&["git", "checkout", "-b", "n", "main"]);
         assert_eq!(a.kind, Kind::Switch);
         assert!(!a.destructive());
+    }
+
+    #[test]
+    fn checkout_with_a_path_first_lists_every_word_as_a_file() {
+        for (words, files) in [
+            (&["git", "checkout", ".", "a.rs"][..], "., a.rs"),
+            (&["git", "checkout", "src/", "a.rs"], "src/, a.rs"),
+            (&["git", "checkout", "a.rs", "b.rs"], "a.rs, b.rs"),
+        ] {
+            let a = read(words);
+            assert_eq!(a.kind, Kind::Restore, "{words:?}");
+            assert_eq!(a.title, "Discard uncommitted changes in files", "{words:?}");
+            assert_eq!(detail(&a, "Files"), Some(files), "{words:?}");
+            assert!(a.destructive(), "{words:?}");
+        }
+        // A bare word stays a revision, with the note that it might be a file.
+        let a = read(&["git", "checkout", "main", "a.rs"]);
+        assert_eq!(detail(&a, "Files"), Some("a.rs"));
+        assert!(detail(&a, "Note").is_some());
+    }
+
+    #[test]
+    fn abbreviated_program_options_are_not_read_only() {
+        for words in [
+            &["git", "grep", "--open-files-in-page=vim", "foo"][..],
+            &["git", "grep", "--open-files", "foo"],
+            &["git", "grep", "--textcon", "foo"],
+            &["git", "diff", "--textcon"],
+            &["git", "log", "--ext-di"],
+            &["git", "log", "--outp=x"],
+        ] {
+            let a = read(words);
+            assert_eq!(a.reach, Reach::Local, "{words:?}");
+            assert!(a.destructive(), "{words:?}");
+        }
+        for words in [
+            &["git", "log", "--no-ext-diff"][..],
+            &["git", "log", "--ou"],
+            &["git", "log", "--oneline"],
+        ] {
+            assert_eq!(read(words).reach, Reach::ReadOnly, "{words:?}");
+        }
+    }
+
+    #[test]
+    fn grep_option_values_and_the_end_of_options_are_not_options() {
+        for words in [
+            &["git", "grep", "-e", "-O", "--", "a.rs"][..],
+            &["git", "grep", "-e", "-O"],
+            &["git", "grep", "--regexp", "-O", "a.rs"],
+            &["git", "grep", "-nC3", "foo"],
+            &["git", "grep", "foo", "--", "-O"],
+        ] {
+            let a = read(words);
+            assert_eq!(a.reach, Reach::ReadOnly, "{words:?}");
+            assert!(!a.destructive(), "{words:?}");
+        }
     }
 
     #[test]
