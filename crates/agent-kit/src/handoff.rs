@@ -9,7 +9,6 @@
 //! it is unit-tested without a display. Callers run the blocking parts through
 //! `gio::spawn_blocking`.
 
-use crate::paths::expand_tilde;
 use crate::sessions::{find_transcript, read_agy_history, SessionFormat};
 use agent_core::redact::redact;
 use std::io::Write;
@@ -182,7 +181,7 @@ pub fn read_agy_conversation(history: &str, session_id: &str) -> Conversation {
 /// Keeps the latest prompts (minus a repeat of the first) and files. Text
 /// sizes are capped when the brief is rendered.
 fn finish(conversation: &mut Conversation, mut prompts: Vec<String>) {
-    if prompts.first() == conversation.first_prompt.as_ref() {
+    if !prompts.is_empty() && prompts.first() == conversation.first_prompt.as_ref() {
         prompts.remove(0);
     }
     let skip = prompts.len().saturating_sub(RECENT_PROMPTS);
@@ -404,12 +403,24 @@ pub fn handoff_prompt(from: &str, brief: &Path) -> String {
 /// Where briefs are kept: `$XDG_STATE_HOME/agent-terminal/handoffs`, falling
 /// back to `~/.local/state/…`. Outside every project, so a brief never lands in
 /// a work tree or a commit.
-pub fn briefs_dir(xdg_state_home: Option<&str>, home: Option<&str>) -> PathBuf {
-    let base = match xdg_state_home.filter(|s| !s.trim().is_empty()) {
-        Some(state) => PathBuf::from(expand_tilde(state)),
-        None => PathBuf::from(home.unwrap_or("/tmp")).join(".local/state"),
+///
+/// Like the thread store, only an absolute `XDG_STATE_HOME` counts (empty,
+/// relative and `~` values are ignored, as the XDG spec requires), and with no
+/// usable home there is no directory: `None`, never a shared `/tmp`.
+pub fn briefs_dir_checked(xdg_state_home: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+    let base = match xdg_state_home.filter(|s| Path::new(s).is_absolute()) {
+        Some(state) => PathBuf::from(state),
+        None => PathBuf::from(home.filter(|h| !h.is_empty())?).join(".local/state"),
     };
-    base.join("agent-terminal").join("handoffs")
+    Some(base.join("agent-terminal").join("handoffs"))
+}
+
+/// The older form of [`briefs_dir_checked`], kept for existing callers: the
+/// same XDG rule, but with no usable home it still falls back to `/tmp`.
+/// Prefer [`briefs_dir_checked`].
+pub fn briefs_dir(xdg_state_home: Option<&str>, home: Option<&str>) -> PathBuf {
+    briefs_dir_checked(xdg_state_home, home)
+        .unwrap_or_else(|| PathBuf::from("/tmp/.local/state/agent-terminal/handoffs"))
 }
 
 /// Writes a brief atomically, readable by its owner only, and prunes old ones.
@@ -814,6 +825,31 @@ mod tests {
         prune_briefs(&dir, std::time::Duration::ZERO);
         assert!(!path.exists());
         assert!(!second.exists());
+    }
+
+    #[test]
+    fn finish_with_no_prompts_does_not_panic() {
+        let mut conversation = Conversation::default();
+        finish(&mut conversation, Vec::new());
+        assert!(conversation.recent_prompts.is_empty());
+    }
+
+    #[test]
+    fn relative_or_tilde_xdg_state_home_is_ignored() {
+        let default = PathBuf::from("/h/.local/state/agent-terminal/handoffs");
+        assert_eq!(briefs_dir(Some("rel/state"), Some("/h")), default);
+        assert_eq!(briefs_dir(Some("~/state"), Some("/h")), default);
+    }
+
+    #[test]
+    fn no_home_and_no_absolute_xdg_yields_no_briefs_dir() {
+        assert_eq!(briefs_dir_checked(None, None), None);
+        assert_eq!(briefs_dir_checked(None, Some("")), None);
+        assert_eq!(briefs_dir_checked(Some("rel"), Some("")), None);
+        assert_eq!(
+            briefs_dir_checked(Some("/s"), None),
+            Some(PathBuf::from("/s/agent-terminal/handoffs"))
+        );
     }
 
     #[test]
