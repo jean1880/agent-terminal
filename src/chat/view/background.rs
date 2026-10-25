@@ -15,6 +15,7 @@ use gtk4::prelude::*;
 
 use super::cards::{label, wrapped_text};
 use super::model::task_name;
+use super::panels::{follow_dialog, popover_list, scrolled};
 use super::payload::TaskOutput;
 
 /// What a task is, as its row says.
@@ -51,17 +52,7 @@ pub struct BackgroundButton {
 impl BackgroundButton {
     /// `open` is called with the task the user picked.
     pub fn new(open: impl Fn(&BackgroundTask) + 'static) -> Rc<Self> {
-        let list = gtk4::ListBox::new();
-        list.add_css_class("subagent-list");
-        list.set_selection_mode(gtk4::SelectionMode::None);
-        let scroller = gtk4::ScrolledWindow::new();
-        scroller.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
-        scroller.set_propagate_natural_height(true);
-        scroller.set_propagate_natural_width(true);
-        scroller.set_max_content_height(360);
-        scroller.set_child(Some(&list));
-        let popover = gtk4::Popover::new();
-        popover.set_child(Some(&scroller));
+        let (list, popover) = popover_list(360);
         let button = gtk4::MenuButton::new();
         button.set_label("Show tasks");
         button.add_css_class("flat");
@@ -175,10 +166,6 @@ pub struct TaskOutputPanel {
 
 impl TaskOutputPanel {
     pub fn new(task: &BackgroundTask) -> Rc<Self> {
-        let dialog = adw::Dialog::new();
-        dialog.set_content_width(760);
-        dialog.set_content_height(560);
-        dialog.set_title(&task_name(task));
         let body = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
         body.set_margin_top(12);
         body.set_margin_bottom(18);
@@ -200,21 +187,15 @@ impl TaskOutputPanel {
         view.set_bottom_margin(10);
         view.set_left_margin(12);
         view.set_right_margin(12);
-        let scroller = gtk4::ScrolledWindow::new();
-        scroller.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
-        scroller.set_vexpand(true);
+        let scroller = scrolled(&view);
         scroller.add_css_class("code-block");
-        scroller.set_child(Some(&view));
         // Opens on the newest output and follows it live.
         super::follow::follow_end(&scroller);
         body.append(&scroller);
         let note = label("", &["dim-label", "caption"]);
         note.set_visible(false);
         body.append(&note);
-        let toolbar = adw::ToolbarView::new();
-        toolbar.add_top_bar(&adw::HeaderBar::new());
-        toolbar.set_content(Some(&body));
-        dialog.set_child(Some(&toolbar));
+        let dialog = follow_dialog(&task_name(task), 760, 560, &body);
         let this = Rc::new(Self {
             dialog,
             task_id: task.id.clone(),

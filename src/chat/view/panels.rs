@@ -170,12 +170,50 @@ fn replace_page(stack: &gtk4::Stack, name: &str, widget: &impl IsA<gtk4::Widget>
     stack.set_visible_child_name(name);
 }
 
-fn scrolled(child: &impl IsA<gtk4::Widget>) -> gtk4::ScrolledWindow {
+pub(super) fn scrolled(child: &impl IsA<gtk4::Widget>) -> gtk4::ScrolledWindow {
     let s = gtk4::ScrolledWindow::new();
     s.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
     s.set_vexpand(true);
     s.set_child(Some(child));
     s
+}
+
+/// A popover listing rows (a `subagent-list`, nothing selected), as tall as its rows up to
+/// `max_height` and then scrolling. Returns the list to fill and the popover.
+pub(super) fn popover_list(max_height: i32) -> (gtk4::ListBox, gtk4::Popover) {
+    let list = gtk4::ListBox::new();
+    list.add_css_class("subagent-list");
+    list.set_selection_mode(gtk4::SelectionMode::None);
+    let scroller = gtk4::ScrolledWindow::new();
+    scroller.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+    scroller.set_propagate_natural_height(true);
+    // Its natural width, not its minimum: the popover is sized from the scroller, and the
+    // minimum gave every name one character per line.
+    scroller.set_propagate_natural_width(true);
+    scroller.set_max_content_height(max_height);
+    scroller.set_child(Some(&list));
+    let popover = gtk4::Popover::new();
+    popover.set_child(Some(&scroller));
+    (list, popover)
+}
+
+/// A dialog of `width` by `height` titled `title`, showing `content` under a header bar: what
+/// follows one sub-agent or task until closed.
+pub(super) fn follow_dialog(
+    title: &str,
+    width: i32,
+    height: i32,
+    content: &impl IsA<gtk4::Widget>,
+) -> adw::Dialog {
+    let dialog = adw::Dialog::new();
+    dialog.set_content_width(width);
+    dialog.set_content_height(height);
+    dialog.set_title(title);
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&adw::HeaderBar::new());
+    toolbar.set_content(Some(content));
+    dialog.set_child(Some(&toolbar));
+    dialog
 }
 
 fn boxed_list() -> gtk4::ListBox {
@@ -185,7 +223,7 @@ fn boxed_list() -> gtk4::ListBox {
     l
 }
 
-fn padded(child: &impl IsA<gtk4::Widget>) -> gtk4::Box {
+pub(super) fn padded(child: &impl IsA<gtk4::Widget>) -> gtk4::Box {
     let b = gtk4::Box::new(gtk4::Orientation::Vertical, 14);
     b.set_margin_top(12);
     b.set_margin_bottom(18);

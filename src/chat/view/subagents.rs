@@ -18,6 +18,7 @@ use gtk4::prelude::*;
 use super::cards::{label, wrap_words, wrapping, Row, RowSink};
 #[cfg(test)]
 use super::model::ToolStatus;
+use super::panels::{follow_dialog, padded, popover_list, scrolled};
 use super::model::{Body, SubagentSummary, Transcript};
 use super::transcript::CHILD_CAP;
 
@@ -295,22 +296,10 @@ impl SubagentButton {
         root.set_child(Some(&inner));
         root.set_visible(false);
 
-        let list = gtk4::ListBox::new();
-        list.add_css_class("subagent-list");
-        list.set_selection_mode(gtk4::SelectionMode::None);
+        let (list, popover) = popover_list(420);
         let groups = Rc::default();
         head_groups(&list, Rc::clone(&groups));
-        let scroller = gtk4::ScrolledWindow::new();
-        scroller.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
-        scroller.set_propagate_natural_height(true);
-        // Its natural width, not its minimum: the popover is sized from the scroller, and the
-        // minimum gave every name one character per line.
-        scroller.set_propagate_natural_width(true);
-        scroller.set_max_content_height(420);
-        scroller.set_child(Some(&list));
-        let popover = gtk4::Popover::new();
         popover.add_css_class("subagent-popover");
-        popover.set_child(Some(&scroller));
         root.set_popover(Some(&popover));
 
         let this = Rc::new(Self {
@@ -455,16 +444,6 @@ pub struct SubagentPanel {
 
 impl SubagentPanel {
     pub fn new(id: &str, sink: RowSink) -> Rc<Self> {
-        let dialog = adw::Dialog::new();
-        dialog.set_content_width(760);
-        dialog.set_content_height(640);
-        let body = gtk4::Box::new(gtk4::Orientation::Vertical, 14);
-        body.add_css_class("transcript");
-        body.set_margin_top(12);
-        body.set_margin_bottom(18);
-        body.set_margin_start(18);
-        body.set_margin_end(18);
-
         let title = label("", &["subagent-panel-title"]);
         wrap_words(&title);
         let status = label("", &["dim-label"]);
@@ -481,7 +460,8 @@ impl SubagentPanel {
         head.append(&identity);
         let controls = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
         head.append(&controls);
-        body.append(&head);
+        let body = padded(&head);
+        body.add_css_class("transcript");
         let (asked, asked_text) = section("Asked to");
         body.append(&asked);
         let steps = gtk4::Box::new(gtk4::Orientation::Vertical, 14);
@@ -493,16 +473,10 @@ impl SubagentPanel {
         let (error, error_text) = section("Error");
         body.append(&error);
 
-        let scroller = gtk4::ScrolledWindow::new();
-        scroller.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
-        scroller.set_vexpand(true);
-        scroller.set_child(Some(&body));
+        let scroller = scrolled(&body);
         // Opens on the sub-agent's latest step and follows it live.
         super::follow::follow_end(&scroller);
-        let toolbar = adw::ToolbarView::new();
-        toolbar.add_top_bar(&adw::HeaderBar::new());
-        toolbar.set_content(Some(&scroller));
-        dialog.set_child(Some(&toolbar));
+        let dialog = follow_dialog("", 760, 640, &scroller);
         Rc::new_cyclic(|this| Self {
             dialog,
             id: id.to_owned(),
