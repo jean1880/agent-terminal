@@ -1308,6 +1308,9 @@ impl CodexAdapter {
         self.turn_open = false;
         self.turn_id = None;
         self.interrupt_sent = false;
+        // A requested compaction completes (and takes the flag) within its turn; a turn that
+        // ended, failed or was interrupted without one leaves no manual compaction coming.
+        self.compact_pending = false;
         out.push(Envelope::new(Event::TurnCompleted {
             state,
             usage,
@@ -2190,6 +2193,8 @@ impl CodexAdapter {
                 );
             }
             (Pending::Compact, None, error) => {
+                // Refused: no manual compaction is coming, so a later automatic one is not one.
+                self.compact_pending = false;
                 out.push(Envelope::new(Event::Error {
                     message: error.unwrap_or_else(|| "request failed".to_owned()),
                 }));
@@ -6162,6 +6167,45 @@ mod tests {
         // A longer text that merely starts with it is a normal prompt.
         let w = prompt(&mut a, "/compact please");
         assert_eq!(w["method"], "turn/start");
+    }
+
+    #[test]
+    fn an_accepted_compact_that_ends_without_compacting_leaves_nothing_manual() {
+        for status in [
+            r#""status":"failed","error":{"message":"boom"}"#,
+            r#""status":"interrupted""#,
+            r#""status":"completed""#,
+        ] {
+            let mut a = started(Mode::Ask);
+            let w = prompt(&mut a, "/compact");
+            a.feed(&json!({"id": w["id"], "result": {}}).to_string());
+            a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"cu"}}}"#);
+            a.feed(&format!(
+                r#"{{"method":"turn/completed","params":{{"threadId":"th-1","turn":{{"id":"cu",{status}}}}}}}"#
+            ));
+            let ev = a.feed(
+                r#"{"method":"item/completed","params":{"threadId":"th-1","turnId":"tu","completedAtMs":1,"item":{"type":"contextCompaction","id":"cc1"}}}"#,
+            );
+            assert!(
+                matches!(ev[0].event, Event::Compacted { manual: false, .. }),
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_compact_does_not_make_a_later_automatic_compaction_manual() {
+        let mut a = started(Mode::Ask);
+        let w = prompt(&mut a, "/compact");
+        let ev = a.feed(&json!({"id": w["id"], "error": {"message": "no"}}).to_string());
+        assert!(matches!(&ev[0].event, Event::Error { .. }));
+        let ev = a.feed(
+            r#"{"method":"item/completed","params":{"threadId":"th-1","turnId":"tu","completedAtMs":1,"item":{"type":"contextCompaction","id":"cc1"}}}"#,
+        );
+        assert!(matches!(
+            ev[0].event,
+            Event::Compacted { manual: false, .. }
+        ));
     }
 
     // ---- notifications ----
