@@ -114,6 +114,8 @@ pub const STALE_AFTER: Duration = Duration::from_secs(60);
 /// The app-wide availability of every driver.
 pub struct AgentAvailability {
     states: RefCell<Vec<(Driver, Availability)>>,
+    /// Per agent, how many results have been recorded ([`Self::scanned`]).
+    scans: RefCell<Vec<(Driver, u64)>>,
     listeners: ListenerSet,
     last_scan: Cell<Option<Instant>>,
 }
@@ -138,6 +140,7 @@ impl AgentAvailability {
                     .map(|d| (d, Availability::Detecting))
                     .collect(),
             ),
+            scans: RefCell::new(Driver::ALL.into_iter().map(|d| (d, 0)).collect()),
             listeners: ListenerSet::default(),
             last_scan: Cell::new(None),
         }
@@ -173,21 +176,37 @@ impl AgentAvailability {
             .any(|(_, s)| *s == Availability::Detecting)
     }
 
-    /// Sets one agent's state; listeners are told only when it changed.
+    /// Records one agent's scan result and tells the listeners, whether or not it changed: a
+    /// result equal to the last one is still news to whatever checked the agent since (Settings'
+    /// Detected row), so it moves [`Self::scanned`]. Listeners only redraw; none rescans.
     pub fn set(&self, driver: Driver, state: Availability) {
-        let changed = {
-            let mut states = self.states.borrow_mut();
-            match states.iter_mut().find(|(d, _)| *d == driver) {
-                Some((_, known)) if *known != state => {
-                    *known = state;
-                    true
-                }
-                _ => false,
-            }
-        };
-        if changed {
-            self.listeners.notify();
+        if let Some((_, known)) = self
+            .states
+            .borrow_mut()
+            .iter_mut()
+            .find(|(d, _)| *d == driver)
+        {
+            *known = state;
         }
+        if let Some((_, count)) = self
+            .scans
+            .borrow_mut()
+            .iter_mut()
+            .find(|(d, _)| *d == driver)
+        {
+            *count += 1;
+        }
+        self.listeners.notify();
+    }
+
+    /// How many results have been recorded for `driver` ([`Self::set`]), changed or not: it
+    /// moves with every completed scan, so a newer answer can be told from an older one.
+    pub fn scanned(&self, driver: Driver) -> u64 {
+        self.scans
+            .borrow()
+            .iter()
+            .find(|(d, _)| *d == driver)
+            .map_or(0, |(_, n)| *n)
     }
 
     /// Records that a scan began now.
@@ -244,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn every_driver_starts_detecting_and_changes_notify_once() {
+    fn every_driver_starts_detecting_and_every_result_notifies_once() {
         let a = AgentAvailability::new();
         assert_eq!(a.all().len(), Driver::ALL.len());
         assert!(a.any_detecting());
@@ -255,14 +274,48 @@ mod tests {
         let id = a.connect_changed(move || h.set(h.get() + 1));
         a.set(Driver::Codex, Availability::Ready("/usr/bin/codex".into()));
         a.set(Driver::Codex, Availability::Ready("/usr/bin/codex".into()));
-        assert_eq!(hits.get(), 1, "an unchanged state is not a change");
+        assert_eq!(hits.get(), 2, "an unchanged result is still a new result");
         assert!(a.is_ready(Driver::Codex));
         a.set(Driver::Claude, Availability::Missing);
         a.set(Driver::Agy, Availability::Disabled);
         assert!(!a.any_detecting());
         a.disconnect(id);
         a.set(Driver::Claude, Availability::Detecting);
-        assert_eq!(hits.get(), 3);
+        assert_eq!(hits.get(), 4);
+    }
+
+    #[test]
+    fn every_completed_scan_moves_its_agents_counter_whether_or_not_it_changed() {
+        let a = AgentAvailability::new();
+        assert!(Driver::ALL.into_iter().all(|d| a.scanned(d) == 0));
+        let ready = Availability::Ready("/usr/bin/claude".into());
+        a.set(Driver::Claude, ready.clone());
+        a.set(Driver::Claude, ready.clone());
+        assert_eq!(
+            a.scanned(Driver::Claude),
+            2,
+            "the same Ready path counts again"
+        );
+        assert_eq!(
+            a.scanned(Driver::Codex),
+            0,
+            "only that agent's counter moves"
+        );
+        // A listener that reads the state (as every one does) sees the new result, and a
+        // listener notified on an unchanged result does not cause another one.
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let s = seen.clone();
+        let reader = Rc::new(AgentAvailability::new());
+        let r = Rc::downgrade(&reader);
+        reader.connect_changed(move || {
+            if let Some(r) = r.upgrade() {
+                s.borrow_mut()
+                    .push((r.scanned(Driver::Claude), r.get(Driver::Claude)));
+            }
+        });
+        reader.set(Driver::Claude, ready.clone());
+        reader.set(Driver::Claude, ready.clone());
+        assert_eq!(*seen.borrow(), [(1, ready.clone()), (2, ready)]);
     }
 
     #[test]
