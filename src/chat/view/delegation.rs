@@ -186,12 +186,23 @@ impl Workers {
         self.worker(id).is_some()
     }
 
+    fn live_histories(&self) -> impl Iterator<Item = (&Worker, &History)> {
+        self.records.iter().filter_map(|worker| {
+            let scope = worker.live_scope()?;
+            worker
+                .histories
+                .iter()
+                .find(|history| history.scope == scope)
+                .map(|history| (worker, history))
+        })
+    }
+
     /// What a worker waits on the user for, as the parent's status says it: an approval
     /// (`NeedsApproval`) before a question or form (`NeedsAnswer`); `None` when none waits.
     /// A worker's requests count as its parent's own: the thread is held up either way.
     pub(super) fn needs_user(&self) -> Option<Activity> {
         let mut needs = None;
-        for history in self.records.iter().flat_map(|worker| &worker.histories) {
+        for (_, history) in self.live_histories() {
             match history.model.pending_interruption() {
                 Some(PendingInterruption::Approval { .. }) => return Some(Activity::NeedsApproval),
                 Some(_) => needs = Some(Activity::NeedsAnswer),
@@ -545,6 +556,73 @@ impl Inspector {
 }
 
 impl Inner {
+    /// Keep the root's request first, then a live worker's. The scope is the one displayed,
+    /// never inferred from a request id (which another worker can also use).
+    pub(super) fn refresh_interruption(&self) {
+        let model = self.model.borrow();
+        let workers = self.delegation.borrow();
+        let waiting: usize = workers
+            .live_histories()
+            .map(|(_, history)| history.model.pending_count())
+            .sum();
+        let root = model.pending_interruption();
+        if root.is_some() || waiting == 0 {
+            *self.interruption_scope.borrow_mut() = None;
+            if waiting == 0 {
+                self.interruption.update(&model);
+            } else {
+                self.interruption
+                    .update_pending(root, model.pending_count() + waiting, None);
+            }
+            return;
+        }
+        let child = workers.live_histories().find_map(|(worker, history)| {
+            history
+                .model
+                .pending_interruption()
+                .map(|pending| (worker, history, pending))
+        });
+        if let Some((worker, history, pending)) = child {
+            *self.interruption_scope.borrow_mut() = Some(history.scope.clone());
+            self.interruption
+                .update_pending(Some(pending), waiting, Some(&worker.summary.name));
+        }
+    }
+
+    pub(super) fn interruption_row(self: &Rc<Self>, event: RowEvent) {
+        let scope = self.interruption_scope.borrow().clone();
+        if let Some(scope) = scope {
+            self.worker_request(&scope, event);
+        } else {
+            self.row_event(event);
+        }
+    }
+
+    pub(super) fn jump_interruption(self: &Rc<Self>, id: &str) {
+        let scope = self.interruption_scope.borrow().clone();
+        let Some(scope) = scope else {
+            self.transcript.focus_pending_card(id);
+            return;
+        };
+        // A queued jump must not land in a replacement process with the same local ids.
+        if !self
+            .delegation
+            .borrow()
+            .worker(scope.worker.as_str())
+            .is_some_and(|worker| worker.live_scope().as_ref() == Some(&scope))
+        {
+            return;
+        }
+        if self.open_worker(scope.worker.as_str()) {
+            if let Some(inspector) = self.worker_inspector.borrow().clone() {
+                *inspector.selected.borrow_mut() = Some(scope);
+                inspector.follow_latest.set(false);
+                self.refresh_worker_inspector();
+                inspector.panel.focus_pending_card(id);
+            }
+        }
+    }
+
     fn queue_worker_flush(self: &Rc<Self>) {
         if self.worker_flush_queued.replace(true) {
             return;
@@ -773,16 +851,21 @@ impl Inner {
             self.worker_diff(&inspector, &scope, event);
             return;
         }
+        self.worker_request(&scope, event);
+    }
+
+    fn worker_request(self: &Rc<Self>, scope: &Scope, event: RowEvent) {
+        let worker_id = scope.worker.as_str();
         let native = |request: &str| {
             self.delegation
                 .borrow()
                 .worker(worker_id)
-                .filter(|worker| worker.live_scope().as_ref() == Some(&scope))
+                .filter(|worker| worker.live_scope().as_ref() == Some(scope))
                 .and_then(|worker| {
                     worker
                         .histories
                         .iter()
-                        .find(|history| history.scope == scope)
+                        .find(|history| &history.scope == scope)
                 })
                 .and_then(|history| history.native_requests.get(request).cloned())
         };
@@ -861,7 +944,7 @@ impl Inner {
             if let Some(history) = worker
                 .histories
                 .iter_mut()
-                .find(|history| history.scope == scope)
+                .find(|history| &history.scope == scope)
             {
                 if let Some(decision) = mark {
                     history.model.mark_approval_sent(&request, decision);
@@ -873,6 +956,7 @@ impl Inner {
             }
         }
         self.refresh_worker_inspector();
+        self.refresh_status();
     }
 
     fn worker_diff(self: &Rc<Self>, inspector: &Rc<Inspector>, scope: &Scope, event: RowEvent) {
@@ -1248,6 +1332,7 @@ pub(crate) mod tests {
 
     /// Called by the existing construction smoke test on its private display.
     pub(crate) fn ui_checks() {
+        worker_shelf_ui_checks();
         let backend = Rc::new(Backend {
             actions: RefCell::new(Vec::new()),
             diff_scopes: RefCell::new(Vec::new()),
@@ -1289,6 +1374,10 @@ pub(crate) mod tests {
         // agent is lit beside the parent's.
         inner.refresh_status();
         assert_eq!(inner.thinking.shown().as_deref(), Some("Needs approval"));
+        assert!(
+            inner.interruption.revealer.reveals_child(),
+            "a child's approval must reach the parent's pinned shelf"
+        );
         assert_eq!(inner.thinking.dot_states(), ["lead", "dimmed", "working"]);
         assert!(inner.open_worker("w_workerAA"));
         let inspector = inner.worker_inspector.borrow().clone().expect("inspector");
@@ -1373,5 +1462,165 @@ pub(crate) mod tests {
         subscriber.registry("root-thread", &[idle]);
         inner.refresh_status();
         assert_eq!(inner.thinking.shown(), None);
+    }
+
+    fn worker_shelf_ui_checks() {
+        let backend = Rc::new(Backend {
+            actions: RefCell::new(Vec::new()),
+            diff_scopes: RefCell::new(Vec::new()),
+            root_answers: Cell::new(0),
+        });
+        let view = ChatView::new(backend.clone());
+        let subscriber = view.delegation_subscriber("root-thread");
+        let inner = view.inner().expect("inner");
+        let mut first = summary("w_workerAA", "r_firstRun");
+        first.name = "First worker".into();
+        let mut second = summary("w_workerBB", "r_firstRun");
+        second.name = "Second worker".into();
+        subscriber.registry("root-thread", &[first.clone(), second.clone()]);
+        let first_scope = scope("w_workerAA", 1, "r_firstRun");
+        let second_scope = scope("w_workerBB", 1, "r_firstRun");
+        let approval = |request: &str| {
+            Envelope::new(Event::ApprovalRequested {
+                tool: "Bash".into(),
+                title: None,
+                input: json!({"command":"true"}),
+                reason: None,
+                options: vec![Decision::Allow, Decision::Deny],
+                response: ResponseCapability::Live,
+                remembers: None,
+            })
+            .request(request)
+        };
+        for (scope, request) in [
+            (&first_scope, "same-id"),
+            (&first_scope, "later"),
+            (&second_scope, "same-id"),
+        ] {
+            subscriber.scoped(&ScopedEnvelope {
+                scope: scope.clone(),
+                envelope: approval(request),
+            });
+        }
+        // Root and child request ids can collide. Root requests retain their existing route.
+        view.apply(&approval("delegated-request-1"));
+        assert!(inner.interruption_scope.borrow().is_none());
+        assert_eq!(inner.interruption.shown().1, 4);
+        inner.interruption.allow_btn.emit_clicked();
+        assert_eq!(backend.root_answers.get(), 1);
+        assert!(backend.actions.borrow().is_empty());
+        assert_eq!(
+            inner.interruption_scope.borrow().as_ref(),
+            Some(&first_scope)
+        );
+        assert_eq!(
+            inner.interruption.shown(),
+            ("First worker: Approval required: Bash".into(), 3)
+        );
+
+        // The shelf answers without an inspector being open and advances to the next request.
+        assert!(inner.worker_inspector.borrow().is_none());
+        inner.interruption.allow_btn.emit_clicked();
+        assert!(
+            matches!(backend.actions.borrow().last(), Some(WorkerAction::Approve {scope, request, decision: Decision::Allow, ..}) if scope == &first_scope && request == "later")
+        );
+        assert_eq!(inner.interruption.shown().1, 2);
+        inner.interruption.jump_btn.emit_clicked();
+        let inspector = inner
+            .worker_inspector
+            .borrow()
+            .clone()
+            .expect("review opens worker");
+        assert_eq!(*inspector.selected.borrow(), Some(first_scope.clone()));
+        // Even another worker's open inspector cannot redirect the shelf's response.
+        assert!(inner.open_worker("w_workerBB"));
+        assert!(inner.interruption.answer(Decision::Deny));
+        assert!(
+            matches!(backend.actions.borrow().last(), Some(WorkerAction::Approve {scope, request, decision: Decision::Deny, ..}) if scope == &first_scope && request == "same-id")
+        );
+        assert_eq!(
+            inner.interruption_scope.borrow().as_ref(),
+            Some(&second_scope)
+        );
+        assert_eq!(
+            inner.interruption.shown().0,
+            "Second worker: Approval required: Bash"
+        );
+
+        // An event can invalidate the displayed scope before its queued repaint. Reject a
+        // click in that interval even with a permissive backend, and never answer the root.
+        second.run_id = Some(RunId::parse("r_secondRun").expect("run"));
+        subscriber.registry("root-thread", &[first, second]);
+        let actions = backend.actions.borrow().len();
+        inner.interruption.allow_btn.emit_clicked();
+        assert_eq!(backend.actions.borrow().len(), actions);
+        assert_eq!(backend.root_answers.get(), 1);
+        inner.refresh_status();
+        assert!(!inner.interruption.revealer.reveals_child());
+
+        let replacement = scope("w_workerBB", 2, "r_secondRun");
+        subscriber.scoped(&ScopedEnvelope {
+            scope: replacement.clone(),
+            envelope: Envelope::new(Event::QuestionRequested {
+                questions: vec![],
+                source: agent_core::event::QuestionSource::Agent,
+            })
+            .request("question"),
+        });
+        inner.refresh_status();
+        assert!(inner.interruption.revealer.reveals_child());
+        assert!(!super::super::interruption::placed(
+            &inner.interruption.allow_btn
+        ));
+        inner.interruption.jump_btn.emit_clicked();
+        let inspector = inner
+            .worker_inspector
+            .borrow()
+            .clone()
+            .expect("question review");
+        assert_eq!(*inspector.selected.borrow(), Some(replacement.clone()));
+        subscriber.scoped(&ScopedEnvelope {
+            scope: replacement.clone(),
+            envelope: Envelope::new(Event::ApprovalExpired).request("question"),
+        });
+        subscriber.scoped(&ScopedEnvelope {
+            scope: replacement.clone(),
+            envelope: Envelope::new(Event::ApprovalRequested {
+                tool: super::super::permission::TOOL.into(),
+                title: None,
+                input: json!({}),
+                reason: None,
+                options: vec![Decision::Allow, Decision::Deny],
+                response: ResponseCapability::Live,
+                remembers: None,
+            })
+            .request("permissions"),
+        });
+        inner.refresh_status();
+        assert!(
+            !inner.interruption.answer(Decision::Allow),
+            "a cut permission list still needs full review"
+        );
+        assert!(!super::super::interruption::placed(
+            &inner.interruption.allow_btn
+        ));
+        subscriber.scoped(&ScopedEnvelope {
+            scope: replacement,
+            envelope: Envelope::new(Event::ApprovalResolved {
+                decision: Decision::Deny,
+            })
+            .request("permissions"),
+        });
+        inner.refresh_status();
+        assert!(!inner.interruption.revealer.reveals_child());
+        assert!(
+            inner
+                .model
+                .borrow()
+                .order()
+                .iter()
+                .all(|id| id == "approval:delegated-request-1"),
+            "worker requests stay outside the root transcript"
+        );
     }
 }

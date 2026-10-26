@@ -27,9 +27,10 @@ pub struct InterruptionShelf {
     pub(crate) more_popover: gtk4::Popover,
     pub(crate) jump_btn: gtk4::Button,
     active: Rc<RefCell<Option<PendingInterruption>>>,
-    /// "1 of 3": the shelf shows the newest of several things waiting, and says so.
+    /// "1 of 3": the shelf shows one of several things waiting, and says so.
     count: gtk4::Label,
     shown_count: std::cell::Cell<usize>,
+    source: RefCell<Option<String>>,
     sink: RowSink,
 }
 
@@ -172,6 +173,7 @@ impl InterruptionShelf {
             active,
             count,
             shown_count: std::cell::Cell::new(0),
+            source: RefCell::new(None),
             sink,
         };
         // A hidden shelf still counts towards the window's minimum width: the slots take their
@@ -190,17 +192,36 @@ impl InterruptionShelf {
     }
 
     pub fn update(&self, transcript: &Transcript) {
-        let interruption = transcript.pending_interruption();
-        let waiting = transcript.pending_count();
+        self.update_pending(
+            transcript.pending_interruption(),
+            transcript.pending_count(),
+            None,
+        );
+    }
+
+    #[cfg(test)]
+    pub(super) fn shown(&self) -> (String, usize) {
+        (self.title.text().to_string(), self.shown_count.get())
+    }
+
+    pub(super) fn update_pending(
+        &self,
+        interruption: Option<PendingInterruption>,
+        waiting: usize,
+        source: Option<&str>,
+    ) {
         if self.shown_count.replace(waiting) != waiting {
             self.count.set_visible(waiting > 1);
             self.count.set_text(&format!("1 of {waiting}"));
-            self.count
-                .set_tooltip_text(Some("The newest of several things waiting for you"));
+            self.count.set_tooltip_text(Some(
+                "Requests waiting for you in this thread and its workers",
+            ));
         }
-        if interruption == *self.active.borrow() {
+        let source_changed = self.source.borrow().as_deref() != source;
+        if interruption == *self.active.borrow() && !source_changed {
             return;
         }
+        *self.source.borrow_mut() = source.map(str::to_owned);
         *self.active.borrow_mut() = interruption.clone();
 
         match interruption {
@@ -346,6 +367,15 @@ impl InterruptionShelf {
                 self.show_slots(false);
                 self.revealer.set_reveal_child(false);
             }
+        }
+        if let Some(source) = source {
+            self.title
+                .set_text(&format!("{source}: {}", self.title.text()));
+            self.jump_as_action(
+                "Review worker…",
+                "Open the worker's request",
+                "Review worker request",
+            );
         }
     }
 
