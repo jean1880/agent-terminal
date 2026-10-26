@@ -4,9 +4,8 @@
 //! the root (when the root is that parent), coalesced for [`WAKE_COALESCE`], and offered to the
 //! root's session (`ChatSession::wake_with`), which posts them as a notice and starts a turn
 //! with them. A root that cannot take them now is offered them again every [`WAKE_RETRY`] and
-//! after each of its turns. A root in dangerous permissive mode is never woken and never
-//! retried: its thread is told what waits once per new item, the user's next message carries
-//! it, and leaving the mode offers it again. What a page (`cross_agent_wait`,
+//! after each of its turns. A root in dangerous permissive mode is woken the same way. What a
+//! page (`cross_agent_wait`,
 //! `cross_agent_read`) already showed the root is never sent again. The decisions, the framing
 //! and the budget are `agent_core::delegation::wake`.
 use super::supervisor::{Supervisor, WorkerRt};
