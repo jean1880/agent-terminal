@@ -160,7 +160,7 @@ impl SystemProbe {
         }
 
         for path in self.candidate_paths(command) {
-            if !path.is_empty() && std::path::Path::new(&path).exists() {
+            if is_executable_file(&path) {
                 debug!("{command} found at {path}");
                 return Some(path);
             }
@@ -173,6 +173,14 @@ impl SystemProbe {
         warn!("{command} not found after all checks");
         None
     }
+}
+
+/// Whether `path` is a regular file (symlinks followed) with an execute bit set. A directory or
+/// a plain file at a candidate location is not a launchable command.
+fn is_executable_file(path: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    !path.is_empty()
+        && std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
 /// Picks the profile to launch.
@@ -221,6 +229,21 @@ pub fn load_env_file(path: &str) -> Vec<(String, String)> {
 /// Like `load_env_file`, but callers that must bind an exact profile can refuse a failed
 /// source instead of silently using the application's environment. Errors contain no values.
 pub fn load_env_file_checked(path: &str) -> Result<Vec<(String, String)>, String> {
+    load_env_file_inner(path, &[])
+}
+
+/// Like [`load_env_file_checked`] for a profile with `clear_env` patterns. The session strips
+/// those variables from the inherited environment before applying the file, so an export equal
+/// to the inherited value is still needed there and is kept when its name matches a pattern.
+#[allow(dead_code)] // the session spawn paths call it once they pass the profile's patterns
+pub fn load_env_file_for_profile(
+    path: &str,
+    clear_env: &[String],
+) -> Result<Vec<(String, String)>, String> {
+    load_env_file_inner(path, clear_env)
+}
+
+fn load_env_file_inner(path: &str, clear_env: &[String]) -> Result<Vec<(String, String)>, String> {
     // Expanded here: the path is passed to the shell quoted, so a leading `~`
     // would otherwise be taken literally.
     let path = expand_tilde(path);
@@ -230,11 +253,25 @@ pub fn load_env_file_checked(path: &str) -> Result<Vec<(String, String)>, String
     // without an explicit `export` are still exported.
     // Bounded, like the shell probe: the tab waits on this before spawning,
     // so a file that blocks would leave it on its loading screen for good.
+    // `vars_os`: `vars` panics on a variable that is not valid Unicode.
+    let inherited: std::collections::HashMap<std::ffi::OsString, std::ffi::OsString> =
+        std::env::vars_os().collect();
+    // The inherited variables a `clear_env` pattern names are unset in the shell before the file
+    // runs, so one that is present afterwards was set by the file, even to its inherited value.
+    // Passed as positional arguments, never spliced into the script.
+    let cleared: Vec<&str> = inherited
+        .keys()
+        .filter_map(|k| k.to_str())
+        .filter(|k| clear_env.iter().any(|p| matches_clear_pattern(k, p)))
+        .collect();
     let mut cmd = std::process::Command::new("/bin/sh");
     cmd.arg("-c")
-        .arg(r#"set -a; . "$1" >/dev/null 2>&1 || exit 1; env -0"#)
+        .arg(
+            r#"p=$1; shift; for k in "$@"; do command unset "$k" 2>/dev/null || :; done; set -a; . "$p" >/dev/null 2>&1 || exit 1; env -0"#,
+        )
         .arg("sh")
-        .arg(path);
+        .arg(path)
+        .args(&cleared);
     let output = match run_command(cmd, "/bin/sh", SHELL_PROBE_TIMEOUT_SECS) {
         Ok(output) if output.status.success() => output,
         Ok(_) => {
@@ -252,22 +289,37 @@ pub fn load_env_file_checked(path: &str) -> Result<Vec<(String, String)>, String
     // entries to every session's environment block and, since these are logged,
     // would name every variable the user happens to have set — secrets included.
     // Only what the file actually added or changed is of any interest.
-    let inherited: std::collections::HashMap<String, String> = std::env::vars().collect();
-
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .split('\0')
-        .filter(|entry| !entry.is_empty())
-        .filter_map(|entry| {
-            let (key, value) = entry.split_once('=')?;
-            Some((key.to_string(), value.to_string()))
-        })
-        .filter(|(key, value)| {
-            // Bookkeeping the shell itself rewrites; never meaningful here.
-            const SHELL_NOISE: [&str; 4] = ["_", "SHLVL", "PWD", "OLDPWD"];
-            !SHELL_NOISE.contains(&key.as_str())
-                && inherited.get(key).map(String::as_str) != Some(value.as_str())
-        })
-        .collect())
+    // Compared as raw bytes, never decoded lossily. A changed entry that is not valid UTF-8 can
+    // not be carried as a `String`, so it is dropped with a warning rather than altered.
+    use std::os::unix::ffi::OsStrExt;
+    let mut changed = Vec::new();
+    for entry in output.stdout.split(|b| *b == 0).filter(|e| !e.is_empty()) {
+        let Some(eq) = entry.iter().position(|b| *b == b'=') else {
+            continue;
+        };
+        let (key, value) = (&entry[..eq], &entry[eq + 1..]);
+        let Ok(key) = std::str::from_utf8(key) else {
+            warn!("Env file {path} sets a variable whose name is not UTF-8; skipping it");
+            continue;
+        };
+        // Bookkeeping the shell itself rewrites; never meaningful here.
+        const SHELL_NOISE: [&str; 4] = ["_", "SHLVL", "PWD", "OLDPWD"];
+        if SHELL_NOISE.contains(&key) {
+            continue;
+        }
+        let cleared = clear_env.iter().any(|p| matches_clear_pattern(key, p));
+        let same = inherited
+            .get(std::ffi::OsStr::new(key))
+            .is_some_and(|v| v.as_os_str() == std::ffi::OsStr::from_bytes(value));
+        if same && !cleared {
+            continue;
+        }
+        match std::str::from_utf8(value) {
+            Ok(value) => changed.push((key.to_string(), value.to_string())),
+            Err(_) => warn!("Env file {path} sets {key} to a value that is not UTF-8; skipping it"),
+        }
+    }
+    Ok(changed)
 }
 
 /// Marks the line carrying the shell's `PATH`, so whatever an rc prints first is skipped.
@@ -1164,6 +1216,109 @@ mod tests {
                 .find(|(k, _)| k == "TERM")
                 .map(|(_, v)| v.as_str()),
             Some("dumb-for-test")
+        );
+    }
+
+    #[test]
+    fn env_file_export_equal_to_inherited_is_kept_for_a_cleared_key() {
+        // The session strips `clear_env` keys from the inherited block, then applies the file.
+        // A file that re-exports the inherited value of such a key must keep it.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("env.sh");
+        // The inherited value is written literally: the shell unsets cleared keys first.
+        let home = std::env::var("HOME").unwrap();
+        std::fs::write(&path, format!("export HOME='{home}'\n")).unwrap();
+        let empty = dir.path().join("empty.sh");
+        std::fs::write(&empty, "").unwrap();
+        let path = path.to_str().unwrap();
+
+        // A file that exports nothing restores nothing, whatever the patterns clear.
+        for pattern in ["HOME", "HO*"] {
+            let none =
+                load_env_file_for_profile(empty.to_str().unwrap(), &[pattern.to_string()]).unwrap();
+            assert!(none.is_empty(), "pattern {pattern}: {none:?}");
+        }
+
+        let plain = load_env_file_for_profile(path, &[]).unwrap();
+        assert!(plain.iter().all(|(k, _)| k != "HOME"), "unchanged: dropped");
+
+        for pattern in ["HOME", "HO*"] {
+            let kept = load_env_file_for_profile(path, &[pattern.to_string()]).unwrap();
+            assert!(
+                kept.iter().any(|(k, _)| k == "HOME"),
+                "pattern {pattern} must keep the export: {kept:?}"
+            );
+        }
+        let other = load_env_file_for_profile(path, &["OTHER".to_string()]).unwrap();
+        assert!(other.iter().all(|(k, _)| k != "HOME"));
+    }
+
+    #[test]
+    fn env_file_survives_a_non_unicode_inherited_variable() {
+        use std::os::unix::ffi::OsStrExt;
+        // Runs in a child process so the test process's own environment is untouched.
+        if std::env::var_os("AT_TEST_NON_UNICODE_CHILD").is_some() {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("env.sh");
+            std::fs::write(&path, "export AT_TEST_ADDED=1\n").unwrap();
+            let env = load_env_file_checked(path.to_str().unwrap()).unwrap();
+            assert!(env.iter().any(|(k, _)| k == "AT_TEST_ADDED"));
+            // The invalid value was inherited and untouched: not returned, not altered.
+            assert!(
+                env.iter().all(|(k, _)| k != "AT_TEST_BAD_BYTES"),
+                "inherited non-UTF-8 value came back: {env:?}"
+            );
+            // A value the file itself sets that is not UTF-8 is dropped, never altered.
+            let bad = dir.path().join("bad.sh");
+            std::fs::write(&bad, "export AT_TEST_FILE_BAD=\"$(printf 'a\\351')\"\n").unwrap();
+            let env = load_env_file_checked(bad.to_str().unwrap()).unwrap();
+            assert!(env.iter().all(|(k, _)| k != "AT_TEST_FILE_BAD"), "{env:?}");
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "utils::tests::env_file_survives_a_non_unicode_inherited_variable",
+                "--test-threads=1",
+            ])
+            .env("AT_TEST_NON_UNICODE_CHILD", "1")
+            .env(
+                "AT_TEST_BAD_BYTES",
+                std::ffi::OsStr::from_bytes(b"caf\xe9\xff"),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "child panicked: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn locate_refuses_a_directory_and_a_non_executable_candidate() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempdir().unwrap();
+        let bin = home.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let probe = SystemProbe::new(
+            Some("/nonexistent-agent-terminal-path".into()),
+            Some(home.path().to_str().unwrap().into()),
+            Some("/bin/sh".into()),
+        );
+
+        std::fs::create_dir(bin.join("at-test-dir-cmd")).unwrap();
+        assert_eq!(probe.locate("at-test-dir-cmd"), None, "a directory");
+
+        let plain = bin.join("at-test-plain-cmd");
+        std::fs::write(&plain, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(probe.locate("at-test-plain-cmd"), None, "no execute bit");
+
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            probe.locate("at-test-plain-cmd"),
+            Some(plain.to_str().unwrap().to_string())
         );
     }
 

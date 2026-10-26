@@ -60,6 +60,17 @@ pub fn merge(
     let mut changed = false;
     if let Some(account) = account {
         if snap.account.as_ref() != Some(&account) {
+            // Quota windows belong to the account that reported them: another account must not
+            // inherit the previous one's usage. A first account keeps what arrived before it.
+            // Identity is the label: a new plan or provider is the same account, updated.
+            let other = snap
+                .account
+                .as_ref()
+                .is_some_and(|a| a.label != account.label);
+            if other && !snap.windows.is_empty() {
+                snap.windows.clear();
+                snap.updated_at = None;
+            }
             snap.account = Some(account);
             changed = true;
         }
@@ -621,6 +632,40 @@ mod tests {
         assert_eq!(s.updated_at, None, "no window yet");
         assert!(!merge(&mut s, Some(acct("a")), vec![], 3), "same account");
         assert!(merge(&mut s, Some(acct("b")), vec![], 4));
+    }
+
+    #[test]
+    fn merge_drops_the_old_accounts_windows_when_the_account_changes() {
+        let mut s = Snapshot::default();
+        assert!(merge(
+            &mut s,
+            Some(acct("a")),
+            vec![win(None, "5-hour", 0.9), win(None, "Weekly", 0.5)],
+            1
+        ));
+        // Same account: windows stay.
+        assert!(!merge(&mut s, Some(acct("a")), vec![], 2));
+        assert_eq!(s.windows.len(), 2);
+        // Another account reports only one window: the other must not survive.
+        assert!(merge(
+            &mut s,
+            Some(acct("b")),
+            vec![win(None, "5-hour", 0.1)],
+            3
+        ));
+        assert_eq!(s.windows.len(), 1);
+        assert_eq!(s.windows[0].used, 0.1);
+        // The same account with a new plan is an update: its windows stay.
+        let mut upgraded = acct("b");
+        upgraded.plan = Some("Max".into());
+        assert!(merge(&mut s, Some(upgraded.clone()), vec![], 4));
+        assert_eq!(s.account, Some(upgraded));
+        assert_eq!(s.windows.len(), 1);
+        // Windows seen before any account was known are kept for the first account.
+        let mut first = Snapshot::default();
+        merge(&mut first, None, vec![win(None, "Weekly", 0.4)], 1);
+        merge(&mut first, Some(acct("a")), vec![], 2);
+        assert_eq!(first.windows.len(), 1);
     }
 
     #[test]
