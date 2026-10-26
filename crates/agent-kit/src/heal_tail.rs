@@ -359,6 +359,41 @@ impl HealTails {
         self.set(k, Some(tail));
     }
 
+    /// Delta row `seq` of the stream now holds `text` (the end of its stream was appended to
+    /// it). A trusted tail without that row cannot vouch for the item any more; one that would
+    /// overflow is dropped as [`HealTails::record`] drops it.
+    pub(crate) fn amended(
+        &mut self,
+        thread: &str,
+        item: &str,
+        stream: StreamKind,
+        seq: i64,
+        text: &str,
+    ) {
+        let k = key(thread, item);
+        let Some(mut tail) = self.items.get(&k).filter(|t| t.trusted).cloned() else {
+            return;
+        };
+        let row = tail
+            .streams
+            .iter_mut()
+            .find(|(s, _)| *s == stream)
+            .and_then(|(_, rows)| rows.iter_mut().find(|(s, _)| *s == seq));
+        let Some((_, old)) = row else {
+            self.set(k, Some(ItemTail::default()));
+            return;
+        };
+        let grown = text.len().saturating_sub(old.len());
+        if tail.bytes + grown > self.item_cap || self.total + grown > self.total_cap {
+            tracing::debug!("a heal tail overflowed; its item will heal by the SQL scan");
+            self.set(k, Some(ItemTail::default()));
+            return;
+        }
+        tail.bytes = tail.bytes - old.len() + text.len();
+        *old = text.to_owned();
+        self.set(k, Some(tail));
+    }
+
     /// The item completed: its tail is spent.
     pub(crate) fn consume(&mut self, thread: &str, item: &str) {
         let k = key(thread, item);
@@ -502,6 +537,25 @@ mod tests {
             t.trusted("t", "i"),
             Some(vec![(A, vec![(1, "he".into()), (5, "y".into())])])
         );
+    }
+
+    #[test]
+    fn an_amended_row_is_kept_rolled_back_with_its_level_or_distrusts_when_unknown() {
+        let mut t = HealTails::default();
+        t.arm("t", "i");
+        t.record("t", "i", A, 1, "he");
+        t.begin();
+        t.amended("t", "i", A, 1, "hello");
+        assert_eq!(
+            t.trusted("t", "i"),
+            Some(vec![(A, vec![(1, "hello".into())])])
+        );
+        t.rollback();
+        assert_eq!(t.trusted("t", "i"), Some(vec![(A, vec![(1, "he".into())])]));
+        assert_eq!(t.total_bytes(), 2 + ROW_OVERHEAD);
+        // A row the tail does not hold: it can no longer vouch for the item.
+        t.amended("t", "i", A, 9, "x");
+        assert!(t.trusted("t", "i").is_none());
     }
 
     #[test]

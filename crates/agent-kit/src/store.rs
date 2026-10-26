@@ -16,6 +16,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_core::event::{Envelope, Event, ItemKind, ItemStatus, StreamKind};
+use agent_core::redact::stream::{
+    Limits, StreamKey, StreamSanitiser, DEFAULT_MAX_STREAMS, DEFAULT_PER_STREAM_BYTES,
+    KEEP_CAPACITY, KEY_FIELD_PREFIX_BYTES, MAX_KEY_FIELD_BYTES,
+};
 use agent_core::redact::{redact, redact_keyed};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
@@ -48,6 +52,12 @@ const SYNC_FULL: i64 = 2;
 /// [`Store::meta`] key of the native sessions whose threads the user deleted (JSON list of
 /// `driver:native_id`).
 const DISMISSED_KEY: &str = "dismissed_natives";
+/// [`Store::meta`] key of the folders of deleted threads (JSON list of paths, each once).
+const FORGOTTEN_FOLDERS_KEY: &str = "thread_folders_forgotten";
+/// Where an unreadable [`FORGOTTEN_FOLDERS_KEY`] value is kept, rather than overwritten.
+const FORGOTTEN_FOLDERS_BACKUP_KEY: &str = "thread_folders_forgotten.unreadable";
+/// Most folders [`Store::forgotten_folders`] keeps (the newest).
+const MAX_FORGOTTEN_FOLDERS: usize = 1000;
 
 /// The recovery metadata for a thread whose first prompt has not been sent.
 pub fn pending_prompt_key(thread: &str) -> String {
@@ -299,9 +309,10 @@ pub fn default_path(xdg_state_home: Option<&str>, home: Option<&str>) -> Option<
 /// pattern redaction.
 ///
 /// Ceiling: redaction is per envelope, so a token split across two streaming
-/// deltas is not recognized here. [`Store::append_event`] closes that gap when
-/// the item completes or snapshots (see `heal_split_deltas`); until then the
-/// earlier delta rows hold the fragments.
+/// deltas is not recognized here. [`Store::append_event`] closes that gap: a
+/// delta's text first passes the stream gate (`DeltaStreams`), which withholds
+/// what cannot yet be judged whole, and the item's rows are healed again when
+/// it completes or snapshots (see `heal_split_deltas`).
 pub fn scrub_envelope(env: Envelope) -> Result<Envelope> {
     let value = serde_json::to_value(&env)?;
     Ok(serde_json::from_value(scrub_value(None, value))?)
@@ -362,6 +373,956 @@ fn scrub_value(key: Option<&str>, v: Value) -> Value {
 /// searches (rows of other threads in that range count against it).
 const HEAL_WINDOW: i64 = 4000;
 
+/// A delta stream's key in the gate: its thread, its item (scrubbed, then bounded) and its
+/// stream. The thread is the store's own id; the item comes from the provider, so it is kept
+/// in a bounded form ([`bounded`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GateKey {
+    thread: String,
+    item: String,
+    stream: &'static str,
+}
+
+impl GateKey {
+    /// `item` is the scrubbed item id, as stored.
+    fn new(thread: &str, item: &str, stream: StreamKind) -> Self {
+        Self {
+            thread: thread.to_owned(),
+            item: bounded(item),
+            stream: stream_label(stream),
+        }
+    }
+
+    fn sanitiser_key(&self) -> StreamKey {
+        StreamKey {
+            worker: self.thread.clone(),
+            generation: 0,
+            item: self.item.clone(),
+            stream: self.stream.to_owned(),
+        }
+    }
+}
+
+/// What a stream still held when it ended: where it goes, and the text now safe to store.
+#[derive(Debug)]
+struct StreamEnd {
+    thread: String,
+    /// The bounded item id ([`GateKey::item`]).
+    item: String,
+    kind: StreamKind,
+    text: String,
+    /// The `seq` of its last stored row (`None`: none was stored).
+    last_seq: Option<i64>,
+}
+
+/// An open stream that holds text not yet published, as a hand-off read shows it
+/// ([`Store::transcript_messages`]): [`HELD_PLACEHOLDER`] after the stream's stored text, never
+/// the text itself. Keyed by item, not by row, so a write committed after the writer published
+/// it (a later delta of the same line) does not erase it.
+#[derive(Debug, Clone)]
+pub(crate) struct HeldText {
+    thread: String,
+    item: String,
+    kind: StreamKind,
+}
+
+/// Every held text the store writer last published, per database (canonical path), for the
+/// app's other connections: a hand-off read after a barrier sees the writer's unfinished lines.
+/// Published at every barrier, a map of the open streams that hold something (no text): its
+/// cost is one walk over the open streams.
+static HELD: std::sync::Mutex<Vec<(PathBuf, Vec<HeldText>)>> = std::sync::Mutex::new(Vec::new());
+
+/// Longest line held whole. Past it (or past [`GATE_RETAINED_BYTES`] for all streams) the line
+/// loses its context: what is held unpublished is dropped and marked, and the rest of the line
+/// is masked ([`Mask`]), never judged on its own.
+const LINE_HARD_BYTES: usize = 1 << 20;
+/// Most bytes the sanitiser may hold for all the gate's streams together.
+const GATE_RETAINED_BYTES: usize = 32 << 20;
+/// Each stream's sanitiser budget: a line of [`LINE_HARD_BYTES`] and room to spare, so the
+/// sanitiser never overflows or seals one (the gate bounds lines itself, before it would).
+const SANITISER_STREAM_BYTES: usize = LINE_HARD_BYTES + DEFAULT_PER_STREAM_BYTES;
+/// Most raw text kept to rebuild a stream after a rollback. Past it (a PEM block that long),
+/// a rolled-back stream cannot be rebuilt and its line is masked whole instead.
+const REPLAY_CAP: usize = 256 * 1024;
+/// Shown in a hand-off read in place of the part of a line still being judged: never that
+/// text, redacted or not (`redact` leaves short values readable).
+pub(crate) const HELD_PLACEHOLDER: &str = "…";
+/// Most streams open at once; past it the least recently fed is ended (stored, redacted).
+const MAX_OPEN_STREAMS: usize = DEFAULT_MAX_STREAMS;
+
+/// `s` if it is short, else its start, length and a 128-bit digest: what the gate keeps of an
+/// id of any length. Deterministic, so every connection bounds an id the same way.
+fn bounded(s: &str) -> String {
+    if s.len() <= MAX_KEY_FIELD_BYTES {
+        return s.to_owned();
+    }
+    let digest = |salt: u64| {
+        let mut h = std::hash::DefaultHasher::new();
+        std::hash::Hasher::write_u64(&mut h, salt);
+        std::hash::Hasher::write(&mut h, s.as_bytes());
+        std::hash::Hasher::finish(&h)
+    };
+    format!(
+        "{}#{}#{:016x}{:016x}",
+        &s[..floor_boundary(s, KEY_FIELD_PREFIX_BYTES)],
+        s.len(),
+        digest(1),
+        digest(2)
+    )
+}
+
+/// The largest char boundary of `s` at or below `i`.
+fn floor_boundary(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn stream_label(stream: StreamKind) -> &'static str {
+    match stream {
+        StreamKind::Assistant => "assistant",
+        StreamKind::Reasoning => "reasoning",
+        StreamKind::ToolInput => "tool_input",
+        StreamKind::ToolOutput => "tool_output",
+    }
+}
+
+/// A line whose start the gate never saw (see [`OpenStream::mask`]), masked whole: `****` and
+/// its last four characters, or `****` alone when it is short.
+fn mask_line(line: &str) -> String {
+    if line.is_empty() {
+        return String::new();
+    }
+    let n = line.chars().count();
+    if n < 8 {
+        return "****".to_owned();
+    }
+    format!("****{}", line.chars().skip(n - 4).collect::<String>())
+}
+
+/// Appended to a stream's text when it ends inside a PEM block, so a resumed stream knows its
+/// next text is the block's rest (see [`Mask::PemEnd`]).
+const PEM_CUT_MARK: &str = "[PEM BLOCK CUT]";
+
+/// Where a stream is in PEM blocks, followed on its raw text with the markers `redact` uses.
+/// It only says where the stream is: masking stays the sanitiser's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum PemState {
+    #[default]
+    Outside,
+    /// Past `-----BEGIN `, looking for `-----END `.
+    Block,
+    /// Past `-----END `, looking for the `-----` that closes it.
+    BlockEnd,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PemTrack {
+    state: PemState,
+    /// The end of the text so far, as long as a marker's start could be in it.
+    tail: String,
+}
+
+impl PemTrack {
+    // Built from pieces so no source line spells a PEM armour marker.
+    const BEGIN: &'static str = concat!("-----BEG", "IN ");
+    const END: &'static str = concat!("-----EN", "D ");
+    const CLOSE: &'static str = "-----";
+
+    fn in_block() -> Self {
+        Self {
+            state: PemState::Block,
+            tail: String::new(),
+        }
+    }
+
+    fn inside(&self) -> bool {
+        self.state != PemState::Outside
+    }
+
+    /// Inside a block, or past what may be the start of `-----BEGIN `: what follows may be a
+    /// block's body.
+    fn might_be_inside(&self) -> bool {
+        self.inside() || (1..Self::BEGIN.len()).any(|k| self.tail.ends_with(&Self::BEGIN[..k]))
+    }
+
+    /// Follows `piece`; returns the offset in it just past the last block that closes in it.
+    fn advance(&mut self, piece: &str) -> Option<usize> {
+        let carried = self.tail.len();
+        let buf = format!("{}{piece}", self.tail);
+        let mut at = 0;
+        let mut closed = None;
+        loop {
+            let (marker, next) = match self.state {
+                PemState::Outside => (Self::BEGIN, PemState::Block),
+                PemState::Block => (Self::END, PemState::BlockEnd),
+                PemState::BlockEnd => (Self::CLOSE, PemState::Outside),
+            };
+            let Some(i) = buf[at..].find(marker) else {
+                break;
+            };
+            at += i + marker.len();
+            self.state = next;
+            if next == PemState::Outside {
+                closed = Some(at.saturating_sub(carried));
+            }
+        }
+        let mut start = buf.len().saturating_sub(Self::BEGIN.len() - 1).max(at);
+        while !buf.is_char_boundary(start) {
+            start += 1;
+        }
+        self.tail = buf[start..].to_owned();
+        closed
+    }
+}
+
+/// The rest of a line being masked whole: only its length and last four characters are kept
+/// (what [`mask_line`] shows), so it holds no text and costs no room however long it runs.
+#[derive(Debug, Clone, Default)]
+struct LineMask {
+    chars: usize,
+    last: std::collections::VecDeque<char>,
+    /// PEM blocks in the masked text: one open at the line's end is masked to its end too.
+    pem: PemTrack,
+}
+
+impl LineMask {
+    /// A mask continuing text whose PEM state is `pem`.
+    fn after(pem: &PemTrack) -> Self {
+        Self {
+            pem: pem.clone(),
+            ..Self::default()
+        }
+    }
+
+    fn push(&mut self, text: &str) {
+        self.pem.advance(text);
+        for c in text.chars() {
+            self.chars += 1;
+            if self.last.len() == 4 {
+                self.last.pop_front();
+            }
+            self.last.push_back(c);
+        }
+    }
+
+    /// The masked line so far, as [`mask_line`] would mask it.
+    fn masked(&self) -> String {
+        match self.chars {
+            0 => String::new(),
+            1..=7 => "****".to_owned(),
+            _ => format!("****{}", self.last.iter().collect::<String>()),
+        }
+    }
+}
+
+/// How text is masked once a stream lost its redaction context (it ended and went on: a close,
+/// an eviction, a reused id, an import; a line too long to hold; a rollback it cannot be
+/// rebuilt from). What follows cannot be judged with what came before, and is never judged on
+/// its own: it is masked until the context is back.
+#[derive(Debug, Clone)]
+enum Mask {
+    /// The rest of the current line, masked whole at its end.
+    LineEnd(LineMask),
+    /// The rest of a PEM block, dropped up to and including its `-----END …-----`; then the
+    /// rest of that line, masked.
+    PemEnd(PemTrack),
+}
+
+/// One open stream of the gate.
+#[derive(Debug, Clone)]
+struct OpenStream {
+    kind: StreamKind,
+    /// The `seq` and stored text length of its last row.
+    last_seq: Option<i64>,
+    last_len: usize,
+    /// The raw text pushed since the sanitiser last held nothing for this stream, in the
+    /// pieces it was pushed in: replayed to rebuild the stream after a rollback. `None` past
+    /// [`REPLAY_CAP`].
+    replay: Option<Vec<String>>,
+    replay_bytes: usize,
+    /// The sanitiser holds something for this stream.
+    has_state: bool,
+    /// Raw bytes of the current line, and what of it was published.
+    line_len: usize,
+    line_out: String,
+    /// Where the stream's raw text is in PEM blocks (no cut is made inside one).
+    pem: PemTrack,
+    /// The stream lost its context and masks what follows (see [`Mask`]).
+    mask: Option<Mask>,
+    /// When it was last fed (for eviction).
+    touched: u64,
+}
+
+impl OpenStream {
+    fn new(kind: StreamKind, mask: Option<Mask>, touched: u64) -> Self {
+        Self {
+            kind,
+            last_seq: None,
+            last_len: 0,
+            replay: Some(Vec::new()),
+            replay_bytes: 0,
+            has_state: false,
+            line_len: 0,
+            line_out: String::new(),
+            pem: PemTrack::default(),
+            mask,
+            touched,
+        }
+    }
+
+    /// The sanitiser holds nothing for the stream from here on. Large buffers are given back.
+    fn clean(&mut self) {
+        self.has_state = false;
+        self.replay = Some(Vec::new());
+        self.replay_bytes = 0;
+        self.line_len = 0;
+        self.line_out.clear();
+        self.line_out.shrink_to(KEEP_CAPACITY);
+        self.pem = PemTrack::default();
+    }
+
+    /// The current line's raw text, when the stream still has it all.
+    fn line_raw(&self) -> Option<String> {
+        let raw = self.replay.as_ref()?.concat();
+        Some(raw.rsplit('\n').next().unwrap_or("").to_owned())
+    }
+
+    /// Whether everything the line holds is published (no rule's judgement still open): a
+    /// safe place to cut it.
+    fn settled(&self) -> bool {
+        if !self.has_state {
+            return true;
+        }
+        if self.pem.inside() {
+            return false;
+        }
+        self.line_raw()
+            .is_some_and(|line| redact(&line) == self.line_out)
+    }
+
+    /// Whether the stream holds text not yet published (a hand-off read shows
+    /// [`HELD_PLACEHOLDER`] for it: never that text, redacted or not).
+    fn holds(&self) -> bool {
+        self.mask.is_some() || !self.settled()
+    }
+}
+
+/// The gate every streamed delta's text passes before it is scrubbed and stored.
+///
+/// Scrubbing delta by delta masks a secret split across deltas piece by piece: a first part
+/// masked alone (`ghp_…` → `****mnop`) leaves the rest of the token plain, and no later join of
+/// the stored rows can see it again. So each `(thread, item, stream)` goes through
+/// [`StreamSanitiser`]: a row holds only text whose redaction can no longer change, and the
+/// rest is withheld, in memory only, until the stream can be judged whole. When the item
+/// completes, its text is whole and what its streams held is judged and appended to their last
+/// rows. A snapshot restarts the stream from its text, which is the context of the deltas
+/// after it. A deleted thread's streams are cancelled.
+///
+/// **Fail-closed where context is lost.** Whenever a stream loses its redaction context, what
+/// follows is masked until the context is back, never judged on its own ([`Mask`]): the rest of
+/// the current line, and if the context was inside a PEM block, everything up to and including
+/// its `-----END …-----`. Context is lost when:
+/// - a stream ends but may go on (a turn's or session's end, a closed thread or store, an
+///   eviction, the end of an imported history): what it held unpublished is dropped and marked
+///   `****`, never judged as if the line had ended; ending inside a PEM block leaves
+///   [`PEM_CUT_MARK`];
+/// - such a stream goes on (live or in an import): its last row's cut word is masked, and the
+///   rest of the line (or block) after it ([`resume_mask`]), however old that row is;
+/// - a line outgrows [`LINE_HARD_BYTES`] (or the gate [`GATE_RETAINED_BYTES`]): lines are held
+///   whole, never cut and judged in pieces;
+/// - a rollback cannot rebuild a stream (past [`REPLAY_CAP`]).
+///
+/// - **Transactional.** Like the heal tails, the gate follows the store's transactions
+///   ([`DeltaStreams::begin`] / `release` / `rollback`): a delta or an ending rolled back is
+///   taken back from the gate too (the sanitiser rebuilt from the stream's raw text since it
+///   last held nothing), so a write sent again is judged once, and nothing is lost.
+/// - **Bounded.** At most [`MAX_OPEN_STREAMS`] streams (past it the least recently fed is
+///   ended, as above), ids kept bounded, lines and all held text capped, replay text capped,
+///   masks keeping no copy of what they mask.
+///
+/// Ceiling: what is held lives in this connection's memory only. A crash or kill loses it; it
+/// is never written unredacted, but nothing marks the cut. Every delta writes a row, its text
+/// withheld or not, so a stream resumed after a crash whose last row is empty or ended
+/// mid-line is still masked to the line's end. One whose last row ended a line while the
+/// stream held the next line's start (a delta that published a whole line and held what came
+/// after it), or a PEM block's, is judged afresh: the rest of a secret the crash cut there can
+/// be stored.
+struct DeltaStreams {
+    sanitiser: StreamSanitiser,
+    open: HashMap<GateKey, OpenStream>,
+    max_open: usize,
+    clock: u64,
+    /// Off (tests only): deltas are scrubbed alone, as before the gate.
+    enabled: bool,
+    /// Entries as they were before each change made inside open levels, oldest first.
+    journal: Vec<(GateKey, Option<OpenStream>)>,
+    /// Where each open level's changes start in `journal`.
+    levels: Vec<usize>,
+}
+
+impl Default for DeltaStreams {
+    fn default() -> Self {
+        Self::with_max_open(MAX_OPEN_STREAMS)
+    }
+}
+
+impl DeltaStreams {
+    fn with_max_open(max_open: usize) -> Self {
+        Self {
+            sanitiser: StreamSanitiser::new(Self::limits(max_open)),
+            open: HashMap::new(),
+            max_open: max_open.max(1),
+            clock: 0,
+            enabled: true,
+            journal: Vec::new(),
+            levels: Vec::new(),
+        }
+    }
+
+    /// Room for every open stream at its full budget, so the sanitiser never refuses or seals
+    /// one: the gate bounds streams and lines itself.
+    fn limits(max_open: usize) -> Limits {
+        let streams = max_open.max(1) + 1;
+        Limits {
+            per_stream_bytes: SANITISER_STREAM_BYTES,
+            // Never binding: the gate stops at `GATE_RETAINED_BYTES` first.
+            aggregate_bytes: GATE_RETAINED_BYTES + SANITISER_STREAM_BYTES.saturating_mul(2),
+            max_streams: streams,
+        }
+    }
+
+    #[cfg(test)]
+    fn set_max_open(&mut self, n: usize) {
+        *self = Self {
+            enabled: self.enabled,
+            ..Self::with_max_open(n)
+        };
+    }
+
+    /// Bytes the open streams' masks keep, by capacity.
+    #[cfg(test)]
+    fn mask_scratch_bytes(&self) -> usize {
+        self.open
+            .values()
+            .map(|s| match &s.mask {
+                Some(Mask::LineEnd(line)) => line.last.capacity() * std::mem::size_of::<char>(),
+                Some(Mask::PemEnd(track)) => track.tail.capacity(),
+                None => 0,
+            })
+            .sum()
+    }
+
+    /// Bytes of ids the gate keeps.
+    #[cfg(test)]
+    fn key_bytes(&self) -> usize {
+        self.open
+            .keys()
+            .map(|k| k.thread.len() + k.item.len())
+            .sum()
+    }
+
+    // ---- transactions ----
+
+    fn begin(&mut self) {
+        self.levels.push(self.journal.len());
+    }
+
+    fn release(&mut self) {
+        self.levels.pop();
+        if self.levels.is_empty() {
+            self.journal.clear();
+        }
+    }
+
+    /// Takes the innermost level's changes back, rebuilding each stream's sanitiser state.
+    fn rollback(&mut self) {
+        let Some(start) = self.levels.pop() else {
+            return;
+        };
+        while self.journal.len() > start {
+            let Some((key, old)) = self.journal.pop() else {
+                break;
+            };
+            let sk = key.sanitiser_key();
+            self.sanitiser.cancel(&sk);
+            match old {
+                Some(mut stream) => {
+                    if stream.has_state {
+                        match &stream.replay {
+                            Some(pieces) => {
+                                for piece in pieces {
+                                    let _ = self.sanitiser.push(&sk, piece);
+                                }
+                            }
+                            None => {
+                                // Not rebuildable: what continues it is masked, to the end of
+                                // its PEM block if it is in one, else of its line.
+                                let mask = if stream.pem.inside() {
+                                    Mask::PemEnd(stream.pem.clone())
+                                } else {
+                                    Mask::LineEnd(LineMask::after(&stream.pem))
+                                };
+                                stream.clean();
+                                stream.mask = Some(mask);
+                            }
+                        }
+                    }
+                    self.open.insert(key, stream);
+                }
+                None => {
+                    self.open.remove(&key);
+                }
+            }
+        }
+    }
+
+    /// Records the key's entry as it is, if a level is open.
+    fn save(&mut self, key: &GateKey) {
+        if !self.levels.is_empty() {
+            self.journal
+                .push((key.clone(), self.open.get(key).cloned()));
+        }
+    }
+
+    // ---- streams ----
+
+    fn is_open(&self, key: &GateKey) -> bool {
+        self.open.contains_key(key)
+    }
+
+    /// Opens `key`'s stream (`mask`: it continues text stored before, see [`Mask`]); returns
+    /// the streams ended to make room, for the caller to store.
+    fn open(&mut self, key: &GateKey, kind: StreamKind, mask: Option<Mask>) -> Vec<StreamEnd> {
+        if self.open.contains_key(key) {
+            return Vec::new();
+        }
+        if self.sanitiser.saturated() && self.open.is_empty() {
+            // Nothing is held or refused: a fresh sanitiser loses no stream's context.
+            self.sanitiser = StreamSanitiser::new(Self::limits(self.max_open));
+        }
+        let mut ends = Vec::new();
+        while self.open.len() >= self.max_open {
+            let Some(oldest) = self
+                .open
+                .iter()
+                .min_by_key(|(_, s)| s.touched)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            tracing::debug!("too many open delta streams; ending the least recently fed");
+            ends.extend(self.finish(&oldest, false));
+        }
+        self.save(key);
+        self.clock += 1;
+        self.open
+            .insert(key.clone(), OpenStream::new(kind, mask, self.clock));
+        ends
+    }
+
+    /// Feeds one delta's (or a snapshot's) raw text to `key`'s open stream; returns what is
+    /// safe to store now.
+    fn push(&mut self, key: &GateKey, text: &str) -> String {
+        self.save(key);
+        self.clock += 1;
+        let clock = self.clock;
+        let Self {
+            sanitiser, open, ..
+        } = self;
+        let Some(stream) = open.get_mut(key) else {
+            return String::new();
+        };
+        stream.touched = clock;
+        let sk = key.sanitiser_key();
+        let mut out = String::new();
+        let mut rest = text;
+        while !rest.is_empty() {
+            // A resumed stream's continuation is masked first (see `Mask`).
+            match stream.mask.as_mut() {
+                Some(Mask::LineEnd(line)) => match rest.find('\n') {
+                    Some(i) => {
+                        line.push(&rest[..i]);
+                        out.push_str(&line.masked());
+                        out.push('\n');
+                        // A block open at the masked line's end is masked to its end as well
+                        // (a marker never spans a line break, so a partial one ends here).
+                        stream.mask = line.pem.inside().then(|| {
+                            let mut pem = line.pem.clone();
+                            pem.tail.clear();
+                            Mask::PemEnd(pem)
+                        });
+                        rest = &rest[i + 1..];
+                        continue;
+                    }
+                    None => {
+                        line.push(rest);
+                        break;
+                    }
+                },
+                Some(Mask::PemEnd(track)) => match track.advance(rest) {
+                    Some(i) => {
+                        // The block is over; the rest of its last line is masked too.
+                        stream.mask = Some(Mask::LineEnd(LineMask::default()));
+                        rest = &rest[i..];
+                        continue;
+                    }
+                    None => break,
+                },
+                None => {}
+            }
+            let seg_len = rest.find('\n').map_or(rest.len(), |i| i + 1);
+            let seg = &rest[..seg_len];
+            let body = seg.strip_suffix('\n').unwrap_or(seg).len();
+            let fits = stream.line_len + body <= LINE_HARD_BYTES
+                && sanitiser.retained_bytes() + body <= GATE_RETAINED_BYTES;
+            if stream.pem.inside() || fits {
+                // A line is held whole, never cut and judged in pieces: no place in it is safe
+                // to restart from (a `curl` at its start still governs a `-u` far along). Never
+                // inside a PEM block either (it would restart outside it and publish the key);
+                // the sanitiser holds nothing of a block, so that costs no room.
+                feed(sanitiser, &sk, stream, seg, &mut out);
+                rest = &rest[seg_len..];
+                continue;
+            }
+            // The line cannot be held whole: what fits is held, then its context is lost, so
+            // nothing of it is judged apart. What is held and not published is dropped and
+            // marked, and the rest of the line is masked (`Mask`).
+            let room = LINE_HARD_BYTES
+                .saturating_sub(stream.line_len)
+                .min(GATE_RETAINED_BYTES.saturating_sub(sanitiser.retained_bytes()));
+            let at = floor_boundary(seg, room.min(body));
+            feed(sanitiser, &sk, stream, &seg[..at], &mut out);
+            if stream.settled() {
+                out.push_str(&sanitiser.finish(&sk).text);
+            } else {
+                sanitiser.cancel(&sk);
+                out.push_str("****");
+            }
+            let mask = LineMask::after(&stream.pem);
+            stream.clean();
+            stream.mask = Some(Mask::LineEnd(mask));
+            rest = &rest[at..];
+        }
+        out
+    }
+
+    /// `key`'s last row is `seq`, holding `len` bytes of text.
+    fn stored(&mut self, key: &GateKey, seq: i64, len: usize) {
+        if self.open.contains_key(key) {
+            self.save(key);
+        }
+        if let Some(stream) = self.open.get_mut(key) {
+            stream.last_seq = Some(seq);
+            stream.last_len = len;
+        }
+    }
+
+    /// Ends `key`'s stream. `whole`: its text is complete (its item completed), so what it held
+    /// is judged as the end of its text. Otherwise (a turn's or session's end, a close, an
+    /// eviction) it may go on later, without this context: what it held is judged as nothing,
+    /// it is dropped and marked `****`, never judged apart from what may follow.
+    fn finish(&mut self, key: &GateKey, whole: bool) -> Option<StreamEnd> {
+        if !self.open.contains_key(key) {
+            return None;
+        }
+        self.save(key);
+        let stream = self.open.remove(key)?;
+        let mut text = match &stream.mask {
+            Some(Mask::LineEnd(line)) => line.masked(),
+            _ => String::new(),
+        };
+        let sk = key.sanitiser_key();
+        if whole || stream.settled() {
+            text.push_str(&self.sanitiser.finish(&sk).text);
+        } else {
+            self.sanitiser.cancel(&sk);
+            text.push_str("****");
+        }
+        let pem_open = match &stream.mask {
+            Some(Mask::PemEnd(_)) => true,
+            Some(Mask::LineEnd(line)) => line.pem.might_be_inside(),
+            None => stream.pem.might_be_inside(),
+        };
+        // A whole text that ends inside a block is marked too: its id may be reused.
+        if pem_open && (!whole || stream.pem.inside()) {
+            // Ended inside a block, or maybe inside its opening marker: a resumed stream masks
+            // the block's rest.
+            text.push_str(PEM_CUT_MARK);
+        }
+        Some(StreamEnd {
+            thread: key.thread.clone(),
+            item: key.item.clone(),
+            kind: stream.kind,
+            text,
+            last_seq: stream.last_seq,
+        })
+    }
+
+    fn finish_where(&mut self, keep: impl Fn(&GateKey) -> bool, whole: bool) -> Vec<StreamEnd> {
+        let mut keys: Vec<(GateKey, u64)> = self
+            .open
+            .iter()
+            .filter(|(k, _)| keep(k))
+            .map(|(k, s)| (k.clone(), s.touched))
+            .collect();
+        // Deterministic: in the order the streams were last fed.
+        keys.sort_by_key(|(_, touched)| *touched);
+        keys.into_iter()
+            .filter_map(|(k, _)| self.finish(&k, whole))
+            .collect()
+    }
+
+    /// The item completed: its streams' text is whole.
+    fn finish_item(&mut self, thread: &str, item: &str) -> Vec<StreamEnd> {
+        let item = bounded(item);
+        self.finish_where(|k| k.thread == thread && k.item == item, true)
+    }
+
+    /// The thread's turn or session ended, or it closed: its streams may go on later.
+    fn finish_thread(&mut self, thread: &str) -> Vec<StreamEnd> {
+        self.finish_where(|k| k.thread == thread, false)
+    }
+
+    /// The store closes, or an import's history ends: the streams may go on later.
+    fn finish_all(&mut self) -> Vec<StreamEnd> {
+        self.finish_where(|_| true, false)
+    }
+
+    fn cancel(&mut self, key: &GateKey) {
+        if self.open.contains_key(key) {
+            self.save(key);
+            self.open.remove(key);
+            self.sanitiser.cancel(&key.sanitiser_key());
+        }
+    }
+
+    fn cancel_thread(&mut self, thread: &str) {
+        let keys: Vec<GateKey> = self
+            .open
+            .keys()
+            .filter(|k| k.thread == thread)
+            .cloned()
+            .collect();
+        for key in keys {
+            self.cancel(&key);
+        }
+    }
+
+    /// Every open stream that holds text not yet published.
+    fn held(&self) -> Vec<HeldText> {
+        self.open
+            .iter()
+            .filter(|(_, s)| s.holds())
+            .map(|(k, s)| HeldText {
+                thread: k.thread.clone(),
+                item: k.item.clone(),
+                kind: s.kind,
+            })
+            .collect()
+    }
+}
+
+/// Pushes `piece` to the sanitiser, keeping the stream's replay text, state and line in step.
+fn feed(
+    sanitiser: &mut StreamSanitiser,
+    sk: &StreamKey,
+    stream: &mut OpenStream,
+    piece: &str,
+    out: &mut String,
+) {
+    if piece.is_empty() {
+        return;
+    }
+    let before = sanitiser.open_streams();
+    let published = sanitiser.push(sk, piece);
+    let after = sanitiser.open_streams();
+    if published.overflowed {
+        tracing::warn!("streamed text the gate could not hold was withheld");
+    }
+    if !stream.has_state {
+        stream.replay = Some(Vec::new());
+        stream.replay_bytes = 0;
+    }
+    // Only this stream's entry changed, so the count says whether it now holds something.
+    stream.has_state = match after.cmp(&before) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => stream.has_state,
+    };
+    if stream.has_state {
+        stream.replay_bytes += piece.len();
+        if stream.replay_bytes > REPLAY_CAP {
+            stream.replay = None;
+        } else if let Some(replay) = stream.replay.as_mut() {
+            replay.push(piece.to_owned());
+        }
+    } else {
+        stream.replay = Some(Vec::new());
+        stream.replay_bytes = 0;
+    }
+    // The line's length, for cuts: a PEM block's body is not in the sanitiser's line (it is
+    // dropped as it comes), so it does not count.
+    let was_inside = stream.pem.inside();
+    stream.pem.advance(piece);
+    match piece.rfind('\n') {
+        Some(i) if !stream.pem.inside() => stream.line_len = piece.len() - i - 1,
+        _ if was_inside && stream.pem.inside() => {}
+        _ => stream.line_len += piece.len(),
+    }
+    match published.text.rfind('\n') {
+        Some(i) => {
+            stream.line_out.clear();
+            stream.line_out.push_str(&published.text[i + 1..]);
+        }
+        None => stream.line_out.push_str(&published.text),
+    }
+    out.push_str(&published.text);
+}
+
+/// A stream about to go on after it ended, its last stored row's text being `text`: how what
+/// follows must be masked (`None`: its context is whole, the row ended a line outside any PEM
+/// block). The word the row was cut in is masked in `text` too, unless it is a mask already:
+/// judged apart from its rest it might be a secret's start its own shape does not give away.
+fn resume_mask(text: &mut String) -> Option<Mask> {
+    if text.ends_with(PEM_CUT_MARK) {
+        return Some(Mask::PemEnd(PemTrack::in_block()));
+    }
+    if text.ends_with('\n') {
+        return None;
+    }
+    if text.is_empty() {
+        // Its delta's text was withheld and never stored: the stream stopped holding it.
+        return Some(Mask::LineEnd(LineMask::default()));
+    }
+    let start = text.rfind([' ', '\t', '\n']).map_or(0, |i| i + 1);
+    let word = &text[start..];
+    if !word.is_empty() && !word.starts_with("****") {
+        *text = format!("{}{}", &text[..start], mask_line(word));
+    }
+    Some(Mask::LineEnd(LineMask::default()))
+}
+
+/// An imported history through a delta gate of its own: what [`Store::import_events`] stores,
+/// before it is scrubbed. Each stream's end is appended to its last row (by position), and a
+/// stream that goes on after it ended (a reused item, an eviction) is masked as a live one is.
+fn gate_import(thread: &str, envs: &[Envelope], enabled: bool) -> Vec<Envelope> {
+    if !enabled {
+        return envs.to_vec();
+    }
+    /// The text of a delta or snapshot row.
+    fn row_text(env: &mut Envelope) -> Option<&mut String> {
+        match &mut env.event {
+            Event::ContentDelta { text, .. } | Event::ContentSnapshot { text, .. } => Some(text),
+            _ => None,
+        }
+    }
+    /// Stores ended streams' text in their last rows, noting each stream's last row.
+    fn apply(
+        out: &mut Vec<Envelope>,
+        last_rows: &mut HashMap<GateKey, usize>,
+        ends: Vec<StreamEnd>,
+    ) {
+        for end in ends {
+            if end.text.is_empty() {
+                continue;
+            }
+            let text = redact(&end.text);
+            let key = GateKey {
+                thread: end.thread.clone(),
+                item: end.item.clone(),
+                stream: stream_label(end.kind),
+            };
+            let index = end.last_seq.and_then(|i| usize::try_from(i).ok());
+            match index.and_then(|i| out.get_mut(i)).and_then(row_text) {
+                Some(t) => t.push_str(&text),
+                None => out.push(
+                    Envelope::new(Event::ContentDelta {
+                        stream: end.kind,
+                        text,
+                    })
+                    .item(end.item),
+                ),
+            }
+            last_rows.insert(key, index.unwrap_or(out.len() - 1));
+        }
+    }
+    let mut gate = DeltaStreams::default();
+    let mut out: Vec<Envelope> = Vec::with_capacity(envs.len());
+    // Each stream's last row: what a stream that ended and goes on continues.
+    let mut last_rows: HashMap<GateKey, usize> = HashMap::new();
+    for env in envs {
+        let item = env.item.as_deref().map(scrub_item);
+        let mut e = env.clone();
+        if !matches!(e.event, Event::Unknown) {
+            e.raw = None;
+        }
+        match (&env.event, item.as_deref()) {
+            (Event::ItemCompleted { .. }, Some(item)) => {
+                let ends = gate.finish_item(thread, item);
+                apply(&mut out, &mut last_rows, ends);
+            }
+            (Event::TurnCompleted { .. } | Event::SessionExited { .. }, _) => {
+                let ends = gate.finish_all();
+                apply(&mut out, &mut last_rows, ends);
+            }
+            _ => {}
+        }
+        let mut key = None;
+        match (&env.event, item.as_deref()) {
+            (Event::ContentDelta { stream, text }, Some(item)) => {
+                let k = GateKey::new(thread, item, *stream);
+                let mask = if gate.is_open(&k) {
+                    None
+                } else {
+                    last_rows
+                        .get(&k)
+                        .and_then(|&i| out.get_mut(i))
+                        .and_then(row_text)
+                        .and_then(resume_mask)
+                };
+                let ends = gate.open(&k, *stream, mask);
+                apply(&mut out, &mut last_rows, ends);
+                e.event = Event::ContentDelta {
+                    stream: *stream,
+                    text: gate.push(&k, text),
+                };
+                key = Some(k);
+            }
+            (Event::ContentSnapshot { stream, text }, Some(item)) => {
+                let k = GateKey::new(thread, item, *stream);
+                gate.cancel(&k);
+                let ends = gate.open(&k, *stream, None);
+                apply(&mut out, &mut last_rows, ends);
+                e.event = Event::ContentSnapshot {
+                    stream: *stream,
+                    text: gate.push(&k, text),
+                };
+                key = Some(k);
+            }
+            _ => {}
+        }
+        if let Some(k) = key {
+            gate.stored(&k, i64::try_from(out.len()).unwrap_or(i64::MAX), 0);
+            last_rows.insert(k, out.len());
+        }
+        out.push(e);
+    }
+    let ends = gate.finish_all();
+    apply(&mut out, &mut last_rows, ends);
+    out
+}
+
+/// The item id as [`scrub_envelope`] stores it.
+fn scrub_item(item: &str) -> String {
+    match scrub_value(Some("item"), Value::String(item.to_owned())) {
+        Value::String(s) => s,
+        _ => redact(item),
+    }
+}
+
 pub struct Store {
     conn: Connection,
     /// Last timestamp handed out, so `updated_at` strictly increases even
@@ -369,6 +1330,14 @@ pub struct Store {
     last_ms: Cell<i64>,
     /// Streamed text of open items, so a heal need not scan the table (see `heal_tail`).
     tails: RefCell<HealTails>,
+    /// The gate streamed deltas pass before they are stored (see [`DeltaStreams`]).
+    streams: RefCell<DeltaStreams>,
+    /// The database's canonical path (`None`: in memory), under which the writer publishes
+    /// what its streams hold ([`HELD`]).
+    path: Option<PathBuf>,
+    /// This connection publishes its held text (it is the store writer's): it never reads
+    /// another's.
+    publishes_held: Cell<bool>,
     /// Inside [`Store::batch`]: methods that open a transaction take a savepoint instead.
     in_batch: Cell<bool>,
     /// `PRAGMA data_version` when the tails were last known to match the database. It changes
@@ -422,7 +1391,7 @@ impl Scope<'_> {
         };
         self.store.conn.execute_batch(sql)?;
         self.done = true;
-        self.store.tails.borrow_mut().release();
+        self.store.level_release();
         Ok(())
     }
 }
@@ -442,7 +1411,7 @@ impl Drop for Scope<'_> {
                 tracing::warn!(error = %e, "could not roll a store write back");
             }
         }
-        self.store.tails.borrow_mut().rollback();
+        self.store.level_rollback();
     }
 }
 
@@ -463,7 +1432,7 @@ struct JobLevel<'a> {
 impl Drop for JobLevel<'_> {
     fn drop(&mut self) {
         if self.done {
-            self.store.tails.borrow_mut().release();
+            self.store.level_release();
             return;
         }
         if !self.store.conn.is_autocommit() {
@@ -472,7 +1441,7 @@ impl Drop for JobLevel<'_> {
                 .conn
                 .execute_batch("ROLLBACK TO job; RELEASE job");
         }
-        self.store.tails.borrow_mut().rollback();
+        self.store.level_rollback();
     }
 }
 
@@ -489,7 +1458,7 @@ impl Batch<'_> {
     pub fn job<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
         let conn = &self.store.conn;
         conn.execute_batch("SAVEPOINT job")?;
-        self.store.tails.borrow_mut().begin();
+        self.store.level_begin();
         let mut level = JobLevel {
             store: self.store,
             done: false,
@@ -528,12 +1497,13 @@ impl Drop for Batch<'_> {
         let threads: Vec<String> = store.batch_threads.borrow_mut().drain().collect();
         if self.committed {
             // Committed: so are the tail changes.
-            store.tails.borrow_mut().release();
+            store.level_release();
             return;
         }
         if !store.conn.is_autocommit() {
             let _ = store.conn.execute_batch("ROLLBACK");
         }
+        store.streams.borrow_mut().rollback();
         let mut tails = store.tails.borrow_mut();
         tails.rollback();
         // Belt and braces: the batch's threads are not vouched for until they start afresh.
@@ -555,6 +1525,40 @@ impl Drop for DistrustUnlessDone<'_> {
     fn drop(&mut self) {
         if !self.done {
             self.store.tails.borrow_mut().distrust_thread(self.thread);
+        }
+    }
+}
+
+/// A store closing (the writer's shutdown, an inline store dropped) ends every delta stream it
+/// still holds, as [`Store::forget_tails`] does for one thread: their withheld text is stored,
+/// redacted, and a stream resumed later masks the rest of its line (see [`DeltaStreams`]).
+/// Best effort; a crash loses the withheld text, it is never stored unredacted.
+impl Drop for Store {
+    fn drop(&mut self) {
+        if self.publishes_held.get() {
+            if let (Some(path), Ok(mut held)) = (&self.path, HELD.lock()) {
+                held.retain(|(p, _)| p != path);
+            }
+        }
+        let ends = self.streams.get_mut().finish_all();
+        if ends.iter().all(|end| end.text.is_empty()) {
+            return;
+        }
+        if !self.conn.is_autocommit() {
+            tracing::warn!(
+                streams = ends.len(),
+                "the store closed inside a transaction; what its open streams held is lost"
+            );
+            return;
+        }
+        let result = self
+            .scope(rusqlite::TransactionBehavior::Immediate)
+            .and_then(|tx| {
+                self.store_stream_ends(None, ends, true)?;
+                tx.commit()
+            });
+        if let Err(e) = result {
+            tracing::warn!(error = %e, "could not store the end of open streams at close");
         }
     }
 }
@@ -614,7 +1618,10 @@ impl Store {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         // The preflight has upgraded any existing store: here only a fresh one is migrated, and
         // an older schema that slipped past it is refused rather than upgraded unbacked.
-        Self::init(conn, false)
+        let canonical = std::fs::canonicalize(path).ok();
+        let mut store = Self::init(conn, false)?;
+        store.path = canonical;
+        Ok(store)
     }
 
     /// An in-memory store for tests.
@@ -631,6 +1638,9 @@ impl Store {
             conn,
             last_ms: Cell::new(0),
             tails: RefCell::new(HealTails::default()),
+            streams: RefCell::new(DeltaStreams::default()),
+            path: None,
+            publishes_held: Cell::new(false),
             in_batch: Cell::new(false),
             seen_version: Cell::new(version),
             batch_threads: RefCell::new(HashSet::new()),
@@ -760,9 +1770,22 @@ impl Store {
         self.tails.borrow_mut().refuse(thread, item);
     }
 
-    /// Forgets the thread's heal tails (its page closed). Its next heal scans the table.
+    /// Forgets the thread's heal tails (its page closed). Its next heal scans the table. Its
+    /// delta streams end too: what they still held is stored, redacted, in their last rows.
     pub fn forget_tails(&self, thread: &str) {
+        let ends = self.streams.borrow_mut().finish_thread(thread);
+        if let Err(e) = self.store_stream_ends(None, ends, true) {
+            tracing::warn!(error = %e, "could not store the end of a closed thread's streams");
+            self.tails.borrow_mut().distrust_thread(thread);
+        }
         self.tails.borrow_mut().clear_thread(thread);
+    }
+
+    /// Test switch: off, every delta is scrubbed alone as before the gate ([`DeltaStreams`]),
+    /// so the heal tests still have split fragments to heal.
+    #[cfg(test)]
+    pub(crate) fn set_delta_gate(&self, enabled: bool) {
+        self.streams.borrow_mut().enabled = enabled;
     }
 
     /// Sets this connection's automatic checkpoint threshold in pages (0: off; SQLite's default
@@ -843,7 +1866,7 @@ impl Store {
         }
         self.in_batch.set(true);
         self.batch_threads.borrow_mut().clear();
-        self.tails.borrow_mut().begin();
+        self.level_begin();
         Ok(Batch {
             store: self,
             committed: false,
@@ -867,7 +1890,7 @@ impl Store {
             (false, _) => "BEGIN DEFERRED",
         };
         self.conn.execute_batch(sql)?;
-        self.tails.borrow_mut().begin();
+        self.level_begin();
         Ok(Scope {
             store: self,
             savepoint,
@@ -877,9 +1900,27 @@ impl Store {
 
     /// Runs `f` under the named savepoint, with a level of the heal tails: both kept if it
     /// succeeds, both taken back if it fails or panics.
+    /// Opens a level of the heal tails and the delta gate, tied to a transaction or savepoint.
+    fn level_begin(&self) {
+        self.tails.borrow_mut().begin();
+        self.streams.borrow_mut().begin();
+    }
+
+    /// Keeps the innermost level's changes (its transaction or savepoint was kept).
+    fn level_release(&self) {
+        self.tails.borrow_mut().release();
+        self.streams.borrow_mut().release();
+    }
+
+    /// Takes the innermost level's changes back (its transaction or savepoint was not kept).
+    fn level_rollback(&self) {
+        self.tails.borrow_mut().rollback();
+        self.streams.borrow_mut().rollback();
+    }
+
     fn in_savepoint<T>(&self, name: &str, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
         self.conn.execute_batch(&format!("SAVEPOINT {name}"))?;
-        self.tails.borrow_mut().begin();
+        self.level_begin();
         struct Level<'a> {
             store: &'a Store,
             name: &'a str,
@@ -896,7 +1937,7 @@ impl Store {
                         .conn
                         .execute_batch(&format!("ROLLBACK TO {0}; RELEASE {0}", self.name));
                 }
-                self.store.tails.borrow_mut().rollback();
+                self.store.level_rollback();
             }
         }
         let mut level = Level {
@@ -907,7 +1948,7 @@ impl Store {
         let out = f(self)?;
         self.conn.execute_batch(&format!("RELEASE {name}"))?;
         level.done = true;
-        self.tails.borrow_mut().release();
+        self.level_release();
         Ok(out)
     }
 
@@ -1187,7 +2228,15 @@ impl Store {
         let all: Vec<&str> = std::iter::once(thread)
             .chain(hidden.iter().map(String::as_str))
             .collect();
+        let mut folders: Vec<String> = Vec::new();
         for t in &all {
+            let cwd: Option<String> = self
+                .conn
+                .query_row("SELECT cwd FROM threads WHERE id = ?1", params![t], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            folders.extend(cwd.filter(|c| !c.is_empty()));
             let natives: Vec<(String, String)> = self
                 .provider_threads(t)?
                 .into_iter()
@@ -1204,11 +2253,49 @@ impl Store {
                 require_row(n, thread)?;
             }
         }
+        self.remember_folders(&folders)?;
         tx.commit()?;
         for t in &all {
             self.tails.borrow_mut().clear_thread(t);
+            self.streams.borrow_mut().cancel_thread(t);
         }
         Ok(())
+    }
+
+    /// Adds `folders` to [`Store::forgotten_folders`], each once. Inside the caller's write
+    /// transaction, so a delete and its record commit together.
+    ///
+    /// The list is the [`MAX_FORGOTTEN_FOLDERS`] most recently forgotten folders (one forgotten
+    /// again moves to the newest end). A folder not there now is kept: an unmounted disk or a
+    /// network share comes back, and the uninstall checks each one. An unreadable value is never overwritten
+    /// into oblivion: it is kept under [`FORGOTTEN_FOLDERS_BACKUP_KEY`] (appended to what is
+    /// there), and the list starts afresh.
+    fn remember_folders(&self, folders: &[String]) -> Result<()> {
+        if folders.is_empty() {
+            return Ok(());
+        }
+        let mut known: Vec<String> = match self.meta(FORGOTTEN_FOLDERS_KEY)? {
+            None => Vec::new(),
+            Some(raw) => match serde_json::from_str(&raw) {
+                Ok(list) => list,
+                Err(e) => {
+                    tracing::warn!(error = %e, "the forgotten-folders list was unreadable; kept aside");
+                    let kept = match self.meta(FORGOTTEN_FOLDERS_BACKUP_KEY)? {
+                        Some(earlier) => format!("{earlier}\n{raw}"),
+                        None => raw,
+                    };
+                    self.set_meta(FORGOTTEN_FOLDERS_BACKUP_KEY, &kept)?;
+                    Vec::new()
+                }
+            },
+        };
+        for folder in folders {
+            known.retain(|f| f != folder);
+            known.push(folder.clone());
+        }
+        let excess = known.len().saturating_sub(MAX_FORGOTTEN_FOLDERS);
+        known.drain(..excess);
+        self.set_meta(FORGOTTEN_FOLDERS_KEY, &serde_json::to_string(&known)?)
     }
 
     /// Deletes the thread only if it is still blank ([`Store::is_blank`]), checked and deleted
@@ -1300,6 +2387,21 @@ impl Store {
                 Ok(Vec::new())
             }
         }
+    }
+
+    /// The folders (`cwd`) of deleted threads, oldest first, each once: a repository whose
+    /// last thread was deleted may still hold what the app put there (checkpoint refs), so the
+    /// uninstall looks in these as well as in the live threads' folders. Only paths are kept,
+    /// the [`MAX_FORGOTTEN_FOLDERS`] most recent, whether or not they are there now (the
+    /// uninstall checks each). An unreadable list is an error, not an empty one: the caller
+    /// must not take it for "no folders".
+    pub fn forgotten_folders(&self) -> Result<Vec<String>> {
+        let Some(value) = self.meta(FORGOTTEN_FOLDERS_KEY)? else {
+            return Ok(Vec::new());
+        };
+        serde_json::from_str(&value).map_err(|e| {
+            StoreError::Failed(format!("the forgotten-folders list is unreadable: {e}"))
+        })
     }
 
     // ---- app state ----
@@ -1497,7 +2599,7 @@ impl Store {
         let result = self
             .scope(rusqlite::TransactionBehavior::Deferred)
             .and_then(|tx| {
-                let seq = self.append_in_txn(thread, provider_thread, env)?;
+                let seq = self.append_in_txn(thread, provider_thread, env, true)?;
                 tx.commit()?;
                 Ok(seq)
             });
@@ -1518,26 +2620,86 @@ impl Store {
     ///
     /// The heal tails are updated as each row is written, from the scrubbed envelope; a write
     /// that fails afterwards (this append's, or the batch's COMMIT) distrusts the thread's tails.
+    ///
+    /// With `gate`, streamed text passes the delta gate ([`DeltaStreams`]); without it (a user's
+    /// prompt, whole when it is stored) a snapshot is scrubbed whole, as it is.
     fn append_in_txn(
         &self,
         thread: &str,
         provider_thread: Option<&str>,
         env: &Envelope,
+        gate: bool,
     ) -> Result<i64> {
-        let scrubbed = scrub_envelope(env.clone())?;
-        let json = serde_json::to_string(&scrubbed)?;
-        let now = self.now();
         if self.in_batch.get() {
             self.batch_threads.borrow_mut().insert(thread.to_owned());
         }
-        self.conn
-            .execute(
-                "INSERT INTO events (thread_id, provider_thread_id, at, envelope_json)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![thread, provider_thread, now, json],
-            )
-            .map_err(|e| fk_or(e, thread))?;
-        let seq = self.conn.last_insert_rowid();
+        let gated = gate && self.streams.borrow().enabled;
+        // The id as it is stored: the gate keys, compares and writes only that.
+        let item = env.item.as_deref().map(scrub_item);
+        // Streams this event ends are finished first: what they held joins their last rows
+        // before this row is stored and before any heal reads them.
+        match (&env.event, item.as_deref()) {
+            (Event::ItemCompleted { .. }, Some(item)) => {
+                let ends = self.streams.borrow_mut().finish_item(thread, item);
+                self.store_stream_ends(provider_thread, ends, false)?;
+            }
+            (Event::TurnCompleted { .. } | Event::SessionExited { .. }, _) => {
+                let ends = self.streams.borrow_mut().finish_thread(thread);
+                self.store_stream_ends(provider_thread, ends, true)?;
+            }
+            _ => {}
+        }
+        let mut out = env.clone();
+        let mut stored_key = None;
+        if gated && !matches!(env.event, Event::Unknown) {
+            // A native frame rides on the first envelope it produced, which may be a sibling
+            // (an item's start, a turn's) of a delta whose text the gate withholds: it would
+            // carry that text verbatim. Kept only where it is the whole event.
+            out.raw = None;
+        }
+        match (&env.event, item.as_deref()) {
+            (Event::ContentDelta { stream, text }, Some(item)) if gated => {
+                let key = GateKey::new(thread, item, *stream);
+                let ends = self.open_stream(thread, item, &key, *stream, true)?;
+                self.store_stream_ends(provider_thread, ends, true)?;
+                let published = self.streams.borrow_mut().push(&key, text);
+                out.event = Event::ContentDelta {
+                    stream: *stream,
+                    text: published,
+                };
+                stored_key = Some(key);
+            }
+            (Event::ContentSnapshot { stream, text }, Some(item)) => {
+                // The snapshot is the stream's whole text so far: it replaces what the deltas
+                // held, and is the context of the deltas after it.
+                let key = GateKey::new(thread, item, *stream);
+                self.streams.borrow_mut().cancel(&key);
+                if gated {
+                    let ends = self.open_stream(thread, item, &key, *stream, false)?;
+                    self.store_stream_ends(provider_thread, ends, true)?;
+                    let published = self.streams.borrow_mut().push(&key, text);
+                    out.event = Event::ContentSnapshot {
+                        stream: *stream,
+                        text: published,
+                    };
+                    stored_key = Some(key);
+                }
+            }
+            _ => {}
+        }
+        let scrubbed = scrub_envelope(out)?;
+        let now = self.now();
+        let seq = self.insert_event(thread, provider_thread, now, &scrubbed)?;
+        if let (Some(key), Event::ContentDelta { text, .. } | Event::ContentSnapshot { text, .. }) =
+            (&stored_key, &scrubbed.event)
+        {
+            self.streams.borrow_mut().stored(key, seq, text.len());
+        }
+        if let (Event::ContentSnapshot { .. }, Some(item)) = (&scrubbed.event, &scrubbed.item) {
+            // A snapshot starts a segment the heal joins with the deltas after it, which the
+            // tails do not follow: the item heals by the scan.
+            self.tails.borrow_mut().refuse(thread, item);
+        }
         match (&scrubbed.event, &scrubbed.item) {
             (Event::ItemStarted { .. }, Some(item)) => {
                 // A reused item id (a second start, a reopened thread, another process) already
@@ -1589,6 +2751,267 @@ impl Store {
         }
         self.touch(thread, now)?;
         Ok(seq)
+    }
+
+    /// Inserts one already scrubbed envelope; returns its `seq`.
+    fn insert_event(
+        &self,
+        thread: &str,
+        provider_thread: Option<&str>,
+        at: i64,
+        scrubbed: &Envelope,
+    ) -> Result<i64> {
+        let json = serde_json::to_string(scrubbed)?;
+        self.conn
+            .execute(
+                "INSERT INTO events (thread_id, provider_thread_id, at, envelope_json)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![thread, provider_thread, at, json],
+            )
+            .map_err(|e| fk_or(e, thread))?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Stores what ended streams still held ([`DeltaStreams`]): appended to each stream's last
+    /// delta row when that row is still this item's delta on this stream, else (the row was
+    /// rolled back, or none was stored) as a new delta row. The text is the sanitiser's output,
+    /// redacted once more on its own: never weaker than scrubbing the delta alone.
+    ///
+    /// With `heal`, each item written to is then healed ([`Store::heal`]): its stream ended
+    /// without the item completing (a turn's or session's end, a closed thread, the store
+    /// closing), so no completion will join this text with the rows before it.
+    fn store_stream_ends(
+        &self,
+        provider_thread: Option<&str>,
+        ends: Vec<StreamEnd>,
+        heal: bool,
+    ) -> Result<()> {
+        // `(thread, item as stored)` of each item written to.
+        let mut written: Vec<(String, String)> = Vec::new();
+        for end in ends {
+            if end.text.is_empty() {
+                continue;
+            }
+            let text = redact(&end.text);
+            let amended = match end.last_seq {
+                Some(seq) => self.amend_last_row(&end, seq, &text)?,
+                None => None,
+            };
+            let item = match amended {
+                Some(item) => item,
+                None => {
+                    let env = scrub_envelope(
+                        Envelope::new(Event::ContentDelta {
+                            stream: end.kind,
+                            text,
+                        })
+                        .item(end.item.as_str()),
+                    )?;
+                    let seq = self.insert_event(&end.thread, provider_thread, self.now(), &env)?;
+                    let item = env.item.clone().unwrap_or_default();
+                    if let Event::ContentDelta { text, .. } = &env.event {
+                        self.tails
+                            .borrow_mut()
+                            .record(&end.thread, &item, end.kind, seq, text);
+                    }
+                    item
+                }
+            };
+            let key = (end.thread, item);
+            if !written.contains(&key) {
+                written.push(key);
+            }
+        }
+        if heal {
+            for (thread, item) in written {
+                if let Err(e) = self.in_savepoint("heal", |s| s.heal(&thread, &item)) {
+                    tracing::warn!(error = %e, "could not re-scrub an item's streamed text");
+                    self.tails.borrow_mut().distrust_thread(&thread);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Appends `text` to row `seq` if it is still the end's last row: its thread's, its item's
+    /// delta or snapshot on its stream. Returns the row's item id as stored, when it was.
+    fn amend_last_row(&self, end: &StreamEnd, seq: i64, text: &str) -> Result<Option<String>> {
+        let json: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT envelope_json FROM events WHERE seq = ?1 AND thread_id = ?2",
+                params![seq, end.thread],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(json) = json else {
+            return Ok(None);
+        };
+        let mut env: Envelope = serde_json::from_str(&json)?;
+        let Some(item) = env.item.clone().filter(|i| bounded(i) == end.item) else {
+            return Ok(None);
+        };
+        let (Event::ContentDelta {
+            stream,
+            text: stored,
+        }
+        | Event::ContentSnapshot {
+            stream,
+            text: stored,
+        }) = &mut env.event
+        else {
+            return Ok(None);
+        };
+        if *stream != end.kind {
+            return Ok(None);
+        }
+        stored.push_str(text);
+        let whole = stored.clone();
+        env.raw = None;
+        self.conn.execute(
+            "UPDATE events SET envelope_json = ?1 WHERE seq = ?2",
+            params![serde_json::to_string(&env)?, seq],
+        )?;
+        self.tails
+            .borrow_mut()
+            .amended(&end.thread, &item, end.kind, seq, &whole);
+        Ok(Some(item))
+    }
+
+    /// Opens `key`'s gate stream if it is not open, storing the streams ended to make room.
+    /// With `resume`, a stream that already has rows (it ended, and now goes on) is masked as
+    /// [`resume_mask`] says, from its last stored row.
+    fn open_stream(
+        &self,
+        thread: &str,
+        item: &str,
+        key: &GateKey,
+        stream: StreamKind,
+        resume: bool,
+    ) -> Result<Vec<StreamEnd>> {
+        if self.streams.borrow().is_open(key) {
+            return Ok(Vec::new());
+        }
+        let mask = if resume {
+            self.resume_from_last_row(thread, item, stream)?
+        } else {
+            None
+        };
+        Ok(self.streams.borrow_mut().open(key, stream, mask))
+    }
+
+    /// A stream about to go on after it ended: [`resume_mask`] of its last stored row, whose
+    /// cut word is masked in place.
+    fn resume_from_last_row(
+        &self,
+        thread: &str,
+        item: &str,
+        stream: StreamKind,
+    ) -> Result<Option<Mask>> {
+        let Some(seq) = self.last_stream_row(thread, item, stream)? else {
+            return Ok(None);
+        };
+        let json: String = self.conn.query_row(
+            "SELECT envelope_json FROM events WHERE seq = ?1",
+            params![seq],
+            |r| r.get(0),
+        )?;
+        let mut env: Envelope = serde_json::from_str(&json)?;
+        let (Event::ContentDelta { text, .. } | Event::ContentSnapshot { text, .. }) =
+            &mut env.event
+        else {
+            return Ok(None);
+        };
+        let before = text.clone();
+        let mask = resume_mask(text);
+        if *text != before {
+            let masked = text.clone();
+            env.raw = None;
+            self.conn.execute(
+                "UPDATE events SET envelope_json = ?1 WHERE seq = ?2",
+                params![serde_json::to_string(&env)?, seq],
+            )?;
+            self.tails
+                .borrow_mut()
+                .amended(thread, item, stream, seq, &masked);
+        }
+        Ok(mask)
+    }
+
+    /// The `seq` of the last row of `item`'s `stream` (a delta or a snapshot): from the item's
+    /// trusted tail when it has one (it holds every row), else by a scan of the thread from its
+    /// newest row back, with no window: a row older than [`HEAL_WINDOW`] is still the context
+    /// this stream lost.
+    fn last_stream_row(&self, thread: &str, item: &str, stream: StreamKind) -> Result<Option<i64>> {
+        if let Some(streams) = self.tails.borrow().trusted(thread, item) {
+            return Ok(streams
+                .iter()
+                .filter(|(s, _)| *s == stream)
+                .flat_map(|(_, rows)| rows.iter().rev())
+                .map(|(seq, _)| *seq)
+                .next());
+        }
+        let needle = format!("\"item\":{}", serde_json::to_string(item)?);
+        let mut stmt = self.conn.prepare(
+            "SELECT seq, envelope_json FROM events
+             WHERE thread_id = ?1 AND instr(envelope_json, ?2) > 0
+             ORDER BY seq DESC",
+        )?;
+        let rows = stmt.query_map(params![thread, needle], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (seq, json) = row?;
+            let env: Envelope = serde_json::from_str(&json)?;
+            if env.item.as_deref() != Some(item) {
+                continue;
+            }
+            if let Event::ContentDelta { stream: s, .. }
+            | Event::ContentSnapshot { stream: s, .. } = &env.event
+            {
+                if *s == stream {
+                    return Ok(Some(seq));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// The store writer publishes what its streams hold, for the app's other connections to
+    /// show in a hand-off read ([`Store::transcript_messages`]). Called at every barrier.
+    pub(crate) fn publish_held(&self) {
+        self.publishes_held.set(true);
+        let Some(path) = &self.path else {
+            return;
+        };
+        let held = self.streams.borrow().held();
+        let Ok(mut all) = HELD.lock() else {
+            return;
+        };
+        all.retain(|(p, _)| p != path);
+        if !held.is_empty() {
+            all.push((path.clone(), held));
+        }
+    }
+
+    /// The held text of `thread`'s open streams: this connection's own, or (a reader of a
+    /// store with a writer) what the writer last published.
+    fn held_of(&self, thread: &str) -> Vec<HeldText> {
+        let own = self.streams.borrow();
+        let mut held = if self.publishes_held.get() || !own.open.is_empty() || self.path.is_none() {
+            own.held()
+        } else {
+            HELD.lock()
+                .ok()
+                .and_then(|all| {
+                    all.iter()
+                        .find(|(p, _)| Some(p) == self.path.as_ref())
+                        .map(|(_, h)| h.clone())
+                })
+                .unwrap_or_default()
+        };
+        held.retain(|h| h.thread == thread);
+        held
     }
 
     /// Whether `thread` already has a row naming `item`, other than row `seq`, within the rows
@@ -1700,7 +3123,9 @@ impl Store {
     /// (already redacted: the whole stream's text, or empty) and its `raw` frame, which carries
     /// the fragment verbatim, is dropped.
     fn rewrite_healed_delta(&self, seq: i64, mut env: Envelope, replacement: String) -> Result<()> {
-        if let Event::ContentDelta { text, .. } = &mut env.event {
+        if let Event::ContentDelta { text, .. } | Event::ContentSnapshot { text, .. } =
+            &mut env.event
+        {
             *text = replacement;
         }
         env.raw = None;
@@ -1725,40 +3150,61 @@ impl Store {
     /// completes or snapshots keeps its fragments. This scan is the fallback: an item whose
     /// in-memory tail is trusted heals from it instead ([`Store::heal`], `heal_tail`), and
     /// writes the same rows.
+    ///
+    /// A snapshot replaces the deltas before it and is continued by the deltas after it, so a
+    /// stream is healed in segments: its deltas before its first snapshot, then each snapshot
+    /// with the deltas that follow it. (Items with a snapshot always heal by this scan: the
+    /// tails follow deltas only.)
     fn heal_split_deltas(&self, thread: &str, item: &str) -> Result<()> {
         let mut stmt = self.conn.prepare(
             "SELECT seq, envelope_json FROM events
              WHERE thread_id = ?1
                AND seq > (SELECT COALESCE(MAX(seq), 0) FROM events WHERE thread_id = ?1) - ?3
                AND json_extract(envelope_json, '$.item') = ?2
-               AND json_extract(envelope_json, '$.event.type') = 'content_delta'
+               AND json_extract(envelope_json, '$.event.type')
+                   IN ('content_delta', 'content_snapshot')
              ORDER BY seq",
         )?;
         let rows = stmt.query_map(params![thread, item, HEAL_WINDOW], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
         })?;
-        let mut groups: Vec<(StreamKind, Vec<(i64, Envelope)>)> = Vec::new();
+        // Per stream, its segments (each a run of rows, a snapshot only ever first).
+        type Segment = Vec<(i64, Envelope)>;
+        let mut groups: Vec<(StreamKind, Vec<Segment>)> = Vec::new();
         for row in rows {
             let (seq, json) = row?;
             let env: Envelope = serde_json::from_str(&json)?;
-            let Event::ContentDelta { stream, .. } = &env.event else {
-                continue;
+            let (stream, snapshot) = match &env.event {
+                Event::ContentDelta { stream, .. } => (*stream, false),
+                Event::ContentSnapshot { stream, .. } => (*stream, true),
+                _ => continue,
             };
-            let stream = *stream;
-            match groups.iter_mut().find(|(s, _)| *s == stream) {
-                Some((_, v)) => v.push((seq, env)),
-                None => groups.push((stream, vec![(seq, env)])),
+            let segments = match groups.iter_mut().find(|(s, _)| *s == stream) {
+                Some((_, segments)) => segments,
+                None => {
+                    groups.push((stream, Vec::new()));
+                    let Some((_, segments)) = groups.last_mut() else {
+                        continue;
+                    };
+                    segments
+                }
+            };
+            match segments.last_mut() {
+                Some(segment) if !snapshot => segment.push((seq, env)),
+                _ => segments.push(vec![(seq, env)]),
             }
         }
         drop(stmt);
-        for (_, rows) in groups {
+        for rows in groups.into_iter().flat_map(|(_, segments)| segments) {
             if rows.len() < 2 {
                 continue;
             }
             let joined: String = rows
                 .iter()
                 .filter_map(|(_, e)| match &e.event {
-                    Event::ContentDelta { text, .. } => Some(text.as_str()),
+                    Event::ContentDelta { text, .. } | Event::ContentSnapshot { text, .. } => {
+                        Some(text.as_str())
+                    }
                     _ => None,
                 })
                 .collect();
@@ -1778,19 +3224,23 @@ impl Store {
     /// envelope scrubbed like [`Store::append_event`]'s, but the thread's `updated_at` is left
     /// alone (opening an old session must not move it to the top of the list) and the imported
     /// events count as read. Only into a thread with no events yet (checked inside the
-    /// transaction, so two openers cannot both import); returns how many were stored, 0 when the
-    /// thread already had history. All or none.
+    /// transaction, so two openers cannot both import); returns how many rows were stored (not
+    /// how many envelopes were given), 0 when the thread already had history. All or none.
+    ///
+    /// Imported deltas go through a delta gate of their own, as live ones do ([`DeltaStreams`]):
+    /// a secret split across them is judged whole, and each stream's end (its item's completion,
+    /// a turn's end, the end of the history) joins its last row.
     pub fn import_events(
         &self,
         thread: &str,
         provider_thread: Option<&str>,
         envs: &[Envelope],
     ) -> Result<usize> {
-        // Scrubbed before the write lock is taken, so the main connection (live events) waits
-        // only for the inserts.
-        let rows: Vec<String> = envs
-            .iter()
-            .map(|env| Ok(serde_json::to_string(&scrub_envelope(env.clone())?)?))
+        // Gated and scrubbed before the write lock is taken, so the main connection (live
+        // events) waits only for the inserts.
+        let rows: Vec<String> = gate_import(thread, envs, self.streams.borrow().enabled)
+            .into_iter()
+            .map(|env| Ok(serde_json::to_string(&scrub_envelope(env)?)?))
             .collect::<Result<_>>()?;
         let tx = self.write_txn()?;
         let existing: i64 = self.conn.query_row(
@@ -1817,7 +3267,8 @@ impl Store {
             params![thread],
         )?;
         tx.commit()?;
-        Ok(envs.len())
+        // The rows stored: the gate may add one to an envelope's (a stream's end with no row).
+        Ok(rows.len())
     }
 
     /// Stores a user prompt as `ItemStarted{UserMessage}` + `ContentSnapshot`;
@@ -1861,8 +3312,8 @@ impl Store {
         let result = self
             .scope(rusqlite::TransactionBehavior::Deferred)
             .and_then(|tx| {
-                self.append_in_txn(thread, provider_thread, &started)?;
-                self.append_in_txn(thread, provider_thread, &snapshot)?;
+                self.append_in_txn(thread, provider_thread, &started, true)?;
+                self.append_in_txn(thread, provider_thread, &snapshot, false)?;
                 self.delete_meta(&pending_prompt_key(thread))?;
                 tx.commit()
             });
@@ -1962,14 +3413,39 @@ impl Store {
     pub fn transcript_messages(&self, thread: &str) -> Result<Vec<TranscriptMessage>> {
         let mut out: Vec<TranscriptMessage> = Vec::new();
         let mut index: HashMap<String, usize> = HashMap::new();
+        // Each item's id as stored, by its bounded form, and the items that completed.
+        let mut items: HashMap<String, String> = HashMap::new();
+        let mut completed: HashSet<String> = HashSet::new();
         let mut after = 0;
         loop {
             let batch = self.events(thread, Some(after), 1000)?;
             let Some((last, _)) = batch.last() else { break };
             after = *last;
             for (_, env) in batch {
+                if let Some(item) = &env.item {
+                    let key = bounded(item);
+                    if matches!(env.event, Event::ItemCompleted { .. }) {
+                        completed.insert(key.clone());
+                    }
+                    items.entry(key).or_insert_with(|| item.clone());
+                }
                 apply_to_transcript(&mut out, &mut index, env);
             }
+        }
+        // A turn still running: an open stream that holds text not yet published shows
+        // `HELD_PLACEHOLDER` after its stored text (a hand-off made now must not take the line
+        // in progress for finished), never that text. Not once its item has completed.
+        for held in self.held_of(thread) {
+            if completed.contains(&held.item) {
+                continue;
+            }
+            let item = items.get(&held.item).cloned().unwrap_or(held.item);
+            let env = Envelope::new(Event::ContentDelta {
+                stream: held.kind,
+                text: HELD_PLACEHOLDER.to_owned(),
+            })
+            .item(item);
+            apply_to_transcript(&mut out, &mut index, env);
         }
         // A hand-off replays this; the model's private thinking must not travel with it.
         out.retain(|m| m.kind != "reasoning");
@@ -2901,6 +4377,8 @@ mod tests {
     #[test]
     fn events_round_trip_in_order_with_paging() {
         let s = store();
+        // Envelopes as sent, row for row: the delta gate would hold "he" back until "llo".
+        s.set_delta_gate(false);
         let t = s.create_thread("/", None).expect("t");
         let p = s.add_provider_thread(&t, "claude", "m").expect("p");
         let sent = vec![
@@ -2928,6 +4406,85 @@ mod tests {
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].0, seqs[2]);
         assert!(s.events(&t, Some(seqs[3]), 10).expect("end").is_empty());
+    }
+
+    /// Through the gate the same deltas keep their rows, and a delta's native frame (which
+    /// holds the fragment verbatim) is not kept. A turn that ends before its item completes
+    /// may leave it to go on: what the stream held unpublished is masked, not judged as if the
+    /// line had ended.
+    #[test]
+    fn gated_deltas_keep_their_rows_and_a_turn_end_masks_what_is_held() {
+        let s = store();
+        let t = s.create_thread("/", None).expect("t");
+        for e in [
+            delta("a1", "he").raw(serde_json::json!({"n": 1})),
+            delta("a1", "llo wor"),
+            delta("a1", "ld"),
+        ] {
+            s.append_event(&t, None, &e).expect("append");
+        }
+        let text = |s: &Store| -> Vec<String> {
+            s.events(&t, None, 100)
+                .expect("events")
+                .into_iter()
+                .filter_map(|(_, e)| {
+                    assert!(e.raw.is_none());
+                    match e.event {
+                        Event::ContentDelta { text, .. } => Some(text),
+                        _ => None,
+                    }
+                })
+                .collect()
+        };
+        assert_eq!(text(&s), ["", "hello ", ""]);
+        s.append_event(
+            &t,
+            None,
+            &Envelope::new(Event::TurnCompleted {
+                state: TurnState::Completed,
+                usage: None,
+                cost_usd: None,
+                error: None,
+            }),
+        )
+        .expect("turn");
+        assert_eq!(text(&s), ["", "hello ", "****"]);
+    }
+
+    /// A store closed mid-item stores what its streams still held (redacted) in their last
+    /// rows. A first part too short to be masked alone is stored as it is at the close; when the
+    /// item resumes, the word it was cut in is masked, and so is the rest of its line.
+    #[test]
+    fn a_store_closed_mid_item_stores_what_it_held_and_masks_the_cut_word_on_resume() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("threads.db");
+        let secret = format!("ghp_{}", "abcdefghijklmnopqrstuvwxyz0123");
+        let (a, b) = secret.split_at(15);
+        let t = {
+            let s = Store::open(&path).expect("first run");
+            let t = s.create_thread("/", None).expect("t");
+            s.append_event(&t, None, &started("x", ItemKind::AssistantMessage))
+                .expect("start");
+            s.append_event(&t, None, &delta("x", &format!("key {a}")))
+                .expect("a");
+            t
+        };
+        let s = Store::open(&path).expect("second run");
+        let first: String = event_rows(&s).into_iter().map(|r| r.3).collect();
+        assert!(first.contains("key "), "the held text was stored at close");
+        s.append_event(&t, None, &started("x", ItemKind::AssistantMessage))
+            .expect("again");
+        s.append_event(&t, None, &delta("x", &format!("{b} ok")))
+            .expect("b");
+        s.append_event(&t, None, &completed("x", ItemStatus::Completed))
+            .expect("done");
+        assert!(!leaks(&s, &[a, b]));
+        assert_eq!(stored_run(&s, &secret), None);
+        let text = &texts_by_item(&s, &t)["x"];
+        assert!(
+            text.starts_with("key ****") && text.ends_with(" ok"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -3039,7 +4596,7 @@ mod tests {
         s.append_event(
             &t,
             None,
-            &delta("a1", &format!("echo {secret}"))
+            &delta("a1", &format!("echo {secret} "))
                 .raw(serde_json::json!({"cmd": format!("export GH={secret}"), "n": [secret]})),
         )
         .expect("append");
@@ -3175,11 +4732,8 @@ mod tests {
     fn sensitive_keys_are_masked_in_nested_json_and_raw_frames() {
         let s = store();
         let t = s.create_thread("/", None).expect("t");
-        let mut env = Envelope::new(Event::ContentDelta {
-            stream: StreamKind::Assistant,
-            text: "hi".into(),
-        })
-        .item("a1");
+        // Not a delta: a delta's frame is not kept at all.
+        let mut env = Envelope::new(Event::Unknown).item("a1");
         env.raw = Some(serde_json::json!({
             "api_key": "plain-secret-9981", // gitleaks:allow
             "nested": {"db": {"Password": "hunter2hunter2"}, "list": [{"client_secret": "abcdefgh5678"}]}, // gitleaks:allow
@@ -3204,15 +4758,16 @@ mod tests {
         let (a, b) = secret.split_at(12);
         for e in [
             started("a1", ItemKind::AssistantMessage),
-            delta("a1", &format!("token is {a}")),
+            delta("a1", &format!("it is {a}")),
             delta("a1", &format!("{b} ok")),
         ] {
             s.append_event(&t, None, &e).expect("append");
         }
         let all =
             |s: &Store| serde_json::to_string(&s.events(&t, None, 50).expect("ev")).expect("j");
-        // Until completion the fragments are all there is.
-        assert!(all(&s).contains(a));
+        // Until completion the unfinished token is withheld, never stored in pieces.
+        assert!(!all(&s).contains(a));
+        assert!(all(&s).contains("it is "));
         s.append_event(
             &t,
             None,
@@ -3227,7 +4782,69 @@ mod tests {
         let stored = all(&s);
         assert!(!stored.contains(a) && !stored.contains(b), "{stored}");
         let msgs = s.transcript_messages(&t).expect("msgs");
+        assert_eq!(msgs[0].text, "it is ****0123 ok");
+    }
+
+    /// A `ghp_` token split after a first part that redaction masks alone: scrubbed delta by
+    /// delta, the first row became `****mnop` and the heal joined that mask with the raw tail,
+    /// so the tail survived. No 8-character run of the token may be stored, in any row.
+    #[test]
+    fn a_token_split_after_a_maskable_first_part_leaves_no_run_of_it_stored() {
+        let s = store();
+        let t = s.create_thread("/", None).expect("t");
+        let secret = format!("ghp_{}", "abcdefghijklmnopqrstuvwxyz0123");
+        let (a, b) = secret.split_at(20);
+        let first = format!("token is {a}");
+        assert_ne!(redact(&first), first, "the first part is masked on its own");
+        for e in [
+            started("a1", ItemKind::AssistantMessage),
+            delta("a1", &first).raw(serde_json::json!({"frag": first})),
+            delta("a1", &format!("{b} ok")).raw(serde_json::json!({"frag": b})),
+            Envelope::new(Event::ItemCompleted {
+                status: ItemStatus::Completed,
+                output: None,
+                error: None,
+            })
+            .item("a1"),
+        ] {
+            s.append_event(&t, None, &e).expect("append");
+        }
+        let stored: String = event_rows(&s).into_iter().map(|r| r.3).collect();
+        for at in 0..=secret.len() - 8 {
+            // The position only: the run itself is secret-shaped.
+            assert!(
+                !stored.contains(&secret[at..at + 8]),
+                "an 8-character run of the token at {at} was stored"
+            );
+        }
+        let msgs = s.transcript_messages(&t).expect("msgs");
         assert_eq!(msgs[0].text, "token is ****0123 ok");
+    }
+
+    /// Deleting a repository's last thread must not make the repository invisible to the
+    /// uninstall: its folder is remembered.
+    #[test]
+    fn deleting_the_last_thread_of_a_folder_remembers_the_folder() {
+        let s = store();
+        let root = tempfile::tempdir().expect("tmp");
+        let repo = |name: &str| {
+            let p = root.path().join(name);
+            std::fs::create_dir_all(&p).expect("mkdir");
+            p.to_string_lossy().into_owned()
+        };
+        let (one, two) = (repo("one"), repo("two"));
+        let a = s.create_thread(&one, None).expect("a");
+        let b = s.create_thread(&two, None).expect("b");
+        let c = s.create_thread(&two, None).expect("c");
+        assert!(s.forgotten_folders().expect("none").is_empty());
+        s.delete_thread(&a).expect("delete a");
+        s.delete_thread(&b).expect("delete b");
+        s.delete_thread(&c).expect("delete c");
+        assert!(s.list_threads(true).expect("list").is_empty());
+        assert_eq!(s.forgotten_folders().expect("folders"), vec![one, two]);
+        // Only paths are kept: a failed delete records nothing.
+        assert!(s.delete_thread("missing").is_err());
+        assert_eq!(s.forgotten_folders().expect("folders").len(), 2);
     }
 
     #[test]
@@ -3257,6 +4874,7 @@ mod tests {
             .item("r1"),
             started("a1", ItemKind::AssistantMessage),
             delta("a1", "answer"),
+            completed("a1", ItemStatus::Completed),
         ] {
             s.append_event(&t, None, &e).expect("append");
         }
@@ -3894,9 +5512,12 @@ mod tests {
         s.fail_next_commit.set(false);
     }
 
+    /// A store for the heal tests. The delta gate is off, so split fragments are stored and the
+    /// heals have work to do; the differential test turns it back on for half its seeds.
     fn diff_store(tails: bool, seed: u64) -> Store {
         let s = store();
         s.set_heal_tails(tails);
+        s.set_delta_gate(false);
         if tails && seed.is_multiple_of(3) {
             s.tails.borrow_mut().set_caps(120, 360);
         }
@@ -3924,6 +5545,10 @@ mod tests {
             let steps = script(seed);
             let tail = diff_store(true, seed);
             let sql = diff_store(false, seed);
+            // Half the seeds through the delta gate: its stream ends amend rows the tails hold.
+            let gated = seed.is_multiple_of(2);
+            tail.set_delta_gate(gated);
+            sql.set_delta_gate(gated);
             play(&tail, &steps);
             play(&sql, &steps);
             let rows = event_rows(&tail);
@@ -4102,6 +5727,9 @@ mod tests {
         let path = tmp.path().join("threads.db");
         let a = Store::open(&path).expect("a");
         let b = Store::open(&path).expect("b");
+        // The heal under test: fragments stored as they come.
+        a.set_delta_gate(false);
+        b.set_delta_gate(false);
         let t = a.create_thread("/", None).expect("t");
         let secret = format!("ghp_{}", "abcdefghijklmnopqrstuvwxyz0123");
         let (one, two) = secret.split_at(12);
@@ -4123,6 +5751,828 @@ mod tests {
         a.append_event(&t, None, &completed("y", ItemStatus::Completed))
             .expect("done");
         assert_eq!(a.heal_paths.get(), [1, 1]);
+    }
+
+    /// Through the gate, the rest of a token held by another connection is masked when that
+    /// connection ends, never stored plain. (The completing connection judges its own part as
+    /// the item's whole text: two connections writing one item is a stated residual risk.)
+    #[test]
+    fn a_rest_held_by_another_connection_is_masked_when_it_closes() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("threads.db");
+        let a = Store::open(&path).expect("a");
+        let b = Store::open(&path).expect("b");
+        let t = a.create_thread("/", None).expect("t");
+        let secret = format!("ghp_{}", "abcdefghijklmnopqrstuvwxyz0123");
+        let (one, two) = secret.split_at(12);
+        a.append_event(&t, None, &started("x", ItemKind::AssistantMessage))
+            .expect("start");
+        a.append_event(&t, None, &delta("x", one)).expect("one");
+        b.append_event(&t, None, &delta("x", two))
+            .expect("two, elsewhere");
+        a.append_event(&t, None, &completed("x", ItemStatus::Completed))
+            .expect("done");
+        drop(b);
+        assert_eq!(
+            stored_run(&a, two),
+            None,
+            "the other connection's part was stored"
+        );
+    }
+
+    // ---- the delta gate: regressions ----
+
+    // Fake credentials in real shapes, built from pieces so that no source line spells a
+    // credential keyword next to a value, or a PEM armour line.
+    const TOKEN: &str = concat!("ghp_", "abcdefghijklmnopqrstuvwxyz0123");
+    /// The label of the fake key's armour lines.
+    const KEY_LABEL: &str = concat!("RSA PRI", "VATE KEY");
+    /// The start every fake key body line has.
+    const BODY: &str = concat!("MI", "IE");
+    /// `Bearer `, the scheme whose next word is a credential.
+    const BEARER: &str = concat!("Bear", "er ");
+
+    /// A PEM armour line: `edge` is `BEGIN` or `END`.
+    fn pem(edge: &str) -> String {
+        format!("-----{edge} {KEY_LABEL}-----")
+    }
+
+    /// A fake key body line.
+    fn body(rest: &str) -> String {
+        format!("{BODY}{rest}")
+    }
+
+    /// A fake key: its armour around `lines`, each a body line, joined by newlines.
+    fn pem_block(lines: &[&str]) -> String {
+        let mut out = pem(concat!("BEG", "IN"));
+        for line in lines {
+            out.push('\n');
+            out.push_str(&body(line));
+        }
+        out.push('\n');
+        out.push_str(&pem(concat!("EN", "D")));
+        out
+    }
+
+    /// `name` (in pieces) assigned `value` with `sep`.
+    fn kv(name: &[&str], sep: &str, value: &str) -> String {
+        format!("{}{sep}{value}", name.concat())
+    }
+
+    /// The position of the first 8-character run of `secret` stored in any row, if any.
+    fn stored_run(s: &Store, secret: &str) -> Option<usize> {
+        let stored: String = event_rows(s).into_iter().map(|r| r.3).collect();
+        (0..=secret.len() - 8).find(|&at| stored.contains(&secret[at..at + 8]))
+    }
+
+    fn texts_by_item(s: &Store, t: &str) -> HashMap<String, String> {
+        s.transcript_messages(t)
+            .expect("msgs")
+            .into_iter()
+            .map(|m| (m.item_id, m.text))
+            .collect()
+    }
+
+    /// A stream refused for want of room, mid-token, must never restart without its context
+    /// once the others end: the rest of the token would be stored plain. Nor is any stream's
+    /// text dropped to make room.
+    #[test]
+    fn a_stream_past_the_stream_limit_never_stores_a_tokens_tail() {
+        let s = store();
+        s.streams.borrow_mut().set_max_open(1);
+        let t = s.create_thread("/", None).expect("t");
+        let (a, b) = TOKEN.split_at(20);
+        for env in [
+            started("i1", ItemKind::AssistantMessage),
+            started("i2", ItemKind::AssistantMessage),
+            started("i3", ItemKind::AssistantMessage),
+            delta("i1", "hold on"),
+            delta("i2", &format!("key {a}")),
+            delta("i3", "hold it"),
+            completed("i1", ItemStatus::Completed),
+            delta("i2", &format!("{b} ok")),
+            completed("i2", ItemStatus::Completed),
+            completed("i3", ItemStatus::Completed),
+        ] {
+            s.append_event(&t, None, &env).expect("append");
+            assert_eq!(stored_run(&s, TOKEN), None, "a run of the token was stored");
+        }
+        let texts = texts_by_item(&s, &t);
+        assert_eq!(
+            texts["i1"], "hold ****",
+            "ended to make room: held text masked"
+        );
+        assert_eq!(texts["i3"], "hold ****");
+        assert!(texts["i2"].starts_with("key ") && texts["i2"].ends_with(" ok"));
+    }
+
+    /// A line far longer than the sanitiser's per-stream budget (minified JSON, base64, a
+    /// progress line) is stored whole, redacted, never replaced by the withheld notice.
+    #[test]
+    fn a_100_kib_line_is_stored_whole_and_redacted() {
+        let s = store();
+        let t = s.create_thread("/", None).expect("t");
+        let line = format!(
+            "{}{TOKEN} {}",
+            "word ".repeat(10 * 1024),
+            "more ".repeat(10 * 1024)
+        );
+        assert!(line.len() > 100 * 1024);
+        s.append_event(&t, None, &started("big", ItemKind::AssistantMessage))
+            .expect("start");
+        for piece in line.as_bytes().chunks(1000) {
+            let piece = std::str::from_utf8(piece).expect("ascii");
+            s.append_event(&t, None, &delta("big", piece)).expect("d");
+        }
+        s.append_event(&t, None, &completed("big", ItemStatus::Completed))
+            .expect("done");
+        let text = &texts_by_item(&s, &t)["big"];
+        assert!(!text.contains("[withheld"), "content was dropped");
+        let want = redact(&line);
+        let differ = text
+            .bytes()
+            .zip(want.bytes())
+            .position(|(a, b)| a != b)
+            .unwrap_or(text.len().min(want.len()));
+        assert!(
+            *text == want,
+            "lengths {} vs {}, first difference at {differ}: {:?} vs {:?}",
+            text.len(),
+            want.len(),
+            &text[differ.saturating_sub(20)..(differ + 40).min(text.len())],
+            &want[differ.saturating_sub(20)..(differ + 40).min(want.len())]
+        );
+        assert_eq!(stored_run(&s, TOKEN), None);
+    }
+
+    /// A hand-off mid-turn reads the transcript: the unfinished line is in it, its part still
+    /// being judged shown only as a placeholder, and reading does not consume it.
+    #[test]
+    fn an_answer_in_progress_is_in_the_transcript_redacted() {
+        let s = store();
+        let t = s.create_thread("/", None).expect("t");
+        s.append_event(&t, None, &started("a1", ItemKind::AssistantMessage))
+            .expect("start");
+        s.append_event(
+            &t,
+            None,
+            &delta("a1", &format!("the key is {}", &TOKEN[..24])),
+        )
+        .expect("d");
+        let expected = format!("the key is {HELD_PLACEHOLDER}");
+        assert_eq!(texts_by_item(&s, &t)["a1"], expected);
+        assert_eq!(texts_by_item(&s, &t)["a1"], expected, "read twice, same");
+        s.append_event(&t, None, &delta("a1", &format!("{} ok", &TOKEN[24..])))
+            .expect("d");
+        s.append_event(&t, None, &completed("a1", ItemStatus::Completed))
+            .expect("done");
+        assert_eq!(
+            texts_by_item(&s, &t)["a1"],
+            redact(&format!("the key is {TOKEN} ok"))
+        );
+        assert_eq!(stored_run(&s, TOKEN), None);
+    }
+
+    /// A corrupt forgotten-folders list is kept aside, never overwritten into oblivion.
+    #[test]
+    fn a_corrupt_forgotten_folders_list_is_kept_not_overwritten() {
+        let s = store();
+        let dir = tempfile::tempdir().expect("tmp");
+        let cwd = dir.path().to_string_lossy().into_owned();
+        s.set_meta(FORGOTTEN_FOLDERS_KEY, "[\"/old/repo\", oops")
+            .expect("corrupt");
+        let t = s.create_thread(&cwd, None).expect("t");
+        s.delete_thread(&t).expect("delete");
+        assert_eq!(
+            s.meta(FORGOTTEN_FOLDERS_BACKUP_KEY)
+                .expect("meta")
+                .as_deref(),
+            Some("[\"/old/repo\", oops")
+        );
+        assert_eq!(s.forgotten_folders().expect("folders"), vec![cwd]);
+    }
+
+    /// The list is the most recent folders, a folder that is not there now (an unmounted disk,
+    /// a network share) included, and only so many of them.
+    #[test]
+    fn forgotten_folders_keep_the_most_recent_even_when_unmounted() {
+        let s = store();
+        let root = tempfile::tempdir().expect("tmp");
+        let dir = |n: usize| {
+            let p = root.path().join(format!("r{n}"));
+            std::fs::create_dir_all(&p).expect("mkdir");
+            p.to_string_lossy().into_owned()
+        };
+        let unmounted = dir(0);
+        let kept = dir(1);
+        s.remember_folders(&[unmounted.clone(), kept.clone()])
+            .expect("remember");
+        std::fs::remove_dir(&unmounted).expect("rmdir");
+        let next = dir(2);
+        s.remember_folders(std::slice::from_ref(&next))
+            .expect("remember");
+        assert_eq!(
+            s.forgotten_folders().expect("folders"),
+            vec![unmounted.clone(), kept.clone(), next.clone()]
+        );
+        // Forgotten again: it moves to the newest end.
+        s.remember_folders(std::slice::from_ref(&unmounted))
+            .expect("remember");
+        assert_eq!(
+            s.forgotten_folders().expect("folders"),
+            vec![kept, next, unmounted]
+        );
+        let many: Vec<String> = (3..MAX_FORGOTTEN_FOLDERS + 10).map(dir).collect();
+        s.remember_folders(&many).expect("remember");
+        let folders = s.forgotten_folders().expect("folders");
+        assert_eq!(folders.len(), MAX_FORGOTTEN_FOLDERS);
+        assert_eq!(folders.last(), many.last(), "the newest are kept");
+    }
+
+    /// An item id that holds a credential is scrubbed in every row, the rows written when a
+    /// stream ends included.
+    #[test]
+    fn an_item_id_holding_a_credential_is_scrubbed_in_every_row() {
+        let s = store();
+        let t = s.create_thread("/", None).expect("t");
+        for env in [
+            started(TOKEN, ItemKind::AssistantMessage),
+            delta(TOKEN, "hello wor"),
+            delta(TOKEN, "ld"),
+            completed(TOKEN, ItemStatus::Completed),
+        ] {
+            s.append_event(&t, None, &env).expect("append");
+        }
+        assert_eq!(stored_run(&s, TOKEN), None);
+        let msgs = s.transcript_messages(&t).expect("msgs");
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert_eq!(msgs[0].text, "hello world");
+    }
+
+    /// agy's first response frame makes the item's start and its first delta: the native
+    /// frame rides on the start, and must not carry the delta's withheld fragment there.
+    #[test]
+    fn an_agy_frame_never_stores_a_withheld_fragment_on_a_sibling_event() {
+        use agent_core::adapter::Adapter;
+        let s = store();
+        let t = s.create_thread("/", None).expect("t");
+        let mut agy = agent_core::agy::AgyAdapter::new("agy");
+        let frame = |text: &str, state: &str| {
+            serde_json::json!({
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "agent_response",
+                    "step_index": 1,
+                    "state": state,
+                    "text_delta": text,
+                }
+            })
+            .to_string()
+        };
+        let (a, b) = TOKEN.split_at(12);
+        let mut saw_raw_start = false;
+        for line in [
+            frame(&format!("the key is {a}"), "RUNNING"),
+            frame(&format!("{b} ok"), "DONE"),
+        ] {
+            for env in agy.feed(&line) {
+                saw_raw_start |=
+                    matches!(env.event, Event::ItemStarted { .. }) && env.raw.is_some();
+                s.append_event(&t, None, &env).expect("append");
+                assert_eq!(stored_run(&s, TOKEN), None, "a run of the token was stored");
+            }
+        }
+        assert!(saw_raw_start, "the frame rode on the item's start");
+    }
+
+    /// A snapshot that ends with a token's first part, then a delta with the rest: the
+    /// snapshot is the stream's context, so the rest is judged with it.
+    #[test]
+    fn a_snapshot_is_the_context_of_the_deltas_after_it() {
+        let s = store();
+        let t = s.create_thread("/", None).expect("t");
+        let (a, b) = TOKEN.split_at(20);
+        for env in [
+            started("s1", ItemKind::AssistantMessage),
+            Envelope::new(Event::ContentSnapshot {
+                stream: StreamKind::Assistant,
+                text: format!("the key is {a}"),
+            })
+            .item("s1"),
+            delta("s1", &format!("{b} ok")),
+            completed("s1", ItemStatus::Completed),
+        ] {
+            s.append_event(&t, None, &env).expect("append");
+            assert_eq!(stored_run(&s, TOKEN), None, "a run of the token was stored");
+        }
+        assert_eq!(
+            texts_by_item(&s, &t)["s1"],
+            redact(&format!("the key is {TOKEN} ok"))
+        );
+    }
+
+    /// With deltas stored as they come (the gate off), the heal joins a snapshot with the
+    /// deltas that follow it.
+    #[test]
+    fn the_heal_joins_a_snapshot_with_the_deltas_after_it() {
+        let s = diff_store(false, 1);
+        let (a, b) = TOKEN.split_at(12);
+        for env in [
+            started("s1", ItemKind::AssistantMessage),
+            Envelope::new(Event::ContentSnapshot {
+                stream: StreamKind::Assistant,
+                text: format!("the key is {a}"),
+            })
+            .item("s1"),
+            delta("s1", &format!("{b} ok")),
+            completed("s1", ItemStatus::Completed),
+        ] {
+            s.append_event("t1", None, &env).expect("append");
+        }
+        assert_eq!(stored_run(&s, TOKEN), None);
+        assert_eq!(
+            texts_by_item(&s, "t1")["s1"],
+            redact(&format!("the key is {TOKEN} ok"))
+        );
+    }
+
+    /// Closed after a token's first part (masked on its own), reopened, the same item resumed
+    /// with the rest: the rest is never stored plain, at any point.
+    #[test]
+    fn an_item_resumed_after_a_close_never_stores_a_tokens_tail() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("threads.db");
+        let (a, b) = TOKEN.split_at(20);
+        assert_ne!(redact(a), a, "the first part is masked on its own");
+        let t = {
+            let s = Store::open(&path).expect("first run");
+            let t = s.create_thread("/", None).expect("t");
+            s.append_event(&t, None, &started("x", ItemKind::AssistantMessage))
+                .expect("start");
+            s.append_event(&t, None, &delta("x", &format!("key {a}")))
+                .expect("a");
+            assert_eq!(stored_run(&s, TOKEN), None);
+            t
+        };
+        let s = Store::open(&path).expect("second run");
+        assert_eq!(stored_run(&s, TOKEN), None, "after the close");
+        for env in [
+            started("x", ItemKind::AssistantMessage),
+            delta("x", &format!("{b} ok")),
+            delta("x", "\nnext line"),
+            completed("x", ItemStatus::Completed),
+        ] {
+            s.append_event(&t, None, &env).expect("append");
+            assert_eq!(stored_run(&s, TOKEN), None, "a run of the token was stored");
+        }
+        let text = &texts_by_item(&s, &t)["x"];
+        assert!(
+            text.starts_with("key ") && text.ends_with(" ok\nnext line"),
+            "{text}"
+        );
+    }
+
+    /// An imported history goes through the same gate: a token split across imported
+    /// deltas is not stored in pieces.
+    #[test]
+    fn imported_deltas_go_through_the_gate() {
+        let s = store();
+        let t = s.create_thread("/", None).expect("t");
+        let (a, b) = TOKEN.split_at(20);
+        let n = s
+            .import_events(
+                &t,
+                None,
+                &[
+                    started("im", ItemKind::AssistantMessage),
+                    delta("im", &format!("key {a}")),
+                    delta("im", &format!("{b} ok")),
+                    completed("im", ItemStatus::Completed),
+                    started("open", ItemKind::AssistantMessage),
+                    delta("open", "never finished"),
+                ],
+            )
+            .expect("import");
+        assert_eq!(n, 6);
+        assert_eq!(stored_run(&s, TOKEN), None);
+        let texts = texts_by_item(&s, &t);
+        assert_eq!(texts["im"], redact(&format!("key {TOKEN} ok")));
+        assert_eq!(texts["open"], "never ****", "the history ended mid-item");
+    }
+
+    /// What an import returns is the number of rows it stored, as read back.
+    #[test]
+    fn an_import_returns_the_rows_it_stored() {
+        let s = store();
+        let t = s.create_thread("/", None).expect("t");
+        let envs = [
+            started("im", ItemKind::AssistantMessage),
+            delta("im", "one "),
+            delta("im", "two"),
+            completed("im", ItemStatus::Completed),
+        ];
+        let n = s.import_events(&t, None, &envs).expect("import");
+        assert_eq!(n, s.events(&t, None, 100).expect("events").len());
+        assert_eq!(s.import_events(&t, None, &envs).expect("again"), 0);
+    }
+
+    /// The part of an unfinished line still being judged is never shown, redacted or not:
+    /// `redact` leaves a value under eight characters readable, and a hand-off would carry it.
+    #[test]
+    fn held_text_never_shows_the_part_still_being_judged() {
+        for (line, secret) in [
+            (kv(&["pass", "word"], ": ", "hunte"), "hunte"),
+            (format!("{BEARER}abc1234"), "abc1234"),
+        ] {
+            let line = line.as_str();
+            let s = store();
+            let t = s.create_thread("/", None).expect("t");
+            s.append_event(&t, None, &started("a", ItemKind::AssistantMessage))
+                .expect("start");
+            s.append_event(&t, None, &delta("a", line)).expect("d");
+            let text = &texts_by_item(&s, &t)["a"];
+            assert!(!text.contains(secret), "{line:?} showed {text:?}");
+            assert!(text.ends_with(HELD_PLACEHOLDER), "{text:?}");
+        }
+    }
+
+    /// A PEM block on one line longer than any cut point (minified JSON holding a key) is
+    /// never cut inside the block: its body is not stored.
+    #[test]
+    fn a_pem_block_on_one_long_line_is_never_cut_open() {
+        let s = store();
+        let t = s.create_thread("/", None).expect("t");
+        let body = "Q".repeat(70 * 1024);
+        let line = format!(
+            "{{\"{}\":\"{}{body}{}\",\"n\":1}} done",
+            concat!("private", "_key"),
+            pem(concat!("BEG", "IN")),
+            pem(concat!("EN", "D"))
+        );
+        s.append_event(&t, None, &started("k", ItemKind::AssistantMessage))
+            .expect("start");
+        for piece in line.as_bytes().chunks(4096) {
+            let piece = std::str::from_utf8(piece).expect("ascii");
+            s.append_event(&t, None, &delta("k", piece)).expect("d");
+        }
+        s.append_event(&t, None, &completed("k", ItemStatus::Completed))
+            .expect("done");
+        let stored: String = event_rows(&s).into_iter().map(|r| r.3).collect();
+        assert!(!stored.contains("QQQQQQQQ"), "the key's body was stored");
+        assert!(texts_by_item(&s, &t)["k"].ends_with("\"n\":1} done"));
+    }
+
+    /// A stream that ended inside a PEM block, resumed: everything up to the block's end is
+    /// masked, however many lines it runs.
+    #[test]
+    fn a_stream_resumed_inside_a_pem_block_masks_up_to_its_end() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("threads.db");
+        let t = {
+            let s = Store::open(&path).expect("first run");
+            let t = s.create_thread("/", None).expect("t");
+            s.append_event(&t, None, &started("x", ItemKind::AssistantMessage))
+                .expect("start");
+            let first = format!(
+                "key {}\n{}\n",
+                pem(concat!("BEG", "IN")),
+                body("secretlineone")
+            );
+            s.append_event(&t, None, &delta("x", &first)).expect("a");
+            t
+        };
+        let s = Store::open(&path).expect("second run");
+        let rest = format!(
+            "{}\n{}\n{}\nafter it",
+            body("secretlinetwo"),
+            body("secretlinethree"),
+            pem(concat!("EN", "D"))
+        );
+        for env in [
+            started("x", ItemKind::AssistantMessage),
+            delta("x", &rest),
+            completed("x", ItemStatus::Completed),
+        ] {
+            s.append_event(&t, None, &env).expect("append");
+            let stored: String = event_rows(&s).into_iter().map(|r| r.3).collect();
+            assert!(
+                !stored.contains("secretline"),
+                "a line of the key was stored"
+            );
+        }
+        assert!(texts_by_item(&s, &t)["x"].ends_with("after it"));
+    }
+
+    /// A long line is never cut right after `Bearer ` (where the earlier gate cut, at its first
+    /// blank past 32 KiB): the credential after it would be judged alone, and kept.
+    #[test]
+    fn a_long_line_is_never_cut_between_bearer_and_its_credential() {
+        const EARLIER_SOFT_CUT: usize = 32 * 1024;
+        let s = store();
+        let t = s.create_thread("/", None).expect("t");
+        // The header name and its scheme, ending just before the blank its credential follows.
+        let head = format!(" {}: {}", concat!("Authori", "zation"), BEARER.trim_end());
+        let opaque = "abcdefghijklmnopqrstuvwxyz012345";
+        let line = format!(
+            "{}{head} {opaque} rest of it",
+            "x".repeat(EARLIER_SOFT_CUT - head.len())
+        );
+        // Two deltas, the second starting with the credential: no row may hold it, at any
+        // point (a crash before the completion's heal would keep it for good).
+        let (first, second) = line.split_at(EARLIER_SOFT_CUT + 1);
+        for env in [
+            started("b", ItemKind::AssistantMessage),
+            delta("b", first),
+            delta("b", second),
+            completed("b", ItemStatus::Completed),
+        ] {
+            s.append_event(&t, None, &env).expect("append");
+            assert_eq!(stored_run(&s, opaque), None, "the credential was stored");
+        }
+        assert!(texts_by_item(&s, &t)["b"].ends_with(" rest of it"));
+    }
+
+    /// A resumed stream masking a very long line keeps no copy of it: its scratch stays tiny.
+    #[test]
+    fn a_resumed_streams_mask_holds_no_copy_of_the_line() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("threads.db");
+        let t = {
+            let s = Store::open(&path).expect("first run");
+            let t = s.create_thread("/", None).expect("t");
+            s.append_event(&t, None, &started("x", ItemKind::AssistantMessage))
+                .expect("start");
+            s.append_event(&t, None, &delta("x", "cut mid li"))
+                .expect("d");
+            t
+        };
+        let s = Store::open(&path).expect("second run");
+        s.append_event(&t, None, &started("x", ItemKind::AssistantMessage))
+            .expect("again");
+        for _ in 0..5 {
+            s.append_event(&t, None, &delta("x", &"z".repeat(100 * 1024)))
+                .expect("d");
+        }
+        assert!(
+            s.streams.borrow().mask_scratch_bytes() < 1024,
+            "{}",
+            s.streams.borrow().mask_scratch_bytes()
+        );
+    }
+
+    /// A line held to the hard bound with an assignment open at it (a sensitive name and `=`,
+    /// its value in the deltas after it): the value is never judged on its own, so never stored
+    /// plain. (Its first character comes alone, so the cut and the rest land in different rows:
+    /// in one row the row's own scrub would have joined them.)
+    #[test]
+    fn a_value_past_the_hard_bound_is_never_judged_on_its_own() {
+        let s = store();
+        let t = s.create_thread("/", None).expect("t");
+        let value = concat!("super", "secretvalue1234");
+        let name = kv(&["API", "_KEY"], "=", "");
+        let head = format!("{}{name}", "y".repeat(LINE_HARD_BYTES - name.len()));
+        for env in [
+            started("v", ItemKind::AssistantMessage),
+            delta("v", &head),
+            delta("v", &value[..1]),
+            delta("v", &format!("{} rest", &value[1..])),
+            completed("v", ItemStatus::Completed),
+        ] {
+            s.append_event(&t, None, &env).expect("append");
+            assert_eq!(stored_run(&s, value), None, "the value was stored");
+        }
+    }
+
+    /// A stream whose last row is older than the heal window still resumes with its context
+    /// lost, never as a fresh stream.
+    #[test]
+    fn a_stream_resumed_past_the_heal_window_is_still_masked() {
+        let s = store();
+        let t = s.create_thread("/", None).expect("t");
+        let (a, b) = TOKEN.split_at(20);
+        let turn_end = Envelope::new(Event::TurnCompleted {
+            state: TurnState::Completed,
+            usage: None,
+            cost_usd: None,
+            error: None,
+        });
+        s.append_event(&t, None, &started("x", ItemKind::AssistantMessage))
+            .expect("start");
+        s.append_event(&t, None, &delta("x", &format!("key {a}")))
+            .expect("a");
+        s.append_event(&t, None, &turn_end).expect("turn");
+        s.batch(|s| {
+            for _ in 0..HEAL_WINDOW + 10 {
+                s.append_event(&t, None, &Envelope::new(Event::Unknown))
+                    .expect("filler");
+            }
+        })
+        .expect("batch");
+        for env in [
+            delta("x", &format!("{b} ok")),
+            completed("x", ItemStatus::Completed),
+        ] {
+            s.append_event(&t, None, &env).expect("append");
+            assert_eq!(stored_run(&s, TOKEN), None, "a run of the token was stored");
+        }
+    }
+
+    /// An imported item that ends and goes on (a reused id) resumes with its context lost, as
+    /// a live one does.
+    #[test]
+    fn an_imported_stream_that_goes_on_after_it_ended_is_masked() {
+        let s = store();
+        let t = s.create_thread("/", None).expect("t");
+        let (a, b) = TOKEN.split_at(20);
+        s.import_events(
+            &t,
+            None,
+            &[
+                started("im", ItemKind::AssistantMessage),
+                delta("im", &format!("key {a}")),
+                completed("im", ItemStatus::Interrupted),
+                started("im", ItemKind::AssistantMessage),
+                delta("im", &format!("{b} ok")),
+                completed("im", ItemStatus::Completed),
+            ],
+        )
+        .expect("import");
+        assert_eq!(stored_run(&s, TOKEN), None);
+    }
+
+    /// A rollback past the replay cap inside a PEM block cannot rebuild the stream: the rest
+    /// of the block is masked, however many lines it runs, not just the rest of a line.
+    #[test]
+    fn a_rollback_past_the_replay_cap_inside_a_pem_block_masks_the_block() {
+        let s = store();
+        let t = s.create_thread("/", None).expect("t");
+        s.append_event(&t, None, &started("p", ItemKind::AssistantMessage))
+            .expect("start");
+        let lines = format!("{}\n", body("bodybodybody")).repeat(REPLAY_CAP / 16 + 10);
+        s.append_event(
+            &t,
+            None,
+            &delta("p", &format!("k {}\n{lines}", pem(concat!("BEG", "IN")))),
+        )
+        .expect("block");
+        let failed = s.atomically(|s| -> Result<()> {
+            s.append_event(&t, None, &delta("p", &format!("{}\n", body("more"))))?;
+            Err(StoreError::Failed("injected".into()))
+        });
+        assert!(failed.is_err());
+        let rest = format!(
+            "{}\n{}\n{}\nafter",
+            body("secretlineA"),
+            body("secretlineB"),
+            pem(concat!("EN", "D"))
+        );
+        for env in [delta("p", &rest), completed("p", ItemStatus::Completed)] {
+            s.append_event(&t, None, &env).expect("append");
+            let stored: String = event_rows(&s).into_iter().map(|r| r.3).collect();
+            assert!(
+                !stored.contains("secretline"),
+                "a line of the key was stored"
+            );
+        }
+        assert!(texts_by_item(&s, &t)["p"].ends_with("after"));
+    }
+
+    /// For random secret shapes (a prefixed token, a `Bearer` credential, an assignment, a PEM
+    /// block) and positions, line breaks, delta cuts, closes and reopens, evictions and
+    /// rolled-back writes: no 8-character run of the secret is ever stored, checked after
+    /// every step.
+    #[test]
+    fn no_run_of_a_token_is_ever_stored_through_cuts_closes_evictions_and_rollbacks() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        // `(text placed in the stream, the secret part of it)`; fake values in real shapes.
+        let opaque = "abcdefghijklmnopqrstuvwxyz012345";
+        let value = concat!("super", "secretvalue1234567");
+        let shapes: [(String, String); 4] = [
+            (TOKEN.to_owned(), TOKEN.to_owned()),
+            (format!("{BEARER}{opaque}"), opaque.to_owned()),
+            (kv(&["API", "_KEY"], "=", value), value.to_owned()),
+            (
+                pem_block(&["secretsecretsecret", "otherlinesecret"]),
+                body("secretsecretsecret"),
+            ),
+        ];
+        for seed in 1..=200u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let (shape, secret) = &shapes[usize::try_from(seed).unwrap_or(0) % shapes.len()];
+            let path = tmp.path().join(format!("p{seed}.db"));
+            let open = |path: &Path| {
+                let s = Store::open(path).expect("open");
+                s.streams.borrow_mut().set_max_open(2);
+                s
+            };
+            let mut s = open(&path);
+            let t = s.create_thread("/", None).expect("t");
+            let n = 2 + rng.below(12);
+            let at = rng.below(n + 1);
+            let mut text = String::new();
+            for i in 0..=n {
+                if i == at {
+                    text.push_str(shape);
+                } else {
+                    text.push_str(&format!("w{i}"));
+                }
+                text.push(if rng.below(5) == 0 { '\n' } else { ' ' });
+            }
+            let mut cuts: Vec<usize> = (0..1 + rng.below(8))
+                .map(|_| 1 + rng.below(text.len() - 1))
+                .collect();
+            cuts.push(0);
+            cuts.push(text.len());
+            cuts.sort_unstable();
+            cuts.dedup();
+            let check = |s: &Store, step: &str| {
+                if stored_run(s, secret).is_some() {
+                    let rows: Vec<String> = event_rows(s).into_iter().map(|r| r.3).collect();
+                    panic!("seed {seed}, {step}: {text:?} cut at {cuts:?}\n{rows:#?}");
+                }
+            };
+            s.append_event(&t, None, &started("x", ItemKind::AssistantMessage))
+                .expect("start");
+            let mut other = 0;
+            for w in cuts.windows(2) {
+                let piece = &text[w[0]..w[1]];
+                match rng.below(6) {
+                    0 => {
+                        drop(s);
+                        s = open(&path);
+                        check(&s, "after a close");
+                        s.append_event(&t, None, &started("x", ItemKind::AssistantMessage))
+                            .expect("again");
+                    }
+                    1 => {
+                        for _ in 0..2 {
+                            other += 1;
+                            let o = format!("o{other}");
+                            s.append_event(&t, None, &started(&o, ItemKind::AssistantMessage))
+                                .expect("other");
+                            s.append_event(&t, None, &delta(&o, "other text"))
+                                .expect("other delta");
+                        }
+                        check(&s, "after an eviction");
+                    }
+                    2 => {
+                        let failed = s.atomically(|s| -> Result<()> {
+                            s.append_event(&t, None, &delta("x", piece))?;
+                            Err(StoreError::Failed("injected".into()))
+                        });
+                        assert!(failed.is_err());
+                        check(&s, "after a rollback");
+                    }
+                    _ => {}
+                }
+                s.append_event(&t, None, &delta("x", piece)).expect("delta");
+                check(&s, "after a delta");
+            }
+            s.append_event(&t, None, &completed("x", ItemStatus::Completed))
+                .expect("done");
+            check(&s, "after the completion");
+        }
+    }
+
+    /// A delta whose write is rolled back is taken back from the gate too: sent again, it is
+    /// stored once. A completion rolled back keeps what its stream held for the next one.
+    #[test]
+    fn a_rolled_back_write_neither_loses_nor_duplicates_held_text() {
+        let s = store();
+        let t = s.create_thread("/", None).expect("t");
+        let fail = |s: &Store, env: &Envelope| {
+            let r = s.atomically(|s| -> Result<()> {
+                s.append_event(&t, None, env)?;
+                Err(StoreError::Failed("injected".into()))
+            });
+            assert!(r.is_err());
+        };
+        s.append_event(&t, None, &started("a", ItemKind::AssistantMessage))
+            .expect("start");
+        s.append_event(&t, None, &delta("a", "hello ")).expect("d");
+        fail(&s, &delta("a", "wor"));
+        s.append_event(&t, None, &delta("a", "wor")).expect("again");
+        s.append_event(&t, None, &delta("a", "ld")).expect("d");
+        fail(&s, &completed("a", ItemStatus::Completed));
+        s.append_event(&t, None, &completed("a", ItemStatus::Completed))
+            .expect("done");
+        assert_eq!(texts_by_item(&s, &t)["a"], "hello world");
+    }
+
+    /// The gate's bookkeeping is bounded: an item id of any length is kept in a bounded form.
+    #[test]
+    fn a_huge_item_id_is_kept_bounded_by_the_gate() {
+        let s = store();
+        let t = s.create_thread("/", None).expect("t");
+        let item = "i".repeat(1 << 20);
+        s.append_event(&t, None, &started(&item, ItemKind::AssistantMessage))
+            .expect("start");
+        s.append_event(&t, None, &delta(&item, "held wor"))
+            .expect("d");
+        assert!(s.streams.borrow().key_bytes() < 1024);
+        s.append_event(&t, None, &completed(&item, ItemStatus::Completed))
+            .expect("done");
+        assert_eq!(texts_by_item(&s, &t)[&item], "held wor");
     }
 
     #[test]
