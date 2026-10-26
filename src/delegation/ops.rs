@@ -566,7 +566,7 @@ impl Supervisor {
             .get(&r.worker_id)
             .and_then(|s| s.lease.clone());
         if let Some(lease) = lease {
-            let open = (self.services.tab_open_in)(&lease.worktree);
+            let tab_open_in = self.services.tab_open_in.clone();
             let watches = self
                 .state
                 .borrow()
@@ -580,9 +580,15 @@ impl Supervisor {
                 })
                 .unwrap_or_default();
             glib::spawn_future_local(async move {
-                for watch in watches {
-                    super::capacity::wait_exit(&watch).await;
-                }
+                let open = tab_open_after(
+                    async {
+                        for watch in watches {
+                            super::capacity::wait_exit(&watch).await;
+                        }
+                    },
+                    || tab_open_in(&lease.worktree),
+                )
+                .await;
                 gio::spawn_blocking(move || super::workspace::cleanup_if_clean(&lease, open))
                     .await
                     .ok();
@@ -1727,10 +1733,28 @@ pub(super) fn replay_value(r: ReplayOutcome) -> Result<Value, ToolError> {
     }
 }
 
+/// Whether a tab is open in a closed worker's worktree, asked only once its processes have
+/// exited: a tab opened during the wait must keep the worktree.
+async fn tab_open_after(
+    exited: impl std::future::Future<Output = ()>,
+    open_in: impl Fn() -> bool,
+) -> bool {
+    exited.await;
+    open_in()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent_proc::AgentEnv;
+
+    #[test]
+    fn a_tab_opened_during_the_exit_wait_keeps_the_worktree() {
+        let open = std::cell::Cell::new(false);
+        let seen = glib::MainContext::new()
+            .block_on(tab_open_after(async { open.set(true) }, || open.get()));
+        assert!(seen, "the tab check must run after the wait, not before");
+    }
 
     #[test]
     fn the_registration_home_is_the_one_the_approval_socket_proves() {
