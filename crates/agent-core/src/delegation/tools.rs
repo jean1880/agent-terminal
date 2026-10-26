@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-use super::authority::TaskMode;
+use super::authority::{Capability, TaskMode};
 use super::error::ErrorCode;
 use super::lifecycle::RunState;
 use super::limits::Limits;
@@ -105,7 +105,9 @@ impl ToolName {
             ToolName::CrossAgentSpawn => {
                 "agent-terminal cross-agent delegation: start a supervised child agent on a task, \
                  in a task mode within your ceiling (ask, accept_edits or plan) and a workspace \
-                 (an isolated git worktree, or the shared tree read-only for plan). Returns a \
+                 (an isolated git worktree, or the shared tree read-only for plan). To limit the \
+                 child on purpose, list what it may do in capabilities (edit, exec, network); a \
+                 limit written only in the task text is not enforced. Returns a \
                  receipt with the worker id; follow it with cross_agent_wait or cross_agent_read. \
                  Pass an idempotency_key; retrying with the same key never starts a second agent."
             }
@@ -281,6 +283,14 @@ fn input_schema_with(tool: ToolName, l: &Limits) -> Value {
                 "task": {"type": "string", "minLength": 1,
                          "description": format!("At most {} bytes of UTF-8.", l.max_task_bytes)},
                 "task_mode": task_mode(),
+                "capabilities": {"type": "array", "uniqueItems": true,
+                    "items": enum_of(&Capability::ALL),
+                    "description": "Optional: all the child may do beyond reading. Anything \
+                                    else is refused outright, never asked, so neither the user's \
+                                    allow list nor dangerous permissive mode can grant it. Omit \
+                                    it to let the task mode and the user's rules decide. A plan \
+                                    child can hold network only; a child of a restricted worker \
+                                    never holds more than it."},
                 "model": {"type": "string", "minLength": 1,
                           "description": format!("At most {} bytes.", l.max_model_bytes)},
                 "effort": {"type": "string", "minLength": 1,

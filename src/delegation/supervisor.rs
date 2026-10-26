@@ -386,6 +386,7 @@ mod tests {
             name: "worker".into(),
             task: "do the task".into(),
             task_mode: TaskMode::Plan,
+            capabilities: None,
             model: Some("synthetic-model".into()),
             effort: None,
             workspace: WorkspaceRequest::SharedReadOnly,
@@ -1793,6 +1794,65 @@ mod tests {
                     .is_some_and(|s| matches!(s.as_str(), "failed" | "interrupted" | "unknown"))
             })
             .await;
+            stop(&sup).await;
+        });
+    }
+    #[test]
+    fn declared_capabilities_are_stored_and_bind_the_children_a_worker_starts() {
+        use agent_core::delegation::authority::Capability;
+        in_context(async {
+            let (_dir, sup, root) = harness();
+            let spec_caps = |w: &WorkerId| sup.state.borrow().child_specs[w].capabilities.clone();
+            let stored = |w: &WorkerId| -> serde_json::Value {
+                let row = sup
+                    .services
+                    .handle
+                    .reader()
+                    .delegation_worker(w.as_str())
+                    .unwrap()
+                    .unwrap();
+                serde_json::from_str::<serde_json::Value>(&row.launch_json).unwrap()["capabilities"]
+                    .clone()
+            };
+            // A root declared nothing: its child holds what it asked for, kept in its record.
+            let mut request = spawn_request("networked");
+            request.capabilities = Some(vec![Capability::Network]);
+            let networked = spawned(&sup.spawn_worker(&root, request).await.unwrap());
+            assert_eq!(spec_caps(&networked), Some(vec![Capability::Network]));
+            assert_eq!(stored(&networked), serde_json::json!(["network"]));
+
+            let mut request = spawn_request("restricted-parent");
+            request.capabilities = Some(vec![]);
+            let parent = spawned(&sup.spawn_worker(&root, request).await.unwrap());
+            pump_until(|| sup.state.borrow().workers[&parent].run.is_none()).await;
+            assert_eq!(stored(&parent), serde_json::json!([]));
+
+            // Its child inherits the limit when it declares none.
+            let inherits = spawned(
+                &sup.spawn_worker(&parent, spawn_request("inherits"))
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(spec_caps(&inherits), Some(vec![]));
+
+            // Same mode and workspace, one capability more than its parent: refused.
+            let mut wider = spawn_request("wider");
+            wider.capabilities = Some(vec![Capability::Network]);
+            let refused = sup.spawn_worker(&parent, wider).await.unwrap_err();
+            assert_eq!(refused.code, ErrorCode::AuthorityDenied);
+            assert!(
+                refused.message.contains("capabilities"),
+                "{}",
+                refused.message
+            );
+
+            // Nothing declared anywhere stays undeclared.
+            let open = spawned(
+                &sup.spawn_worker(&root, spawn_request("undeclared"))
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(spec_caps(&open), None);
             stop(&sup).await;
         });
     }

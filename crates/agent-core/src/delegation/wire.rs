@@ -326,6 +326,10 @@ pub struct SpawnRequest {
     pub name: String,
     pub task: String,
     pub task_mode: TaskMode,
+    /// What the child may do beyond reading; `None`: the task mode alone decides. Sorted, no
+    /// duplicates ([`super::authority::normalize_capabilities`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Vec<super::authority::Capability>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -547,6 +551,27 @@ impl<'a> Args<'a> {
         }
     }
 
+    fn opt_enum_list<T: serde::de::DeserializeOwned>(
+        &self,
+        field: &str,
+    ) -> Result<Option<Vec<T>>, ToolError> {
+        match self.get(field)? {
+            None => Ok(None),
+            Some(Value::Array(items)) => items
+                .iter()
+                .map(|v| {
+                    if !v.is_string() {
+                        return Err(ToolError::invalid(field, "not_a_string"));
+                    }
+                    serde_json::from_value(v.clone())
+                        .map_err(|_| ToolError::invalid(field, "invalid_value"))
+                })
+                .collect::<Result<Vec<T>, _>>()
+                .map(Some),
+            Some(_) => Err(ToolError::invalid(field, "not_an_array")),
+        }
+    }
+
     fn req_enum<T: serde::de::DeserializeOwned>(&self, field: &str) -> Result<T, ToolError> {
         let v = self.required(field)?;
         if !v.is_string() {
@@ -616,6 +641,7 @@ pub fn parse_request(
                 "name",
                 "task",
                 "task_mode",
+                "capabilities",
                 "model",
                 "effort",
                 "workspace",
@@ -627,6 +653,9 @@ pub fn parse_request(
                 name: a.req_str("name")?.to_owned(),
                 task: a.req_str("task")?.to_owned(),
                 task_mode: a.req_enum("task_mode")?,
+                capabilities: a
+                    .opt_enum_list("capabilities")?
+                    .map(super::authority::normalize_capabilities),
                 model: a.opt_str("model")?.map(str::to_owned),
                 effort: a.opt_str("effort")?.map(str::to_owned),
                 workspace: parse_workspace(a.required("workspace")?)?,
@@ -802,6 +831,19 @@ impl ToolRequest {
                 }
                 if let WorkspaceRequest::IsolatedWorktree { base: Some(b) } = &r.workspace {
                     check_base(b, limits)?;
+                }
+                if let Some(caps) = &r.capabilities {
+                    super::authority::capabilities_allowed(r.task_mode, caps).map_err(|c| {
+                        ToolError::new(
+                            ErrorCode::InvalidArgument,
+                            format!(
+                                "task_mode {} cannot hold the {} capability",
+                                r.task_mode.as_str(),
+                                c.as_str()
+                            ),
+                        )
+                        .with_detail("field", "capabilities")
+                    })?;
                 }
                 workspace_allowed(r.task_mode, &r.workspace).map_err(|code| {
                     ToolError::new(
@@ -2175,6 +2217,40 @@ mod tests {
             m.remove("idempotency_key");
         }
         assert_invalid(ToolName::CrossAgentSend, missing, "idempotency_key");
+    }
+
+    #[test]
+    fn spawn_capabilities_are_optional_normalised_and_fit_the_mode() {
+        let spawn = |caps: Value| {
+            parse(
+                ToolName::CrossAgentSpawn,
+                with(spawn_example(), "capabilities", caps),
+            )
+        };
+        let caps = |req: Result<ToolRequest, ToolError>| match req {
+            Ok(ToolRequest::Spawn(r)) => r.capabilities,
+            other => panic!("not a spawn: {other:?}"),
+        };
+        assert_eq!(
+            caps(parse(ToolName::CrossAgentSpawn, spawn_example())),
+            None
+        );
+        assert_eq!(
+            caps(spawn(json!(["network", "network"]))),
+            Some(vec![super::super::authority::Capability::Network])
+        );
+        assert_eq!(caps(spawn(json!([]))), Some(vec![]));
+        // A plan child cannot be given edits or commands.
+        let e = spawn(json!(["exec"])).expect_err("plan with exec");
+        assert_eq!(e.code, ErrorCode::InvalidArgument);
+        assert_eq!(field_of(&e).as_deref(), Some("capabilities"));
+        for bad in [json!("network"), json!(["read"]), json!([1]), Value::Null] {
+            assert_invalid(
+                ToolName::CrossAgentSpawn,
+                with(spawn_example(), "capabilities", bad),
+                "capabilities",
+            );
+        }
     }
 
     #[test]

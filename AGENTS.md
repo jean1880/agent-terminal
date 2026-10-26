@@ -207,6 +207,15 @@ Architectural mandates, standards, and workflows for this codebase.
   message reaches a process (for Codex, only once its thread is up: never into the adapter's
   own queue); a message that never does gives it back, exactly once, unless a stop or close
   discarded it meanwhile.
+- **A parent's declared limit on a child is refused, never asked**: `cross_agent_spawn`'s optional
+  `capabilities` (`edit`, `exec`, `network`) is all a child may do beyond reading. It only narrows
+  the task mode (a plan child can hold `network` only, refused otherwise), a child of a restricted
+  worker never holds more than it (none declared inherits it), and it is kept in the launch
+  record (an unreadable one restores as none). A call outside it, or an unrecognised tool, is
+  denied by `ChildAuthority::judge`, so neither the user's rules nor dangerous permissive mode can
+  approve it. With nothing declared the task mode decides, and the user's shell and edit rules
+  reach a writing child within it (`rule_may_apply`); a plan child has no network unless declared.
+  `authority::tests::a_declared_limit_is_refused_and_no_rule_reaches_past_it` proves these.
 - **A folder grant is session-only and never wider than its card**: "Allow for session" on an
   edit keeps the file's folder (`always_allow::session_folder`): inside the workspace, or at
   least two levels inside home outside it; never `/`, home or above, and nothing when home is
