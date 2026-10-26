@@ -2057,6 +2057,52 @@ mod tests {
             stop(&sup).await;
         });
     }
+    /// Closing one worker bumps the tree's epoch; its siblings keep working under the new one.
+    #[test]
+    fn closing_a_worker_leaves_its_siblings_current() {
+        in_context(async {
+            let (_dir, sup, root) = harness();
+            let hold = |key: &str| {
+                let mut request = spawn_request(key);
+                request.task = "hold".into();
+                request
+            };
+            let closed = spawned(
+                &sup.spawn_worker(&root, hold("closed-sibling"))
+                    .await
+                    .unwrap(),
+            );
+            let survivor = spawned(&sup.spawn_worker(&root, hold("survivor")).await.unwrap());
+            for w in [&closed, &survivor] {
+                pump_until(|| sup.state.borrow().workers[w].pending.is_none()).await;
+            }
+            let before = sup.epoch(&root).unwrap();
+            let close = CloseRequest {
+                worker_id: closed.clone(),
+                expected_authority_epoch: None,
+                idempotency_key: IdempotencyKey::parse("close-one").unwrap(),
+            };
+            sup.close_worker_call(&root, close).await.unwrap();
+            pump_until(|| !sup.state.borrow().roots[&root].revoking).await;
+            assert!(
+                sup.epoch(&root).unwrap() > before,
+                "a close bumps the epoch"
+            );
+            {
+                let state = sup.state.borrow();
+                assert!(!state.token_current(&state.workers[&closed]));
+                assert!(
+                    state.token_current(&state.workers[&survivor]),
+                    "the sibling's credential moved to the new epoch"
+                );
+            }
+            // Its calls are still its own: it can report to its parent.
+            sup.send_worker(&survivor, report_to_parent("still here", "survivor-report"))
+                .await
+                .expect("the surviving sibling is not stale");
+            stop(&sup).await;
+        });
+    }
     /// Worker status, run agreement, startup deadlines and paging errors (PR-E).
     mod status_tests;
     /// A root is told its sub-agents' results without polling for them.
@@ -3330,10 +3376,30 @@ impl Supervisor {
             })
             .await?;
         let mut state = self.state.borrow_mut();
+        let mut moved = None;
         if let Some(r) = state.roots.get_mut(root) {
+            let before = r.row.epoch();
             r.row.authority_epoch = revoked.authority_epoch as i64;
+            let after = r.row.epoch();
+            if after > before {
+                moved = Some((before, after));
+            }
             if r.revision == revision {
                 r.revoking = false;
+            }
+        }
+        // The bump fences what was in flight under the old epoch; it revokes only the workers
+        // the event names (their tokens are already gone). Every other worker of the tree keeps
+        // its credential, now under the new epoch: closing one sibling must not leave the
+        // others stale, every call denied. A token from an older epoch stays stale.
+        if let Some((before, after)) = moved {
+            for (id, w) in state.workers.iter_mut() {
+                if &w.root != root || revoked.effect.kill_tokens.contains(id) {
+                    continue;
+                }
+                if let Some(token) = w.token.as_mut().filter(|t| t.epoch == before) {
+                    token.epoch = after;
+                }
             }
         }
         for id in revoked.effect.mark_restricted {
