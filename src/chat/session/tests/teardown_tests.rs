@@ -111,6 +111,7 @@ fn plant_unspawned(
             item_id,
             text: text.into(),
             stored,
+            for_switch: false,
         }],
         news: Vec::new(),
     });

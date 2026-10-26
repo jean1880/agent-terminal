@@ -116,6 +116,8 @@ struct TestHooks {
     suspend_asks: RefCell<Vec<u64>>,
     /// Each generation whose binding was released without a process.
     abandoned: RefCell<Vec<u64>>,
+    /// How often the session said the user stopped the turn from inside it.
+    root_stops: Cell<usize>,
 }
 
 impl DelegationHooks for TestHooks {
@@ -180,6 +182,10 @@ impl DelegationHooks for TestHooks {
     fn suspending(&self, generation: ProcessGeneration) -> bool {
         self.suspend_asks.borrow_mut().push(generation.0);
         self.allow_suspend.get()
+    }
+
+    fn root_stopped(&self) {
+        self.root_stops.set(self.root_stops.get() + 1);
     }
 
     fn line(&self, _generation: ProcessGeneration, line: &str, _stderr: bool) {
@@ -1697,6 +1703,134 @@ fn a_delegation_root_suspends_only_with_its_hooks_consent() {
             !session.resumes_from_suspension(),
             "a started process is no longer that resume"
         );
+    });
+}
+
+/// "Stop turn" on an approval card stops a root as the window's Stop does: its hooks are told
+/// (the supervisor then holds its sub-agents' news until the user speaks), from agy's hook card
+/// and from Claude's, answered or not, and only for Stop turn.
+#[test]
+fn an_approval_cards_stop_turn_tells_the_hooks_the_root_stopped() {
+    in_loop(|ctx| {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let thread = fresh(&store, &dir.path().to_string_lossy());
+        let (sink, seen) = make_sink();
+        let hooks = Rc::new(TestHooks::default());
+        let session = ChatSession::with_options(
+            Box::new(agent_core::claude::ClaudeAdapter::new()),
+            super::idle_claude(dir.path()),
+            SessionStore::from(store),
+            thread,
+            sink,
+            Err(None),
+            minimal_env(dir.path()),
+            SessionOptions {
+                generation_base: ProcessGeneration(0),
+                hooks: Some(hooks.clone()),
+                child: None,
+            },
+        );
+        session.reload_session();
+        assert!(pump_until(ctx, 10, || has(&seen, |e| matches!(
+            e,
+            Event::TurnCompleted { .. }
+        ))));
+
+        // agy's hook card: the post-answer path, as its socket would take it.
+        for decision in [Decision::Allow, Decision::Deny] {
+            session.inner.finish_hook_approval("h1", decision, true);
+        }
+        assert_eq!(hooks.root_stops.get(), 0, "only Stop turn is a stop");
+        for answered in [true, false] {
+            session
+                .inner
+                .finish_hook_approval("h1", Decision::Cancel, answered);
+        }
+        assert_eq!(
+            hooks.root_stops.get(),
+            2,
+            "agy's Stop turn, answered or not"
+        );
+
+        // Claude's card.
+        feed(&session, &can_use_tool("r1", "touch a"));
+        session.respond_approval("r1", Decision::Deny);
+        assert_eq!(resolution(&seen, "r1"), Some(Decision::Deny));
+        assert_eq!(hooks.root_stops.get(), 2);
+        feed(&session, &can_use_tool("r2", "touch b"));
+        session.respond_approval("r2", Decision::Cancel);
+        assert_eq!(resolution(&seen, "r2"), Some(Decision::Cancel));
+        assert_eq!(hooks.root_stops.get(), 3, "Claude's Stop turn");
+        session.shutdown(false);
+    });
+}
+
+/// A delegation root's switch: the window stops it for the rebind, asks for the switch, then
+/// ends the rebind straight away. A switch still reading the thread then is not cancelled by
+/// that restart, nor is the outgoing agent started again: the switch starts its new agent.
+#[test]
+fn a_rebind_around_a_roots_switch_lets_the_switch_start_the_new_agent() {
+    use agent_kit::store_writer::StoreWriter;
+    in_loop(|ctx| {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("threads.sqlite");
+        let store = Rc::new(Store::open(&path).expect("store"));
+        let thread = fresh(&store, "/w");
+        let writer = StoreWriter::spawn(&path).expect("writer");
+        let handle = StoreHandle::Queued {
+            reader: store,
+            writer: writer.clone(),
+        };
+        let (sink, seen) = make_sink();
+        let hooks = Rc::new(TestHooks::default());
+        let old: Log = Rc::default();
+        let new: Log = Rc::default();
+        let session = ChatSession::with_options(
+            FakeAdapter::boxed(Driver::Agy, &old),
+            OpenSession {
+                model: Some("gemini-pro".into()),
+                mode: Mode::Plan,
+                ..open_session("unused", Vec::new(), "/")
+            },
+            SessionStore::from(handle),
+            thread,
+            sink,
+            Err(None),
+            minimal_env(dir.path()),
+            SessionOptions {
+                generation_base: ProcessGeneration(0),
+                hooks: Some(hooks.clone()),
+                child: None,
+            },
+        );
+        let factory = new.clone();
+        session.set_adapter_factory(Rc::new(move |d| launch_of(FakeAdapter::boxed(d, &factory))));
+        assert!(pump_until(ctx, 5, || session.status().alive));
+
+        session.rebind_stop();
+        writer
+            .write("a slow write", None, |_| {
+                std::thread::sleep(Duration::from_millis(400));
+                Ok(())
+            })
+            .expect("queued");
+        session.switch(Driver::Claude, Some("opus".into()), None);
+        let starts = hooks.started.borrow().len();
+        session.rebind_start();
+        assert_eq!(
+            hooks.started.borrow().len(),
+            starts,
+            "the outgoing agent was started again"
+        );
+        assert!(
+            pump_until(ctx, 10, || session.status().driver == Driver::Claude
+                && session.status().alive),
+            "the switch was lost to the rebind"
+        );
+        assert!(has(&seen, |e| matches!(e, Event::Notice { text }
+            if text.starts_with("Switched to Claude") || text.starts_with("Continuing in Claude"))));
+        session.shutdown(false);
     });
 }
 

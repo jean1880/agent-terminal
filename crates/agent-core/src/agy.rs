@@ -97,8 +97,23 @@ fn profile_args(extra_args: &[String]) -> Vec<String> {
     kept
 }
 
-/// Fragment of the error agy puts on a step the PreToolUse hook refused.
-const HOOK_DENIAL: &str = "denied by pre-tool hook";
+/// How agy's error on a step the PreToolUse hook refused begins: the step never ran.
+const HOOK_DENIAL: &str = "tool call denied by pre-tool hook";
+
+/// Whether a step's error is agy's own report that a hook refused it before it ran (then the
+/// step is [`ItemStatus::Declined`]), rather than the failure of a tool that did run
+/// ([`ItemStatus::Failed`]). Only that report's exact shape counts, as agy writes it (recorded
+/// in `tests/fixtures/agy-hook-approval.ndjson`): an error object of type `TOOL_ERROR` whose
+/// message begins with the refusal, on a step with no tool output. A tool that ran can put any
+/// text in its error, the refusal's words included, and a tool that ran may leave output.
+fn refused_before_running(error: Option<&Value>, output: Option<&Value>) -> bool {
+    let Some(error) = error else {
+        return false;
+    };
+    let tool_error = error.get("type").and_then(Value::as_str) == Some("TOOL_ERROR");
+    let message = error.get("message").and_then(Value::as_str).unwrap_or("");
+    tool_error && output.is_none_or(Value::is_null) && message.starts_with(HOOK_DENIAL)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SideKind {
@@ -453,7 +468,7 @@ impl AgyAdapter {
                         detail: Some(Value::String(message.clone())),
                     }));
                 }
-                let status = if message.contains(HOOK_DENIAL) {
+                let status = if refused_before_running(info.error.as_ref(), info.output.as_ref()) {
                     ItemStatus::Declined
                 } else {
                     ItemStatus::Failed
@@ -1389,6 +1404,75 @@ mod tests {
             matches!(&started.event, Event::ItemStarted { kind: ItemKind::Command, title, .. }
             if title == "echo allow-me")
         );
+    }
+
+    /// Only agy's own report of a hook refusal is a step refused before it ran (`Declined`). A
+    /// tool that ran and failed stays `Failed`, even when its error quotes the refusal's words
+    /// (a command can print anything), since the session's canary watches failed steps.
+    #[test]
+    fn only_a_hook_refusal_is_declined_never_a_failure_that_quotes_one() {
+        let status = |message: &str| {
+            let mut a = turn_adapter();
+            let out = step_of(
+                &mut a,
+                json!({"conversation_id": "c1", "state": "ERROR", "step_index": 1,
+                    "step_type": "tool", "tool_name": "run_command",
+                    "tool_info": {"error": {"message": message, "type": "TOOL_ERROR"}}}),
+            );
+            out.iter()
+                .find_map(|e| match &e.event {
+                    Event::ItemCompleted { status, .. } => Some(*status),
+                    _ => None,
+                })
+                .expect("the step completes")
+        };
+        assert_eq!(
+            status("tool call denied by pre-tool hook: denied in agent-terminal (probe)"),
+            ItemStatus::Declined
+        );
+        for ran in [
+            "exit status 1: tool call denied by pre-tool hook",
+            "error: pre-commit hook refused the commit; tool call denied by pre-tool hook: no",
+            "permission denied",
+        ] {
+            assert_eq!(status(ran), ItemStatus::Failed, "{ran}");
+        }
+    }
+
+    /// The refusal is recognised by the whole shape of agy's report (the fixture's step 4: a
+    /// `TOOL_ERROR` object, the refusal first, no output), never by its words alone: a tool that
+    /// ran and whose own error begins with the refusal sentence is still `Failed`.
+    #[test]
+    fn an_executed_tool_whose_error_begins_with_the_refusal_is_still_failed() {
+        let fixture_step = HOOK
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .map(|v| v["frame"]["step_update"].clone())
+            .find(|s| s["state"] == "ERROR")
+            .expect("the fixture's refused step");
+        let status = |step: Value| {
+            let mut a = turn_adapter();
+            step_of(&mut a, step)
+                .iter()
+                .find_map(|e| match &e.event {
+                    Event::ItemCompleted { status, .. } => Some(*status),
+                    _ => None,
+                })
+                .expect("the step completes")
+        };
+        assert_eq!(status(fixture_step.clone()), ItemStatus::Declined);
+        // The same report, but the tool ran: it left output.
+        let mut ran = fixture_step.clone();
+        ran["tool_info"]["output"] = json!("hook: pre-commit\nexit status 1");
+        assert_eq!(status(ran), ItemStatus::Failed);
+        // An error that is only text, or of another type, is not agy's refusal report.
+        let mut text_only = fixture_step.clone();
+        text_only["tool_info"]["error"] =
+            json!("tool call denied by pre-tool hook: printed by the tool itself");
+        assert_eq!(status(text_only), ItemStatus::Failed);
+        let mut other_type = fixture_step;
+        other_type["tool_info"]["error"]["type"] = json!("EXECUTION_ERROR");
+        assert_eq!(status(other_type), ItemStatus::Failed);
     }
 
     #[test]
