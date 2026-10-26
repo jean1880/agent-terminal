@@ -691,6 +691,7 @@ impl StreamSanitiser {
 #[cfg(test)]
 mod tests {
     use super::super::redact;
+    use super::super::tests::fx;
     use super::*;
 
     /// A fake key, not a credential.
@@ -810,7 +811,8 @@ mod tests {
     /// pre-refactor `redact.rs` (master at cf63cc31, compiled standalone) and frozen here: an
     /// independent check that neither `redact` nor the sanitiser drifted. Some entries record
     /// `redact`'s known limits as they stand (a `\r` kept inside a masked value, `Basic` on a
-    /// line without "authorization", a token cut by an invalid byte).
+    /// line without "authorization", a token cut by an invalid byte). Entries a later rule
+    /// changed on purpose say so beside them.
     const BASELINE: &[&str] = &[
         "export GH=****0123 and",
         "key ****efgh end",
@@ -832,10 +834,13 @@ mod tests {
         "API_KEY=****1234 next",
         "\"db_password\": \"****ter2\", \"x\": 1",
         "before [REDACTED PEM BLOCK] after\nnext",
-        "key: ****CTED PEM BLOCK]",
+        // Since `name: value` runs to the line end, the whole PEM mask is the value: kept.
+        "key: [REDACTED PEM BLOCK]",
         "[REDACTED PEM BLOCK]",
         "café TOKEN=****ééé€ ghp_ßßßßßßßßßßßß 日本語 password: ****dé!!",
-        "{\"api_key\": \"****78, \"secret\":\"****aces",
+        // The first value is read as one shell word up to the next quote (`"…, "secret`) and
+        // masked inside a quote of its own; the next key's value is still masked.
+        "{\"api_key\": \"****cret\"\":\"****aces",
         "API_KEY=****234\r\nnext line\r\n",
         "[REDACTED PEM BLOCK]\r\nafter\r\n",
         "Authorization: Bearer ****mnop\r\nBasic dXNlcjpodW50ZXIyaHVudGVy\r\n",
@@ -843,7 +848,8 @@ mod tests {
         "\"api_key\":\"abc\r\ndefghijklmnop\"\r\n",
         "url https://user:pa\r\nss@host/x and https://u:****3456@h/\r\n",
         "pre \u{FFFD}[REDACTED PEM BLOCK]\u{FFFD} post",
-        "password: ****ter2 \u{FFFD} token=****et99",
+        // `name: value` runs to the line end: the rest of the line is the password.
+        concat!("pass", "word: ****et99"),
         "****ijkl\u{FFFD}mnopqrstuvwxyz0123 and Bearer abc\u{FFFD}defghijklmn",
         "-----BEG\u{FFFD}IN KEY----- not a block; [REDACTED PEM BLOCK] tail",
         "Cookie: ****456\r\nX-Api-Key:\t****7890",
@@ -977,6 +983,101 @@ mod tests {
         }
     }
 
+    /// Unquoted `name: value` runs to the line end or a comment, quoted values honour escapes,
+    /// blanks after `Bearer` and a separator attached to a program: cut at any byte offset, once
+    /// or twice, the stream publishes exactly `redact`, and never the value.
+    #[test]
+    fn line_long_escaped_and_attached_values_stream_like_redact() {
+        for (text, leaked) in [
+            ("%pp%: correct horse battery staple\nnext", "horse"),
+            ("db_%pw%: two words here  \r\nok", "two words"),
+            ("%sc%_%ky%: alpha beta gamma # rotated\n", "alpha beta"),
+            ("%pw%: hunter2hunter2 #\n", "hunter2"),
+            (
+                "{\"%pw%\": \"abc\\\"defghijklmnop\", \"x\": 1}\n",
+                "defghij",
+            ),
+            // A backslash is literal in single quotes; the next assignment is still found.
+            (
+                "%PW%='abcdefgh\\' %TK%='hunter2hunter2' x\n",
+                "hunter2hunter2",
+            ),
+            // A short flow-mapping value is not masked at all.
+            ("{%pw%: 123, host: example.org}\n", "****"),
+            ("{%pw%: hunter2hunter2, host: x}\n", "hunter2hunter2"),
+            ("%pp%: 'it''s a very long %sc%' x\n", "very long"),
+            (
+                concat!(
+                    "%pw%: ghp_",
+                    "abcdefghijklmnopqrstuvwxyz0123",
+                    " correct horse battery staple\n"
+                ),
+                "horse",
+            ),
+            (
+                "true;%cu% -u 'user:ab'cdefghijklmnop https://x\n",
+                "defghijklm",
+            ),
+            ("%cu% -u user:abc\\ defghijklmnop https://x\n", "defghijklm"),
+            ("%cu% -u user:****abcdSUFFIX https://x\n", "SUFFIX"),
+            ("%PW%=abcdefgh\"ijklmnop\" x\n", "ijklmnop"),
+            ("echo \"API_%KY%=super%sc%value1234\" done\n", "super%sc%"),
+            // The prefix `name: abc, ` reads as code; the whole line does not.
+            ("%pw%: abc, def ghi jkl\n", "def ghi"),
+            ("let %ky%: &str = name;\n", "****"),
+            ("fn f(%tk%: String) -> Result<(), E> {\n", "****"),
+            ("    %pw%: Option<String>,\n", "Option"),
+            (
+                concat!(
+                    "%cu% -H 'x-%ky%: sk-",
+                    "abcdefghijklmnopqrstuvwxyz0123456789' https://example.test\n"
+                ),
+                "abcdefghij",
+            ),
+            ("echo \"%pw%: hunter2hunter2\" done\n", "hunter2hunter2"),
+            ("echo '%pp%: correct horse battery' done\n", "horse"),
+            ("%PW%=\"a\\\"bcdefghijklmnop\n", "bcdefghijklm"),
+            ("%PW%=abc\\ defghijklmnop x\n", "defghijklm"),
+            ("tool --%pw% \"ab\"cdefghijklmnop next\n", "cdefghijklm"),
+            ("\"x{%pw%\": correct,horse,battery,staple\n", "horse"),
+            (
+                "Authorization: %BR%\tabcdefghijklmnop rest\n",
+                "abcdefghijkl",
+            ),
+            ("tool --%pw% \"pa\\\"ss word here\" next\n", "ss word"),
+            (
+                "Authorization: %BR%   abcdefghijklmnop rest\n",
+                "abcdefghijkl",
+            ),
+            ("%br% \t abcdefghijklmnop\n", "abcdefghijkl"),
+            ("true;%cu% -u u:s3cr3tpass https://x\n", "3cr3tpass"),
+            ("x=$(%cu% --user u:s3cr3tpass https://x)\n", "3cr3tpass"),
+            (
+                "%ky%: -----BEGIN K-----\nMIIE\n-----END K----- tail\n",
+                "MIIE",
+            ),
+        ] {
+            // Written with markers, assembled here (see `redact::tests::fx`).
+            let (text, leaked) = (fx(text), fx(leaked));
+            let text = text.as_str();
+            let expected = redact(text);
+            assert!(!expected.contains(&leaked), "{expected:?}");
+            let bytes = text.as_bytes();
+            for i in 0..=bytes.len() {
+                for j in i..=bytes.len() {
+                    let mut s: StreamSanitiser = StreamSanitiser::default();
+                    let mut out = String::new();
+                    for part in [&bytes[..i], &bytes[i..j], &bytes[j..]] {
+                        out.push_str(&s.push_bytes(&sk(0), part).text);
+                        assert!(expected.starts_with(&out), "{i},{j} {text:?}: {out:?}");
+                    }
+                    out.push_str(&s.finish(&sk(0)).text);
+                    assert_eq!(out, expected, "split at {i},{j}: {text:?}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn char_by_char_publishes_exactly_redact() {
         for (text, _) in fixtures() {
@@ -1076,6 +1177,15 @@ mod tests {
             "****",
             "x",
             "1234",
+            "\\",
+            "\\\"",
+            " #",
+            "::",
+            ": ",
+            concat!("pass", "phrase"),
+            "true;",
+            "$(",
+            concat!("Bea", "rer   "),
         ];
         let mut rng = Lcg(0x5eed);
         for _ in 0..6000 {
