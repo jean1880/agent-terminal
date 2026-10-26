@@ -199,14 +199,12 @@ Architectural mandates, standards, and workflows for this codebase.
   redacted before it is cut to `WAKE_BUDGET`, coalesced, held while the root is busy, never sent
   again once a `cross_agent_wait`/`read` page showed it, a notice only after
   `MAX_CONSECUTIVE_WAKES` wakes without the user, and dropped once the user stops the root (until
-  the user speaks) or its thread closes. A root in dangerous permissive mode is never woken
-  (`ParentState::Unattended`): the news is kept, the thread is told once per new item that it
-  waits, nothing retries it on a timer, and it goes, framed the same way, with the user's next
-  message, a live one mid-turn included (never a slash command, never beside a handoff), or as
-  an ordinary wake once the mode is left. It is spent, and its notice posted, only once that
-  message reaches a process (for Codex, only once its thread is up: never into the adapter's
-  own queue); a message that never does gives it back, exactly once, unless a stop or close
-  discarded it meanwhile.
+  the user speaks) or its thread closes. A root in dangerous permissive mode is woken the same
+  way (the cap on wakes without the user still applies).
+- **Closing or losing one worker never leaves its siblings stale**: a `Close` or
+  `GenerationExited` bumps the tree's authority epoch to fence what was in flight and revokes
+  only that subtree; `commit_revoke` moves every other worker's token from the replaced epoch to
+  the new one. `closing_a_worker_leaves_its_siblings_current` proves it.
 - **A parent's declared limit on a child is refused, never asked**: `cross_agent_spawn`'s optional
   `capabilities` (`edit`, `exec`, `network`) is all a child may do beyond reading. It only narrows
   the task mode (a plan child can hold `network` only, refused otherwise), a child of a restricted

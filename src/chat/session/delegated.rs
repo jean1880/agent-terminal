@@ -258,9 +258,8 @@ impl Inner {
 
     /// Whether a wake turn must wait: anything the user's own prompt would queue behind or
     /// that a turn would cut short. A pending handoff waits for the user's next real prompt to
-    /// carry it, since a handoff frames what rides with it as the user's message. Dangerous
-    /// permissive mode never runs a turn nobody asked for. A dead process is restarted only from
-    /// idle suspension; one that exited on its own waits for the user.
+    /// carry it, since a handoff frames what rides with it as the user's message. A dead process
+    /// is restarted only from idle suspension; one that exited on its own waits for the user.
     fn wake_busy(&self) -> bool {
         self.wake_blocker().is_some()
     }
@@ -271,7 +270,6 @@ impl Inner {
         let process_gone = !state.alive && !self.suspended.get();
         let reasons = [
             (state.running_turn, "a turn is running"),
-            (state.mode == Mode::Bypass, "dangerous permissive mode"),
             (process_gone, "the agent process is gone"),
             (
                 self.proc
@@ -318,10 +316,10 @@ impl Inner {
 
     fn wake_with(self: &Rc<Self>, text: &str) -> WakeOutcome {
         use agent_core::delegation::wake::{capped_notice, decide, Decision, ParentState};
+        // Dangerous permissive mode is woken like any other: the user chose to let it run on its
+        // own, and the cap on wakes without the user still applies.
         let state = if self.child.is_some() || self.wakes_held.get() {
             ParentState::Stopped
-        } else if self.state.borrow().mode == Mode::Bypass {
-            ParentState::Unattended
         } else if self.wake_busy() {
             ParentState::Busy
         } else {

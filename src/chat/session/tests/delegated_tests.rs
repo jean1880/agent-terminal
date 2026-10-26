@@ -2020,13 +2020,11 @@ impl crate::chat::session::HeldNews for FakeNews {
     }
 }
 
-/// Dangerous permissive mode never starts a turn nobody asked for: news offered to an idle root
-/// in it is held for the user (no prompt, no notice from the session), however often it is
-/// offered. The user's next message carries it, shown as the app's notice; a message that is
-/// not sent gives it back and leaves no notice; a slash command never carries it; leaving the
-/// mode releases it, and an ordinary wake then starts.
+/// News held for the user in dangerous permissive mode rides on the user's next message, shown
+/// as the app's notice; a message that is not sent gives it back and leaves no notice; a slash
+/// command never carries it; leaving the mode releases it, and an ordinary wake then starts.
 #[test]
-fn a_root_in_dangerous_permissive_mode_takes_news_only_with_the_users_message() {
+fn held_news_in_dangerous_permissive_mode_rides_only_on_the_users_message() {
     use crate::chat::session::WakeOutcome;
     in_loop(|ctx| {
         let dir = tempfile::tempdir().expect("dir");
@@ -2064,18 +2062,6 @@ fn a_root_in_dangerous_permissive_mode_takes_news_only_with_the_users_message() 
 
         session.confirm_mode(Mode::Bypass);
         assert_eq!(session.status().mode, Mode::Bypass);
-        for _ in 0..3 {
-            assert_eq!(session.wake_with("news held"), WakeOutcome::HeldForUser);
-        }
-        assert!(!session.status().running_turn);
-        assert!(!session.inner.prompt_in_flight.get());
-        assert_eq!(session.inner.auto_wakes.get(), 0);
-        assert_eq!(
-            notices("news held"),
-            0,
-            "the supervisor tells the thread, once"
-        );
-        assert!(!prompts().contains("news held"));
 
         let news = Rc::new(FakeNews::default());
         *news.text.borrow_mut() = Some("[agent-terminal] held news".into());
