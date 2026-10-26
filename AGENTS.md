@@ -359,6 +359,8 @@ Keep the three asset lists (deb, rpm metadata, PKGBUILD) in step.
   source" must have its own icon and never collapse into "healthy" — that
   collapse is exactly what made the old drift button report a permanently green
   shield for a file that had not existed in months.
-- Settings apply on change, not on dialog close. Rows that can hold an invalid
+- Settings apply as they are made, never on dialog close: a switch or dropdown at
+  once, a text entry when committed (Enter, its apply button, or focus leaving it),
+  and never with a half-typed value. Rows that can hold an invalid
   value must validate inline and refuse to persist rather than silently falling
   back at spawn time.

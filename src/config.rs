@@ -130,6 +130,12 @@ pub struct Profile {
     /// Existing profiles remain unavailable until the user enables them in Settings.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub available_for_delegation: bool,
+    /// The chat agent this profile was made for, recorded by Preferences → Agents (and
+    /// [`new_agent_profile`]) so a command whose file name is not the agent's (a half-typed
+    /// name, `claude-nightly`) keeps the profile that agent's. `None` (hand-written and older
+    /// profiles): judged by the command's file name alone. See [`profile_driver`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<agent_core::adapter::Driver>,
 }
 
 /// A blank profile with a fresh id, so the invariant holds for `..Profile::default()` too.
@@ -156,6 +162,7 @@ impl Default for Profile {
             default_effort: None,
             disabled: false,
             available_for_delegation: false,
+            driver: None,
         }
     }
 }
@@ -191,11 +198,20 @@ pub fn new_profile_id() -> String {
 }
 
 /// The chat driver a profile's command runs, judged by the command's file
-/// name: `claude` or `agy`, wherever it is installed. Anything else (Gemini,
-/// a wrapper script) has no adapter and runs as a Terminal thread only.
+/// name: `claude`, `agy` or `codex`, wherever it is installed. A file name that
+/// names no agent falls back to the agent the profile records ([`Profile::driver`]),
+/// so `claude-nightly` set in Preferences → Agents stays Claude's. Anything else
+/// (Gemini, a hand-written wrapper script) has no adapter and runs as a Terminal
+/// thread only. A file name that names another agent wins over the record, so a
+/// hand edit to another CLI never runs it under the wrong adapter.
 pub fn profile_driver(profile: &Profile) -> Option<agent_core::adapter::Driver> {
+    command_driver(&profile.command).or(profile.driver)
+}
+
+/// The driver whose default command is `command`'s file name.
+fn command_driver(command: &str) -> Option<agent_core::adapter::Driver> {
     use agent_core::adapter::Driver;
-    let name = Path::new(profile.command.trim())
+    let name = Path::new(command.trim())
         .file_name()
         .map(|n| n.to_string_lossy().to_lowercase())?;
     Driver::ALL
@@ -210,6 +226,7 @@ pub fn new_agent_profile(driver: agent_core::adapter::Driver) -> Profile {
     let mut profile = Profile {
         name: info.profile_name.to_string(),
         command: info.default_command.to_string(),
+        driver: Some(driver),
         ..Profile::default()
     };
     apply_known_settings(&mut profile);
@@ -255,14 +272,7 @@ pub fn agent_settings_model(
 
 /// The model configured in the settings file of the agent running `command`.
 pub fn agent_settings_model_for_command(command: &str, home: Option<&Path>) -> Option<String> {
-    use agent_core::adapter::Driver;
-    let name = Path::new(command.trim())
-        .file_name()
-        .map(|n| n.to_string_lossy().to_lowercase())?;
-    let driver = Driver::ALL
-        .into_iter()
-        .find(|d| d.info().default_command == name)?;
-    agent_settings_model(driver, home)
+    agent_settings_model(command_driver(command)?, home)
 }
 
 fn claude_settings_model(home: &Path) -> Option<String> {
@@ -796,6 +806,36 @@ pub fn parse_permission_sources(text: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+/// What a free-text settings row does with its text ([`field_change`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldChange<T> {
+    /// The text does not parse: show why. The saved value stays in use.
+    Invalid(String),
+    /// Valid, and nothing is to be written now.
+    Keep,
+    /// Valid and different from the saved value: write it.
+    Persist(T),
+}
+
+/// The rule for a free-text settings row: validate on every change, persist only on commit.
+///
+/// `parsed` is the row's text as parsed. `saved` is the value in use, and `commit` says
+/// whether the user committed the text (Enter, the apply button, focus leaving the row, or the
+/// dialog closing) rather than still typing. A valid draft is never written while it is being
+/// typed, so a half-typed value never reaches the config (or restarts an agent). An invalid
+/// text is reported both while typing and on commit, and the saved value is kept.
+pub fn field_change<T: PartialEq>(
+    parsed: Result<T, String>,
+    saved: &T,
+    commit: bool,
+) -> FieldChange<T> {
+    match parsed {
+        Err(reason) => FieldChange::Invalid(reason),
+        Ok(value) if commit && value != *saved => FieldChange::Persist(value),
+        Ok(_) => FieldChange::Keep,
+    }
+}
+
 impl TerminalConfig {
     /// [`Self::permission_sources`] as paths (`~/` expanded), for the import and export code.
     pub fn permission_source_paths(&self) -> Vec<PathBuf> {
@@ -871,7 +911,8 @@ fn report_load_problem(problem: String) {
 /// replaced is kept rather than lost. `None` if the copy failed.
 ///
 /// An identical copy already kept is reused, so a file that stays broken
-/// across launches leaves one copy rather than one per launch.
+/// across launches leaves one copy rather than one per launch. The copy is
+/// written `0600`, like the config itself.
 fn keep_copy(path: &Path, tag: &str) -> Option<PathBuf> {
     let content = match fs::read(path) {
         Ok(content) => content,
@@ -890,23 +931,67 @@ fn keep_copy(path: &Path, tag: &str) -> Option<PathBuf> {
                 p.file_name()
                     .is_some_and(|n| n.to_string_lossy().starts_with(&prefix))
             })
+            .filter(|p| reusable_copy(p))
             .find(|p| fs::read(p).is_ok_and(|kept| kept == content))
     });
-    if existing.is_some() {
-        return existing;
+    if let Some(existing) = existing {
+        // An older build wrote its copies with the umask (0644): narrow one before reusing it.
+        // A copy that cannot be narrowed is not reused; a fresh private one is written.
+        if make_private(&existing) {
+            return Some(existing);
+        }
     }
 
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
     let copy = path.with_file_name(format!("{prefix}{nanos}"));
-    match fs::write(&copy, &content) {
+    // The config can hold tokens (profile env, indicator commands): the copy is as private as
+    // the file it keeps, never left to the umask.
+    match agent_kit::fsutil::write_private_atomic(&copy, &content) {
         Ok(()) => Some(copy),
         Err(err) => {
             warn!("Could not keep a copy of {}: {err}", path.display());
             None
         }
     }
+}
+
+/// Whether a file named as a kept copy may be reused: a regular file with one link (not a
+/// symlink or a hard link, so neither its contents nor a mode change reach another path) owned
+/// by this user.
+fn reusable_copy(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    fs::symlink_metadata(path).is_ok_and(|m| {
+        m.file_type().is_file() && m.uid() == agent_kit::fsutil::effective_uid() && m.nlink() == 1
+    })
+}
+
+/// Narrows a kept copy to `0600` when it is wider, through a handle opened without following a
+/// symlink, so the mode change lands on the very file checked. `false` when it cannot be done.
+fn make_private(path: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    let Ok(file) = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    else {
+        return false;
+    };
+    let Ok(meta) = file.metadata() else {
+        return false;
+    };
+    // A second link is another path to the same inode: its mode is not this copy's to change.
+    if !meta.file_type().is_file()
+        || meta.uid() != agent_kit::fsutil::effective_uid()
+        || meta.nlink() != 1
+    {
+        return false;
+    }
+    meta.permissions().mode() & 0o077 == 0
+        || file
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .is_ok()
 }
 
 thread_local! {
@@ -1380,12 +1465,31 @@ impl TerminalConfig {
         self.profiles.iter().find(|p| p.id == id)
     }
 
-    /// The position of the profile that defines `driver`'s chat agent: the
-    /// first whose command runs it. Preferences → Agents edits this profile.
+    /// The position of the profile that defines `driver`'s chat agent: the first that records
+    /// it as its agent ([`Profile::driver`]) while it still runs it, else the first whose
+    /// command runs it. Preferences → Agents edits this profile.
     pub fn agent_profile_index(&self, driver: agent_core::adapter::Driver) -> Option<usize> {
+        let runs = |p: &Profile| profile_driver(p) == Some(driver);
         self.profiles
             .iter()
-            .position(|p| profile_driver(p) == Some(driver))
+            .position(|p| p.driver == Some(driver) && runs(p))
+            .or_else(|| self.profiles.iter().position(runs))
+    }
+
+    /// The position of the profile Preferences → Agents edits for `driver`, created when there
+    /// is none. The profile found records `driver` as its agent, so an edit that gives its
+    /// command another file name (typing, a wrapper) keeps it `driver`'s rather than detaching
+    /// it and making the next edit create a duplicate.
+    pub fn agent_profile_slot(&mut self, driver: agent_core::adapter::Driver) -> usize {
+        let index = match self.agent_profile_index(driver) {
+            Some(i) => i,
+            None => {
+                self.profiles.push(new_agent_profile(driver));
+                self.profiles.len() - 1
+            }
+        };
+        self.profiles[index].driver = Some(driver);
+        index
     }
 
     /// The profile that defines `driver`'s chat agent, if one does.
@@ -2686,6 +2790,215 @@ mod tests {
             "writing the new file would make the old one unadoptable"
         );
         assert_eq!(std::fs::read(&legacy).unwrap(), b"{ broken");
+    }
+
+    #[test]
+    fn editing_an_agents_command_to_another_name_keeps_its_profile() {
+        use agent_core::adapter::Driver;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut config = TerminalConfig::default();
+        let first = config.agent_profile_slot(Driver::Claude);
+        let id = config.profiles[first].id.clone();
+        let count = config.profiles.len();
+        // Typing in Settings → Agents → Claude → Command: a half-typed name, a wrapper with
+        // another basename, then back to the plain name. Each debounced save edits the slot.
+        for command in ["claud", "/opt/bin/claude-nightly", "claude"] {
+            let slot = config.agent_profile_slot(Driver::Claude);
+            assert_eq!(config.profiles[slot].id, id, "{command}: another profile");
+            config.profiles[slot].command = command.into();
+        }
+        assert_eq!(config.profiles.len(), count, "a duplicate Claude profile");
+
+        // A non-standard command survives a save and a load as Claude's.
+        let slot = config.agent_profile_slot(Driver::Claude);
+        config.profiles[slot].command = "/opt/bin/claude-nightly".into();
+        config.save_to(&path);
+        let loaded = TerminalConfig::load_from(&path);
+        let claude = loaded.agent_profile(Driver::Claude).expect("claude");
+        assert_eq!(claude.id, id);
+        assert_eq!(claude.command, "/opt/bin/claude-nightly");
+        assert_eq!(profile_driver(claude), Some(Driver::Claude));
+        assert_eq!(
+            loaded
+                .thread_profile(Some(&id), Driver::Claude)
+                .map(|p| &p.id),
+            Some(&id)
+        );
+
+        // A hand-written wrapper profile that names no agent still runs as a terminal only.
+        let wrapper = Profile {
+            command: "/opt/bin/claude-wrapper".into(),
+            ..Profile::default()
+        };
+        assert_eq!(profile_driver(&wrapper), None);
+    }
+
+    #[test]
+    fn a_profiles_recorded_agent_round_trips_and_older_files_need_no_migration() {
+        use agent_core::adapter::Driver;
+        // A file from before the field: judged by the command's name, exactly as before.
+        let old: Profile =
+            serde_json::from_str(r#"{"id":"p-1","name":"Claude","command":"claude"}"#).unwrap();
+        assert_eq!(old.driver, None);
+        assert_eq!(profile_driver(&old), Some(Driver::Claude));
+        // An unrecorded profile writes no field, so the file stays what an older build reads.
+        assert!(!serde_json::to_string(&old).unwrap().contains("driver"));
+
+        let recorded = Profile {
+            command: "claude-nightly".into(),
+            driver: Some(Driver::Claude),
+            ..Profile::default()
+        };
+        let json = serde_json::to_string(&recorded).unwrap();
+        assert!(json.contains(r#""driver":"claude""#), "{json}");
+        let back: Profile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, recorded);
+        assert_eq!(profile_driver(&back), Some(Driver::Claude));
+
+        // A command that names another agent wins over the record: never the wrong adapter.
+        let moved = Profile {
+            command: "/usr/bin/codex".into(),
+            ..recorded
+        };
+        assert_eq!(profile_driver(&moved), Some(Driver::Codex));
+        assert_eq!(
+            new_agent_profile(Driver::Agy).driver,
+            Some(Driver::Agy),
+            "a profile made for an agent records it"
+        );
+    }
+
+    #[test]
+    fn a_half_typed_setting_is_validated_but_saved_only_on_commit() {
+        let saved = vec!["--verbose".to_string()];
+        let parse = |text: &str| -> Result<Vec<String>, String> {
+            if text.matches('\'').count() % 2 == 1 {
+                Err("Unfinished quote".into())
+            } else {
+                Ok(text.split_whitespace().map(str::to_owned).collect())
+            }
+        };
+        // Typing `--model opus` into Extra Arguments: every keystroke is a valid draft, and
+        // none of them is written while the user types.
+        for typed in ["-", "--m", "--model", "--model o", "--model opus"] {
+            assert_eq!(
+                field_change(parse(typed), &saved, false),
+                FieldChange::Keep,
+                "{typed:?} was saved while typing"
+            );
+        }
+        // Enter (or focus leaving, or the dialog closing) writes the finished value.
+        assert_eq!(
+            field_change(parse("--model opus"), &saved, true),
+            FieldChange::Persist(vec!["--model".to_string(), "opus".to_string()])
+        );
+        // An unfinished quote is reported while typing and on commit; the saved value stays.
+        for commit in [false, true] {
+            assert_eq!(
+                field_change(parse("--model 'op"), &saved, commit),
+                FieldChange::Invalid("Unfinished quote".into())
+            );
+        }
+        // Committing the value already in use writes nothing.
+        assert_eq!(
+            field_change(parse("--verbose"), &saved, true),
+            FieldChange::Keep
+        );
+    }
+
+    #[test]
+    fn an_older_builds_0644_backup_is_made_private_when_reused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let broken = br#"{ "env": {"TOKEN": "s3cret"}, oops }"#;
+        std::fs::write(&path, broken).unwrap();
+        // An identical copy an older build left world-readable.
+        let old = dir.path().join("config.json.invalid-1");
+        std::fs::write(&old, broken).unwrap();
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let kept = keep_copy(&path, "invalid").expect("kept");
+        let mode = std::fs::metadata(&kept).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "kept copy is {:o}", mode & 0o777);
+        let mode = std::fs::metadata(&old).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "the old copy is {:o}", mode & 0o777);
+
+        // A symlink with the copy's name is never reused (nor its target's mode changed).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, broken).unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::write(&elsewhere, broken).unwrap();
+        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = dir.path().join("config.json.invalid-1");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+        let kept = keep_copy(&path, "invalid").expect("kept");
+        assert_ne!(kept, link, "a symlink was reused");
+        let meta = std::fs::symlink_metadata(&kept).unwrap();
+        assert!(meta.file_type().is_file());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        let mode = std::fs::metadata(&elsewhere).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o644, "the link's target was touched");
+    }
+
+    #[test]
+    fn a_hard_linked_backup_is_not_chmodded_and_a_fresh_copy_is_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let broken = br#"{ "env": {"TOKEN": "s3cret"}, oops }"#;
+        std::fs::write(&path, broken).unwrap();
+        // An identical 0644 backup that is also another path (st_nlink 2).
+        let other = dir.path().join("someone-elses-file");
+        std::fs::write(&other, broken).unwrap();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let linked = dir.path().join("config.json.invalid-1");
+        std::fs::hard_link(&other, &linked).unwrap();
+
+        let kept = keep_copy(&path, "invalid").expect("kept");
+        let mode = std::fs::metadata(&other).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o644, "the shared inode was chmodded");
+        assert_ne!(kept, linked, "a hard-linked backup was reused");
+        let meta = std::fs::symlink_metadata(&kept).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read(&kept).unwrap(), broken);
+    }
+
+    #[test]
+    fn a_kept_copy_of_a_private_config_is_private_too() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        // A 0600 config holding a token, broken by a hand edit, under a umask that would make a
+        // plain write 0644: the copy kept before defaults replace it must stay 0600.
+        std::fs::write(&path, br#"{ "env": {"TOKEN": "s3cret"}, oops }"#).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        TerminalConfig::load_from(&path);
+        let _ = take_load_problem();
+        let copies = kept_copies(dir.path(), "invalid");
+        assert_eq!(copies.len(), 1, "{copies:?}");
+        let mode = std::fs::metadata(dir.path().join(&copies[0]))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "kept copy is {:o}", mode & 0o777);
+
+        // The copy kept of an edit made behind a save's back, too.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let config = TerminalConfig::default();
+        config.save_to(&path);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&path, br#"{"scrollback_lines": 1234}"#).unwrap();
+        config.save_to(&path);
+        let copies = kept_copies(dir.path(), "external");
+        assert_eq!(copies.len(), 1, "{copies:?}");
+        let mode = std::fs::metadata(dir.path().join(&copies[0]))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "kept copy is {:o}", mode & 0o777);
     }
 
     #[test]
