@@ -580,18 +580,23 @@ impl Supervisor {
                 })
                 .unwrap_or_default();
             glib::spawn_future_local(async move {
-                let open = tab_open_after(
+                let worktree = lease.worktree.clone();
+                cleanup_after_exit(
                     async {
                         for watch in watches {
                             super::capacity::wait_exit(&watch).await;
                         }
                     },
-                    || tab_open_in(&lease.worktree),
+                    || tab_open_in(&worktree),
+                    |open| async move {
+                        gio::spawn_blocking(move || {
+                            super::workspace::cleanup_if_clean(&lease, open)
+                        })
+                        .await
+                        .ok();
+                    },
                 )
                 .await;
-                gio::spawn_blocking(move || super::workspace::cleanup_if_clean(&lease, open))
-                    .await
-                    .ok();
             });
         }
         Ok(a.receipt)
@@ -1733,14 +1738,20 @@ pub(super) fn replay_value(r: ReplayOutcome) -> Result<Value, ToolError> {
     }
 }
 
-/// Whether a tab is open in a closed worker's worktree, asked only once its processes have
-/// exited: a tab opened during the wait must keep the worktree.
-async fn tab_open_after(
+/// Once a closed worker's processes have exited, asks whether a tab is open in its worktree and
+/// dispatches the removal with that answer in the same main-loop turn (no await between the two),
+/// so a tab opened during the wait keeps the worktree. The removal then runs off the main thread
+/// and re-checks the lease and cleanliness; a tab opened after the dispatch, before
+/// `git worktree remove` finishes, is the one window left: the tab's owner has no way to see the
+/// removal in progress from here.
+async fn cleanup_after_exit<R, F: std::future::Future<Output = R>>(
     exited: impl std::future::Future<Output = ()>,
     open_in: impl Fn() -> bool,
-) -> bool {
+    dispatch: impl FnOnce(bool) -> F,
+) -> R {
     exited.await;
-    open_in()
+    let open = open_in();
+    dispatch(open).await
 }
 
 #[cfg(test)]
@@ -1748,12 +1759,55 @@ mod tests {
     use super::*;
     use crate::agent_proc::AgentEnv;
 
+    /// Yields to the main loop once.
+    async fn yield_once() {
+        let mut yielded = false;
+        std::future::poll_fn(|cx| {
+            if yielded {
+                return std::task::Poll::Ready(());
+            }
+            yielded = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        })
+        .await;
+    }
+
     #[test]
-    fn a_tab_opened_during_the_exit_wait_keeps_the_worktree() {
-        let open = std::cell::Cell::new(false);
-        let seen = glib::MainContext::new()
-            .block_on(tab_open_after(async { open.set(true) }, || open.get()));
-        assert!(seen, "the tab check must run after the wait, not before");
+    fn a_tab_opened_at_any_await_of_the_exit_wait_keeps_the_worktree() {
+        // The wait has three await points; a tab opens at each in turn.
+        for opens_at in 0..3 {
+            let open = std::cell::Cell::new(false);
+            let polls = std::cell::Cell::new(0u32);
+            let polls_at_check = std::cell::Cell::new(None);
+            let dispatched = std::cell::Cell::new(None);
+            glib::MainContext::new().block_on(cleanup_after_exit(
+                async {
+                    for step in 0..3 {
+                        if step == opens_at {
+                            open.set(true);
+                        }
+                        polls.set(polls.get() + 1);
+                        yield_once().await;
+                    }
+                },
+                || {
+                    polls_at_check.set(Some(polls.get()));
+                    open.get()
+                },
+                |seen| {
+                    // Dispatch happens with no await since the check.
+                    assert_eq!(Some(polls.get()), polls_at_check.get());
+                    dispatched.set(Some(seen));
+                    async {}
+                },
+            ));
+            assert_eq!(
+                dispatched.get(),
+                Some(true),
+                "tab opened at await {opens_at}"
+            );
+        }
     }
 
     #[test]

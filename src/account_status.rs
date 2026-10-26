@@ -62,7 +62,12 @@ pub fn merge(
         if snap.account.as_ref() != Some(&account) {
             // Quota windows belong to the account that reported them: another account must not
             // inherit the previous one's usage. A first account keeps what arrived before it.
-            if snap.account.is_some() && !snap.windows.is_empty() {
+            // Identity is the label: a new plan or provider is the same account, updated.
+            let other = snap
+                .account
+                .as_ref()
+                .is_some_and(|a| a.label != account.label);
+            if other && !snap.windows.is_empty() {
                 snap.windows.clear();
                 snap.updated_at = None;
             }
@@ -650,6 +655,12 @@ mod tests {
         ));
         assert_eq!(s.windows.len(), 1);
         assert_eq!(s.windows[0].used, 0.1);
+        // The same account with a new plan is an update: its windows stay.
+        let mut upgraded = acct("b");
+        upgraded.plan = Some("Max".into());
+        assert!(merge(&mut s, Some(upgraded.clone()), vec![], 4));
+        assert_eq!(s.account, Some(upgraded));
+        assert_eq!(s.windows.len(), 1);
         // Windows seen before any account was known are kept for the first account.
         let mut first = Snapshot::default();
         merge(&mut first, None, vec![win(None, "Weekly", 0.4)], 1);
