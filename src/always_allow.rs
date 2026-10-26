@@ -416,6 +416,201 @@ fn unrestricted_traversal(argv: &[String]) -> bool {
     }
 }
 
+/// grep's short options a session read pattern covers: flags with no value, and ones whose value
+/// ends the cluster or is the next word (`e f m A B C`, digits), which is then judged as a path.
+/// Not `r`/`R` (recursion), `d`/`D` (directory and device actions).
+const GREP_SHORT_FLAGS: &str = "EFGPiyvwxcLloqsbHhnTZzaIU0123456789";
+const GREP_SHORT_VALUE: &str = "efmABC";
+
+/// grep's long options a session read pattern covers, by full name only: GNU grep takes any
+/// unambiguous prefix, so `--rec` is `--recursive` and an unknown word may be one.
+const GREP_LONG_FLAGS: &[&str] = &[
+    "extended-regexp",
+    "fixed-strings",
+    "basic-regexp",
+    "perl-regexp",
+    "ignore-case",
+    "no-ignore-case",
+    "word-regexp",
+    "line-regexp",
+    "null-data",
+    "no-messages",
+    "invert-match",
+    "count",
+    "files-without-match",
+    "files-with-matches",
+    "only-matching",
+    "quiet",
+    "silent",
+    "byte-offset",
+    "with-filename",
+    "no-filename",
+    "line-buffered",
+    "line-number",
+    "initial-tab",
+    "null",
+    "text",
+];
+
+/// grep's long options that take a value (`=value` or the next word, judged as a path).
+const GREP_LONG_VALUE: &[&str] = &[
+    "regexp",
+    "file",
+    "max-count",
+    "label",
+    "after-context",
+    "before-context",
+    "context",
+    "color",
+    "colour",
+    "binary-files",
+];
+
+/// Whether a `grep` call has an option outside [`GREP_SHORT_FLAGS`], [`GREP_SHORT_VALUE`],
+/// [`GREP_LONG_FLAGS`] and [`GREP_LONG_VALUE`]: recursion (`-r`, `--rec…`), directory or device
+/// actions, or an option this does not know. Such a call is never covered by a session read
+/// pattern ([`Context::args_contained`]).
+///
+/// Read left to right as grep does: an option whose value is the next word takes that word,
+/// whatever it is, before a `--` could end the options (`grep -e -- --rec .` searches for `--`,
+/// recursively). `--color`/`--colour` take only an attached value.
+fn grep_option_unlisted(argv: &[String]) -> bool {
+    if argv.first().map(|w| basename(w)) != Some("grep") {
+        return false;
+    }
+    let mut words = argv.iter().skip(1);
+    while let Some(word) = words.next() {
+        if word == "--" {
+            break;
+        }
+        let takes_next = if let Some(long) = word.strip_prefix("--") {
+            match long.split_once('=') {
+                Some((name, _)) if GREP_LONG_VALUE.contains(&name) => false,
+                None if GREP_LONG_FLAGS.contains(&long) => false,
+                None if GREP_LONG_VALUE.contains(&long) => !matches!(long, "color" | "colour"),
+                _ => return true,
+            }
+        } else if let Some(short) = word.strip_prefix('-').filter(|s| !s.is_empty()) {
+            let mut takes_next = false;
+            for (i, letter) in short.char_indices() {
+                if GREP_SHORT_VALUE.contains(letter) {
+                    takes_next = i + letter.len_utf8() == short.len();
+                    break;
+                }
+                if !GREP_SHORT_FLAGS.contains(letter) {
+                    return true;
+                }
+            }
+            takes_next
+        } else {
+            false
+        };
+        if takes_next {
+            words.next();
+        }
+    }
+    false
+}
+
+/// rg's short flags that take no value and neither widen the search (`-u`, `-L`, `-.`) nor run
+/// anything (`-z`): [`rg_searches_a_folder`]'s allowlist.
+const RG_FLAGS_SHORT: &str = "nNisSwxvclFHIoqbUPa0";
+
+/// rg's long flags that take no value and neither widen the search nor run anything.
+const RG_FLAGS_LONG: &[&str] = &[
+    "line-number",
+    "no-line-number",
+    "ignore-case",
+    "case-sensitive",
+    "smart-case",
+    "word-regexp",
+    "line-regexp",
+    "invert-match",
+    "count",
+    "count-matches",
+    "files-with-matches",
+    "files-without-match",
+    "fixed-strings",
+    "with-filename",
+    "no-filename",
+    "only-matching",
+    "quiet",
+    "byte-offset",
+    "multiline",
+    "pcre2",
+    "text",
+    "null",
+    "heading",
+    "no-heading",
+    "column",
+    "no-column",
+    "vimgrep",
+    "json",
+    "no-messages",
+    "trim",
+    "stats",
+];
+
+/// Whether an `rg` call may search a folder: rg recurses into every directory it is given, and
+/// into the working directory when it is given no path, reading secret-named files that are not
+/// hidden or ignored (`credentials.json`, `prod.key`). Such a call is never covered by a session
+/// read pattern ([`Context::args_contained`]); only a search of named regular files is.
+///
+/// An allowlist, so that no option can take the next word as its value: every option word before
+/// `--` is flags known to take none ([`RG_FLAGS_SHORT`], [`RG_FLAGS_LONG`], `--color=…`), or a
+/// pattern with its value attached (`-eneedle`, `-ie…`, `-f…`, `--regexp=…`, `--file=…`). Any
+/// other option (`-g '!x'`, `-t rust`, `-m 1`, `-e needle`) may make the next word its value, the
+/// path after it the pattern, and the cwd the search, so it counts as searching a folder.
+///
+/// Since no listed option takes the next word, a `--` here is never an option's value
+/// (`rg -e -- -u .` asks at `-e`), so it always ends the options.
+///
+/// The words left (those not starting with `-`, and every word after `--`) are then exactly
+/// rg's positionals: the first is the pattern unless an option gave one, and every other one must
+/// name a regular file (`is_file`).
+fn rg_searches_a_folder(argv: &[String], is_file: impl Fn(&str) -> bool) -> bool {
+    if argv.first().map(|w| basename(w)) != Some("rg") {
+        return false;
+    }
+    let mut positional = Vec::new();
+    let mut pattern_from_option = false;
+    let mut words = argv.iter().skip(1);
+    for word in words.by_ref() {
+        if word == "--" {
+            break;
+        }
+        if let Some(long) = word.strip_prefix("--") {
+            match long.split_once('=') {
+                None if RG_FLAGS_LONG.contains(&long) => {}
+                Some(("color" | "colour", value)) if !value.is_empty() => {}
+                Some(("regexp" | "file", value)) if !value.is_empty() => {
+                    pattern_from_option = true;
+                }
+                _ => return true,
+            }
+        } else if let Some(short) = word.strip_prefix('-').filter(|s| !s.is_empty()) {
+            for (i, letter) in short.char_indices() {
+                if matches!(letter, 'e' | 'f') && i + letter.len_utf8() < short.len() {
+                    pattern_from_option = true;
+                    break;
+                }
+                if !RG_FLAGS_SHORT.contains(letter) {
+                    return true;
+                }
+            }
+        } else {
+            positional.push(word.as_str());
+        }
+    }
+    positional.extend(words.map(String::as_str));
+    let paths = if pattern_from_option {
+        &positional[..]
+    } else {
+        positional.get(1..).unwrap_or_default()
+    };
+    paths.is_empty() || !paths.iter().all(|p| is_file(p))
+}
+
 /// The pattern a plain "Allow for session" keeps for a read-only command [`prefix_extends`]
 /// allows: its program (`cat`), or `git` and its subcommand (`git diff`), as a prefix. Such a
 /// rule holds anywhere in the workspace, but only for a call whose working directory and every
@@ -490,8 +685,70 @@ pub fn session_folder(action: &Action, ctx: &Context) -> Option<PathBuf> {
             return None;
         }
     }
-    crate::approval_server::folder_auto_matchable(&file, &folder, Some(home)).then_some(folder)
+    (folder_identity(&folder).is_some()
+        && crate::approval_server::folder_auto_matchable(&full, &folder, Some(home)))
+    .then_some(folder)
 }
+
+/// The device and inode of `folder`, when it is a real directory whose path resolves to itself
+/// (no component a symlink); `None` otherwise. A folder grant keeps it and matches only while it
+/// is unchanged ([`Target::Dir`]).
+fn folder_identity(folder: &Path) -> Option<[u64; 2]> {
+    use std::os::unix::fs::MetadataExt;
+    if std::fs::canonicalize(folder).ok()? != folder {
+        return None;
+    }
+    let meta = std::fs::symlink_metadata(folder).ok()?;
+    meta.is_dir().then(|| [meta.dev(), meta.ino()])
+}
+
+/// The folder opened (`O_DIRECTORY | O_NOFOLLOW`) and its identity as that handle sees it, when
+/// [`folder_identity`] takes one and the handle is the same folder.
+fn open_folder(folder: &Path) -> Option<([u64; 2], FolderHandle)> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let identity = folder_identity(folder)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(folder)
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    let held = [meta.dev(), meta.ino()];
+    (held == identity).then(|| (identity, FolderHandle(Some(std::sync::Arc::new(file)))))
+}
+
+/// Whether a folder grant still holds: the identity of its held handle, of its path now, and
+/// the one kept at grant time are all known and equal.
+fn folder_still_granted(
+    handle: Option<[u64; 2]>,
+    path: Option<[u64; 2]>,
+    kept: Option<[u64; 2]>,
+) -> bool {
+    kept.is_some() && handle == kept && path == kept
+}
+
+/// An open handle on a granted folder, held for the grant's lifetime so its inode cannot be
+/// freed and reused by another folder while the grant exists. Never serialised: a grant read
+/// back has none, and grants nothing. Ignored by equality (the folder and identity say which
+/// grant it is).
+#[derive(Debug, Clone, Default)]
+pub struct FolderHandle(Option<std::sync::Arc<std::fs::File>>);
+
+impl FolderHandle {
+    fn identity(&self) -> Option<[u64; 2]> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = self.0.as_ref()?.metadata().ok()?;
+        Some([meta.dev(), meta.ino()])
+    }
+}
+
+impl PartialEq for FolderHandle {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for FolderHandle {}
 
 /// `/`, the home folder, or a folder above it: never a folder grant, typed or not.
 fn folder_too_broad(folder: &Path, home: &Path) -> bool {
@@ -651,13 +908,16 @@ pub fn exec_option(argv: &[String]) -> Option<&str> {
                     .any(|a| word.starts_with(a))
                     .then_some(word);
             }
+            // GNU getopt_long and git's parse-options take any unambiguous prefix of a long
+            // option (`--outp=x` is `--output=x`), so a word naming a prefix of one counts too.
+            let name = word.split_once('=').map_or(word, |(name, _)| name);
             let long = word.starts_with("--")
                 && EXEC_LONG.iter().any(|(p, opt)| {
                     *p == program
-                        && match opt.strip_suffix('*') {
+                        && (match opt.strip_suffix('*') {
                             Some(prefix) => word.starts_with(prefix),
                             None => word == *opt || word.starts_with(&format!("{opt}=")),
-                        }
+                        } || (name.len() > 2 && opt.trim_end_matches('*').starts_with(name)))
                 });
             // tar's old style takes its first argument as a cluster with no dash (`tar tIfoo`).
             let cluster = if let Some(rest) = word.strip_prefix('-').filter(|r| !r.starts_with('-'))
@@ -895,7 +1155,10 @@ struct Probe {
     workspace_key: String,
     cwd_key: Option<String>,
     argv: Option<Vec<String>>,
+    /// The edited or read file, canonical: what path rules compare.
     path: Option<PathBuf>,
+    /// The same file as the call named it (absolute): a folder rule judges both.
+    named_path: Option<PathBuf>,
     /// The user's home, for the folder rule's sensitivity check.
     home: Option<PathBuf>,
     /// The command carries no secret and no exec-capable option, and its working directory and
@@ -929,11 +1192,11 @@ impl Context<'_> {
     /// (inside, no `..`, no symlink, not a secret, not under `.git`, not a home dotfile). A path
     /// is a plain argument, the value of `--opt=value`, the rest of a short option cluster
     /// (`-f.env`), and the path part of a git `<rev>:<path>` (no hidden part at all there).
-    /// Fails closed on what the shell would expand (`~…`) and on [`unrestricted_traversal`].
+    /// Fails closed on what the shell would expand (`~…`), on [`unrestricted_traversal`] and on
+    /// an `rg` that may search a folder ([`rg_searches_a_folder`]).
     ///
-    /// Ceiling: what a program selects by itself is not a word here. `rg` on a folder reads the
-    /// files it finds (it skips hidden and git-ignored ones by default), and `git diff`/`show`/
-    /// `log -p` print the files git tracks.
+    /// Ceiling: what a program selects by itself is not a word here. `git diff`/`show`/`log -p`
+    /// print the files git tracks.
     fn args_contained(&self, argv: &[String]) -> bool {
         let Some(cwd) = self.cwd else {
             return false;
@@ -956,8 +1219,15 @@ impl Context<'_> {
             })
         };
         let path_ok = |word: &str| word.is_empty() || (revision_path_ok(word) && readable(word));
+        let is_file = |word: &str| {
+            self.absolute(word)
+                .and_then(|p| std::fs::symlink_metadata(p).ok())
+                .is_some_and(|meta| meta.is_file())
+        };
         readable(cwd)
             && !unrestricted_traversal(argv)
+            && !rg_searches_a_folder(argv, is_file)
+            && !grep_option_unlisted(argv)
             && argv.iter().skip(1).all(|arg| {
                 if let Some(long) = arg.strip_prefix("--") {
                     !arg.contains('~') && long.split_once('=').is_none_or(|(_, v)| path_ok(v))
@@ -992,17 +1262,19 @@ impl Context<'_> {
         // The app's own session read pattern is the only rule that judges the call: a plain
         // read that stays in the workspace. A user's rule matches as written.
         let args_contained = plain && argv.as_ref().is_some_and(|argv| self.args_contained(argv));
-        let path = match action {
-            Action::Edit { path } | Action::Read { path } => self
-                .absolute(path)
-                .map(|full| crate::approval_server::canonical_target(&full)),
+        let named_path = match action {
+            Action::Edit { path } | Action::Read { path } => self.absolute(path),
             _ => None,
         };
+        let path = named_path
+            .as_deref()
+            .map(crate::approval_server::canonical_target);
         Probe {
             workspace_key: self.workspace_key(),
             cwd_key: self.cwd.map(canonical_or_raw),
             argv,
             path,
+            named_path,
             home: self.home.map(Path::to_owned),
             args_contained,
         }
@@ -1025,7 +1297,19 @@ pub enum Target {
     /// keeps the file's folder ([`session_folder`]); a typed edit pattern ending in `/` is one.
     /// Session only ([`Rule::check`]); matched through
     /// [`crate::approval_server::folder_auto_matchable`] (no `..`, no link out, not sensitive).
-    Dir { dir: String },
+    ///
+    /// `identity` is the folder's device and inode when the grant was made ([`folder_identity`]),
+    /// and `handle` holds the folder open from then on ([`FolderHandle`]). A rule matches only
+    /// while `dir` still resolves to itself and it, the handle and `identity` are the same folder
+    /// ([`folder_still_granted`]), so a folder replaced by a link or another folder grants
+    /// nothing. No identity or no handle matches nothing.
+    Dir {
+        dir: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        identity: Option<[u64; 2]>,
+        #[serde(skip)]
+        handle: FolderHandle,
+    },
     /// One MCP server's tool (`*`: any tool of that server).
     Mcp { server: String, tool: String },
 }
@@ -1103,6 +1387,8 @@ impl Rule {
                 }
                 Target::Dir {
                     dir: dir.to_owned(),
+                    identity: None,
+                    handle: FolderHandle::default(),
                 }
             }
             ActionKind::Edit | ActionKind::Read => {
@@ -1226,8 +1512,13 @@ impl Rule {
 
     /// An exact edit rule made the session folder rule for `folder` ([`session_folder`]).
     fn into_folder(mut self, folder: &Path) -> Self {
+        // Held open for the grant's lifetime; a folder that cannot be opened grants nothing.
+        let (identity, handle) =
+            open_folder(folder).map_or((None, FolderHandle::default()), |(id, h)| (Some(id), h));
         self.target = Target::Dir {
             dir: folder.to_string_lossy().into_owned(),
+            identity,
+            handle,
         };
         self
     }
@@ -1243,22 +1534,38 @@ impl Rule {
                 self.cwd = ctx.cwd.map(canonical_or_raw);
             }
         }
-        if let Target::Path { path: p } | Target::Dir { dir: p } = &mut self.target {
+        if let Target::Path { path: p } | Target::Dir { dir: p, .. } = &mut self.target {
             // Outside the workspace or sensitive is the user's call ([`Self::warnings`]).
             let canonical = crate::approval_server::canonical_target(Path::new(p));
             *p = canonical.to_string_lossy().into_owned();
         }
         // A typed folder is the user's choice, but never `/`, home or above it, and never without
-        // the home folder known (the dotfile protections need it).
-        if let Target::Dir { dir } = &self.target {
+        // the home folder known (the dotfile protections need it). It is held open from here
+        // ([`open_folder`]); one that cannot be is refused rather than kept granting nothing.
+        if let Target::Dir {
+            dir,
+            identity,
+            handle,
+        } = &mut self.target
+        {
             let home = ctx
                 .home
                 .ok_or("a folder rule needs the home folder known; keep the one file instead")?;
-            if folder_too_broad(Path::new(dir), home) {
+            let folder = Path::new(dir.as_str());
+            if folder_too_broad(folder, home) {
                 return Err(format!(
                     "{dir}/ is `/`, your home folder or above it: too wide for a folder rule"
                 ));
             }
+            let (id, held) = open_folder(folder).ok_or_else(|| {
+                if std::fs::symlink_metadata(folder).is_err() {
+                    format!("{dir}/ does not exist yet; create it first")
+                } else {
+                    format!("{dir}/ is not a plain folder (a link, or not a folder at all)")
+                }
+            })?;
+            *identity = Some(id);
+            *handle = held;
         }
         Ok(self)
     }
@@ -1333,7 +1640,7 @@ impl Rule {
                      instructions that change what runs next)"
                 ));
             }
-            Target::Dir { dir }
+            Target::Dir { dir, .. }
                 if ctx.is_some_and(|ctx| !folder_in_workspace(Path::new(dir), ctx)) =>
             {
                 out.push(format!(
@@ -1388,9 +1695,19 @@ impl Rule {
                 probe.path.as_deref() == Some(Path::new(path))
             }
             // No home known: the home-dotfile protections cannot apply, so nothing matches.
-            (Target::Dir { dir }, Action::Edit { .. }) => match (&probe.path, &probe.home) {
+            // The folder granted, still the same folder at the same canonical path.
+            (
+                Target::Dir {
+                    dir,
+                    identity,
+                    handle,
+                },
+                Action::Edit { .. },
+            ) => match (&probe.named_path, &probe.home) {
                 (Some(p), Some(home)) => {
-                    crate::approval_server::folder_auto_matchable(p, Path::new(dir), Some(home))
+                    let dir = Path::new(dir);
+                    folder_still_granted(handle.identity(), folder_identity(dir), *identity)
+                        && crate::approval_server::folder_auto_matchable(p, dir, Some(home))
                 }
                 _ => false,
             },
@@ -1421,7 +1738,7 @@ impl Rule {
                 }
             }
             Target::Path { path } => path.clone(),
-            Target::Dir { dir } => format!("{dir}/"),
+            Target::Dir { dir, .. } => format!("{dir}/"),
             Target::Mcp { server, tool } => format!("{server}/{tool}"),
         }
     }
@@ -4208,8 +4525,6 @@ mod tests {
         for (rule, ok) in [
             (&grep, "grep -n needle README.md"),
             (&grep, "grep --max-count=5 needle README.md"),
-            (&rg, "rg -n needle src"),
-            (&rg, "rg --glob=src needle"),
             (&git, "git show HEAD:src/a.rs"),
         ] {
             assert!(rule.matches(&shell(ok), &c), "{ok}");
@@ -4232,6 +4547,9 @@ mod tests {
             (&rg, "rg --no-ignore needle"),
             (&rg, "rg --follow needle"),
             (&rg, "rg -L needle"),
+            // Any rg recursion: a folder, or no path at all.
+            (&rg, "rg -n needle src"),
+            (&rg, "rg --glob=src needle"),
             // A hidden file in a revision (#3).
             (&git, "git show HEAD:.bashrc"),
             (&git, "git show HEAD:.github/workflows/ci.yml"),
@@ -4239,6 +4557,301 @@ mod tests {
         ] {
             assert!(!rule.matches(&shell(refused), &c), "{refused}");
         }
+    }
+
+    /// rg searches a folder recursively, secret-named files included (`.env` is skipped only when
+    /// it is hidden or ignored; `credentials.json`, `id_ed25519` and `prod.key` are not). A
+    /// session `rg` pattern therefore covers only a search of named files, never `rg x .`.
+    #[test]
+    fn a_session_rg_pattern_never_covers_a_recursive_search() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let ws = std::fs::canonicalize(tmp.path()).expect("canon");
+        std::fs::create_dir_all(ws.join("src")).expect("src");
+        std::fs::write(ws.join("README.md"), "needle").expect("readme");
+        std::fs::write(ws.join("src/a.rs"), "needle").expect("a.rs");
+        std::fs::write(ws.join("src/credentials.json"), "needle").expect("secret");
+        let root = ws.to_string_lossy().into_owned();
+        let c = ctx("codex", &ws, Some(&root));
+        let rg = Rule {
+            workspace: c.workspace_key(),
+            cwd: None,
+            origin: "codex".into(),
+            kind: ActionKind::Shell,
+            target: Target::Argv {
+                argv: argv(&["rg"]),
+                prefix: true,
+            },
+        };
+        for ok in [
+            "rg needle README.md",
+            "rg -n needle README.md src/a.rs",
+            "rg -eneedle README.md",
+            "rg -ieneedle README.md",
+            "rg --regexp=needle -- README.md",
+            "rg -n -i -w -v needle README.md",
+            "rg --color=never --no-heading -S needle README.md src/a.rs",
+        ] {
+            assert!(rg.matches(&shell(ok), &c), "{ok}");
+        }
+        for refused in [
+            "rg x .",
+            "rg needle",
+            "rg -n needle src",
+            "rg needle README.md src",
+            "rg --glob=src needle",
+            "rg -e needle",
+            "rg -e needle src",
+            // A separate option value is read as a path, so it fails closed.
+            "rg -e needle README.md",
+            "rg -g -e src -e x README.md",
+            "rg -eneedle src README.md",
+            "rg -ie needle src README.md",
+            "rg --regexp needle src",
+            "rg -f README.md src",
+            "rg -e x -- src",
+            "rg -t rust needle",
+            "rg needle missing.rs",
+        ] {
+            assert!(!rg.matches(&shell(refused), &c), "{refused}");
+        }
+        // An option's separate value taken for the pattern: rg then has no path and searches the
+        // cwd (`-v` printing every line). Only options known to take no value pass; the
+        // exec-capable search-zip never does, in a cluster too.
+        let matched: Vec<&str> = [
+            "rg -v -g '!x' README.md",
+            "rg -t rust README.md",
+            "rg -m 1 README.md",
+            "rg -T x README.md",
+            "rg -A 3 README.md",
+            "rg -j 2 README.md",
+            "rg --type-add 'x:*' -tx README.md",
+            "rg --color always README.md",
+            "rg --max-count 1 README.md",
+            "rg -nz needle README.md",
+            "rg -e -- -u .",
+            "rg --regexp -- -u .",
+        ]
+        .into_iter()
+        .filter(|call| rg.matches(&shell(call), &c))
+        .collect();
+        assert!(matched.is_empty(), "covered unasked: {matched:?}");
+        // Answered for the session, a recursive search keeps the exact call, not `rg …`.
+        let exact = decide(Some(&shell("rg x .")), None, Scope::Session, &c).expect("exact");
+        assert!(matches!(&exact.target, Target::Argv { prefix: false, .. }));
+        let widened =
+            decide(Some(&shell("rg x README.md")), None, Scope::Session, &c).expect("widened");
+        assert!(matches!(&widened.target, Target::Argv { prefix: true, .. }));
+    }
+
+    /// A session folder rule is judged on the path the agent named as well as on the file it
+    /// reaches: a `.claude` that is a symlink inside the folder still asks.
+    #[test]
+    fn a_session_folder_grant_does_not_follow_a_replaced_folder() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = std::fs::canonicalize(tmp.path()).expect("canon");
+        let ws = root.join("ws");
+        let src = ws.join("src");
+        let home = root.join("home");
+        let outside = root.join("outside");
+        for d in [&src, &home, &outside] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        let ws_s = ws.to_string_lossy().into_owned();
+        let c = Context {
+            driver: "claude",
+            workspace: &ws,
+            cwd: Some(&ws_s),
+            home: Some(&home),
+        };
+        let edit = |p: &Path| Action::Edit {
+            path: p.to_string_lossy().into_owned(),
+        };
+        let rule =
+            decide(Some(&edit(&src.join("a.rs"))), None, Scope::Session, &c).expect("session rule");
+        assert!(rule.matches(&edit(&src.join("b.rs")), &c));
+        // The granted folder becomes a link out: neither name reaches the new target.
+        std::fs::rename(&src, ws.join("src-old")).expect("move away");
+        std::os::unix::fs::symlink(&outside, &src).expect("link in its place");
+        let mut covered = Vec::new();
+        for path in [outside.join("a.rs"), src.join("a.rs")] {
+            if rule.matches(&edit(&path), &c) {
+                covered.push(path);
+            }
+        }
+        // A new folder at the same path is not the one granted either.
+        std::fs::remove_file(&src).expect("remove link");
+        std::fs::create_dir(&src).expect("new folder");
+        if rule.matches(&edit(&src.join("a.rs")), &c) {
+            covered.push(src.join("a.rs (new folder)"));
+        }
+        assert!(covered.is_empty(), "covered unasked: {covered:?}");
+    }
+
+    /// A folder grant holds its folder open, so the inode cannot be recycled while it lives, and
+    /// matches only while that handle, the path and the identity kept at grant time agree. A
+    /// grant without its handle (one read back from JSON) or for a folder that is not there yet
+    /// grants nothing.
+    #[test]
+    fn a_session_folder_grant_is_bound_to_an_open_handle() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = std::fs::canonicalize(tmp.path()).expect("canon");
+        let ws = root.join("ws");
+        let src = ws.join("src");
+        let home = root.join("home");
+        for d in [&src, &home] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        let ws_s = ws.to_string_lossy().into_owned();
+        let c = Context {
+            driver: "claude",
+            workspace: &ws,
+            cwd: Some(&ws_s),
+            home: Some(&home),
+        };
+        let edit = |p: &Path| Action::Edit {
+            path: p.to_string_lossy().into_owned(),
+        };
+        let rule =
+            decide(Some(&edit(&src.join("a.rs"))), None, Scope::Session, &c).expect("session rule");
+        assert!(rule.matches(&edit(&src.join("b.rs")), &c));
+        let mut problems = Vec::new();
+        // Read back without its handle: the identity alone is no proof.
+        let json = serde_json::to_string(&rule).expect("serialise");
+        let reread: Rule = serde_json::from_str(&json).expect("deserialise");
+        if reread.matches(&edit(&src.join("b.rs")), &c) {
+            problems.push("a grant read back without its handle still matches");
+        }
+        // Deleted and recreated at the same path (the held handle keeps the old inode alive).
+        std::fs::remove_dir(&src).expect("delete");
+        std::fs::create_dir(&src).expect("recreate");
+        if rule.matches(&edit(&src.join("b.rs")), &c) {
+            problems.push("a recreated folder still matches");
+        }
+        // A typed folder that does not exist yet is refused, with a reason, not kept dead.
+        let missing = ws.join("later");
+        match Rule::new("", "Edit", format!("{}/", missing.display())).complete(&c) {
+            Ok(_) => problems.push("a missing typed folder was kept"),
+            Err(why) if !why.contains("does not exist yet; create it first") => {
+                problems.push("a missing typed folder was refused without the reason")
+            }
+            Err(_) => {}
+        }
+        // A file in a folder not created yet keeps the exact file.
+        if session_folder(&edit(&ws.join("new/dir/c.rs")), &c).is_some() {
+            problems.push("a folder that is not there yet was offered");
+        }
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    /// The comparison a folder grant makes: the held handle, the path now and the identity kept
+    /// at grant time must all be known and agree.
+    #[test]
+    fn a_folder_grant_needs_handle_path_and_identity_to_agree() {
+        let id = Some([1, 2]);
+        assert!(folder_still_granted(id, id, id));
+        for (handle, path, kept) in [
+            (None, id, id),
+            (id, None, id),
+            (id, id, None),
+            (Some([1, 3]), id, id),
+            (id, Some([1, 3]), id),
+            (id, id, Some([9, 2])),
+        ] {
+            assert!(
+                !folder_still_granted(handle, path, kept),
+                "{handle:?} {path:?} {kept:?}"
+            );
+        }
+    }
+
+    /// GNU grep and git take any unambiguous prefix of a long option, so an abbreviation is the
+    /// option itself: `grep --rec` recurses, `git diff --ext` runs the external diff.
+    #[test]
+    fn a_session_read_pattern_asks_for_abbreviated_options() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let ws = std::fs::canonicalize(tmp.path()).expect("canon");
+        std::fs::write(ws.join("README.md"), "needle").expect("readme");
+        let root = ws.to_string_lossy().into_owned();
+        let c = ctx("codex", &ws, Some(&root));
+        let pattern = |head: &[&str]| Rule {
+            workspace: c.workspace_key(),
+            cwd: None,
+            origin: "codex".into(),
+            kind: ActionKind::Shell,
+            target: Target::Argv {
+                argv: argv(head),
+                prefix: true,
+            },
+        };
+        let (grep, diff, log) = (
+            pattern(&["grep"]),
+            pattern(&["git", "diff"]),
+            pattern(&["git", "log"]),
+        );
+        for (rule, ok) in [
+            (&grep, "grep -n needle README.md"),
+            (&grep, "grep -inw -A 3 needle README.md"),
+            (&grep, "grep --ignore-case --max-count=5 needle README.md"),
+            (&grep, "grep -e needle -- README.md"),
+            (&grep, "grep -e -- README.md"),
+            (&diff, "git diff --stat"),
+            (&log, "git log --oneline -5"),
+        ] {
+            assert!(rule.matches(&shell(ok), &c), "{ok}");
+        }
+        let matched: Vec<&str> = [
+            (&grep, "grep --rec needle ."),
+            (&grep, "grep --dereference-recurs needle ."),
+            (&grep, "grep --direc=recurse needle ."),
+            (&grep, "grep --directories=recurse needle ."),
+            (&grep, "grep --devices=read needle README.md"),
+            (&grep, "grep --no-such-option needle README.md"),
+            (&diff, "git diff --ext"),
+            (&diff, "git diff --textc"),
+            (&log, "git log --outp=x"),
+            (&log, "git log --show-sig"),
+            // A `--` that is an option's value is not the end of the options.
+            (&grep, "grep -v -e -- --dereference-recurs ."),
+            (&grep, "grep -l -e -- --rec dir"),
+            (&grep, "grep -m -- -r needle ."),
+            (&grep, "grep --regexp -- --rec ."),
+        ]
+        .into_iter()
+        .filter(|(rule, call)| rule.matches(&shell(call), &c))
+        .map(|(_, call)| call)
+        .collect();
+        assert!(matched.is_empty(), "covered unasked: {matched:?}");
+    }
+
+    #[test]
+    fn a_session_folder_asks_for_a_symlinked_claude_settings_file() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = std::fs::canonicalize(tmp.path()).expect("canon");
+        let ws = root.join("ws");
+        let src = ws.join("src");
+        let home = root.join("home");
+        let cfg = src.join("cfg");
+        for d in [&cfg, &home] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        std::os::unix::fs::symlink(&cfg, src.join(".claude")).expect("dir link");
+        let ws_s = ws.to_string_lossy().into_owned();
+        let c = Context {
+            driver: "claude",
+            workspace: &ws,
+            cwd: Some(&ws_s),
+            home: Some(&home),
+        };
+        let edit = |p: &Path| Action::Edit {
+            path: p.to_string_lossy().into_owned(),
+        };
+        let rule =
+            decide(Some(&edit(&src.join("a.rs"))), None, Scope::Session, &c).expect("session rule");
+        assert!(matches!(rule.target, Target::Dir { .. }));
+        let linked = edit(&src.join(".claude/settings.json"));
+        assert!(!rule.matches(&linked, &c), "the symlinked .claude asks");
+        assert_eq!(session_folder(&linked, &c), None, "and keeps no folder");
+        assert!(rule.matches(&edit(&cfg.join("settings.json")), &c));
     }
 
     /// Codex wraps commands in the user's own login shell, wherever it lives (Linuxbrew, Nix,
@@ -4457,9 +5070,12 @@ mod tests {
         assert_eq!(
             rule.target,
             Target::Dir {
-                dir: src.to_string_lossy().into_owned()
+                dir: src.to_string_lossy().into_owned(),
+                identity: folder_identity(&src),
+                handle: FolderHandle::default(),
             }
         );
+        assert!(folder_identity(&src).is_some());
         assert_eq!(rule.detail(), format!("{}/", src.display()));
         assert!(rule.matches(&a, &c), "the call that made it");
         assert!(rule.matches(&edit(&src.join("b.rs")), &c), "a sibling file");

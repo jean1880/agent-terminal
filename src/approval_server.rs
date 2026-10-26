@@ -1437,30 +1437,65 @@ pub(crate) fn path_auto_matchable(target: &Path, workspace: &Path, home: Option<
     contained(target, workspace) && !sensitive_target(target, workspace, home)
 }
 
-/// Whether an edit of `target` may be matched by a session folder rule for `folder`:
-/// [`contained`] in the folder (absolute, no `..`, no symlink or extra hard link below it), not a
-/// [`sensitive_target`] relative to it, and not [`sensitive_anywhere`] (the folder may sit outside
-/// the workspace, so the workspace-relative view alone would miss a `.git` or `~/.config` above
-/// it). The folder grants ordinary files; git, hooks, agent config and instructions still ask.
+/// Whether an edit of `target` (the path as the agent named it) may be matched by a session
+/// folder rule for `folder` (canonical). Both the path as named and the file it reaches
+/// ([`canonical_target`]) are judged, since the agent acts on the name (a symlinked `.claude`
+/// is still agent config) and the write lands on the target:
+/// - the named path is absolute with no `..`, and the target is [`contained`] in the folder (absolute, no `..`, no symlink or extra hard
+///   link below it), and neither is a [`sensitive_target`] relative to it or
+///   [`sensitive_anywhere`] (the folder may sit outside the workspace, so the workspace-relative
+///   view alone would miss a `.git` or `~/.config` above it);
+/// - no component of the named path that sits inside the folder is a symlink. A link above the
+///   folder (an alias of the workspace) is not one.
+///
+/// The folder grants ordinary files; git, hooks, agent config and instructions still ask.
 pub(crate) fn folder_auto_matchable(target: &Path, folder: &Path, home: Option<&Path>) -> bool {
-    contained(target, folder)
-        && !sensitive_target(target, folder, home)
-        && !sensitive_anywhere(target, home)
+    let real = canonical_target(target);
+    let judged =
+        |path: &Path| !sensitive_target(path, folder, home) && !sensitive_anywhere(path, home);
+    // A component of the named path that sits inside the folder (its parent resolves there) and
+    // is a symlink; one that cannot be inspected counts as a link.
+    let links_inside = || {
+        target.ancestors().any(|part| {
+            let Some(parent) = part.parent() else {
+                return false;
+            };
+            if !canonical_target(parent).starts_with(folder) {
+                return false;
+            }
+            match std::fs::symlink_metadata(part) {
+                Ok(meta) => meta.file_type().is_symlink(),
+                Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+            }
+        })
+    };
+    // The folder itself must still be where it was: a granted folder replaced by a link would
+    // otherwise lend `contained` the link's target as its root.
+    target.is_absolute()
+        && !has_parent_dir(target)
+        && std::fs::canonicalize(folder).is_ok_and(|resolved| resolved == folder)
+        && contained(&real, folder)
+        && judged(&real)
+        && (real == target || (judged(target) && !links_inside()))
 }
 
 /// Whether a session read pattern may read `target` unasked: inside `workspace` ([`contained`]:
-/// no `..`, no symlink), not named like a secret ([`agent_kit::git::is_secret_path`]), not in a
-/// `.git` directory (its config can carry credentials in remote URLs), and not a top-level
-/// dotfile or dot-directory of `home`. Unlike an edit, reading an agent instruction file or a
-/// tool config runs nothing, so [`sensitive_target`]'s list does not apply.
+/// no `..`, no symlink), and neither the path as named nor the file it reaches
+/// ([`canonical_target`]: a workspace may itself be a link) is named like a secret
+/// ([`agent_kit::git::is_secret_path`]), in a `.git` directory (its config can carry
+/// credentials in remote URLs), or a top-level dotfile or dot-directory of `home`. Unlike an
+/// edit, reading an agent instruction file or a tool config runs nothing, so
+/// [`sensitive_target`]'s list does not apply.
 pub(crate) fn read_auto_matchable(target: &Path, workspace: &Path, home: Option<&Path>) -> bool {
-    contained(target, workspace)
-        && !agent_kit::git::is_secret_path(target)
-        && !names(target).iter().any(|n| n == ".git")
-        && !home
-            .and_then(|home| relative_to(target, home))
-            .and_then(|rel| names(&rel).into_iter().next())
-            .is_some_and(|first| first.starts_with('.'))
+    let readable = |path: &Path| {
+        !agent_kit::git::is_secret_path(path)
+            && !names(path).iter().any(|n| n == ".git")
+            && !home
+                .and_then(|home| relative_to(path, home))
+                .and_then(|rel| names(&rel).into_iter().next())
+                .is_some_and(|first| first.starts_with('.'))
+    };
+    contained(target, workspace) && readable(target) && readable(&canonical_target(target))
 }
 
 /// `path` with symlinks resolved in its longest existing ancestor: how path rules are compared.
@@ -1575,6 +1610,61 @@ mod tests {
 
     fn cmd(line: &str) -> ApprovalQuery {
         q("run_command", serde_json::json!({"CommandLine": line}))
+    }
+
+    /// A folder rule judges the path as the agent named it and the file it reaches: a symlinked
+    /// `.claude` (or a link to a file) inside the folder still asks, while an alias of the
+    /// workspace above the folder does not.
+    #[test]
+    fn a_folder_rule_refuses_a_symlinked_claude_settings_file() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = std::fs::canonicalize(tmp.path()).expect("canon");
+        let src = root.join("ws/src");
+        let home = root.join("home");
+        let cfg = src.join("cfg");
+        for d in [&cfg, &home] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        std::fs::write(cfg.join("real.json"), "{}").expect("file");
+        std::os::unix::fs::symlink(&cfg, src.join(".claude")).expect("dir link");
+        std::os::unix::fs::symlink(cfg.join("real.json"), src.join("settings.json"))
+            .expect("file link");
+        std::os::unix::fs::symlink(root.join("ws"), root.join("alias")).expect("alias");
+        let home = Some(home.as_path());
+        assert!(folder_auto_matchable(&src.join("a.rs"), &src, home));
+        assert!(
+            folder_auto_matchable(&root.join("alias/src/a.rs"), &src, home),
+            "an alias above the folder is not a link inside it"
+        );
+        for refused in [src.join(".claude/settings.json"), src.join("settings.json")] {
+            assert!(!folder_auto_matchable(&refused, &src, home), "{refused:?}");
+        }
+    }
+
+    /// A read rule judges the file a path reaches too: a workspace that is a link into a home
+    /// dot-directory does not make that directory's files readable unasked.
+    #[test]
+    fn a_read_rule_judges_the_canonical_target_too() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = std::fs::canonicalize(tmp.path()).expect("canon");
+        let home = root.join("home");
+        let ssh = home.join(".ssh");
+        let plain = home.join("plain");
+        for d in [&ssh, &plain] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        std::fs::write(ssh.join("config"), "Host x").expect("file");
+        std::fs::write(plain.join("notes.md"), "notes").expect("file");
+        let ws = home.join("proj");
+        std::os::unix::fs::symlink(&ssh, &ws).expect("workspace link");
+        let plain_ws = home.join("plain-link");
+        std::os::unix::fs::symlink(&plain, &plain_ws).expect("plain link");
+        assert!(read_auto_matchable(
+            &plain_ws.join("notes.md"),
+            &plain_ws,
+            Some(&home)
+        ));
+        assert!(!read_auto_matchable(&ws.join("config"), &ws, Some(&home)));
     }
 
     fn edit(tool: &str, file: &str) -> ApprovalQuery {

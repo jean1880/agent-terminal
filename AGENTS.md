@@ -164,7 +164,9 @@ Architectural mandates, standards, and workflows for this codebase.
   profile arguments, and with it `--gemini_dir`/`--app_data_dir` (which move every hook file
   away from the `$HOME/.gemini` the proof reads). Any workspace `.agents/hooks.json` or
   `.agents/plugins/<p>/hooks.json`, in the thread directory or an ancestor up to the repository
-  root, refuses the proof. A cached verdict only binds the socket and drives the UI: every agy
+  root, refuses the proof. Outside a repository (or under a toplevel that is not its ancestor)
+  every ancestor up to `/` is checked, the same directories as the delegation guard's
+  (`agy_guard::l2_directories`). A cached verdict only binds the socket and drives the UI: every agy
   process the session starts with the flag first waits for a fresh `check_target`, run off the
   main thread right before that spawn (`ChatSession`'s `start_process`; writes are held until it
   is in), and a failed check starts that process hookless. The session's canary restarts agy
