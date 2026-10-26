@@ -137,8 +137,10 @@ pub enum Mode {
     Plan,
     /// Dangerous permissive mode: every request is approved without asking (Claude
     /// `bypassPermissions`; Codex `never` + `dangerFullAccess`; agy the skip flag with the hook
-    /// allowing everything). Session-only: never stored as a choice or a default, and a new
-    /// process (reopen, fork, agent switch) never starts in it ([`Mode::session_safe`]).
+    /// allowing everything); a delegated worker's approvals are answered Allow on its behalf,
+    /// though the worker never runs in it. Session-only: never stored as a choice or a default,
+    /// and a new process (reopen, fork, agent switch) never starts in it
+    /// ([`Mode::session_safe`]).
     Bypass,
 }
 

@@ -4,11 +4,11 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::rc::{Rc, Weak};
 
-use agent_core::adapter::Driver;
+use agent_core::adapter::{Driver, Mode};
 use agent_core::delegation::scope::{Scope, ScopedEnvelope};
 use agent_core::delegation::wire::WorkerSummary;
 use agent_core::delegation::WorkerId;
-use agent_core::event::{Envelope, Event, WorkerDelegation, WorkerOrigin, WorkerState};
+use agent_core::event::{Decision, Envelope, Event, WorkerDelegation, WorkerOrigin, WorkerState};
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 
@@ -589,6 +589,51 @@ impl Inner {
         }
     }
 
+    /// Dangerous permissive mode approves whatever still reaches the thread, its live workers'
+    /// approvals included: each is answered Allow (once, no rule) on the shelf's own route, so
+    /// the worker re-checks its inherited authority at the answer and still denies what that
+    /// forbids. Questions and forms, and a card that offers no Allow, still wait for the user.
+    /// Called deferred, never while the supervisor publishes.
+    fn allow_worker_requests(self: &Rc<Self>) {
+        if self.backend.status().mode != Mode::Bypass {
+            return;
+        }
+        let pending: Vec<(Scope, String)> = self
+            .delegation
+            .borrow()
+            .live_histories()
+            .flat_map(|(_, history)| {
+                history
+                    .model
+                    .pending_approvals_offering(Decision::Allow)
+                    .into_iter()
+                    .map(|request| (history.scope.clone(), request))
+            })
+            .collect();
+        // One attempt per request: one the worker could not take stays on the shelf.
+        self.worker_auto_allowed
+            .borrow_mut()
+            .retain(|tried| pending.contains(tried));
+        for (scope, request) in pending {
+            if !self
+                .worker_auto_allowed
+                .borrow_mut()
+                .insert((scope.clone(), request.clone()))
+            {
+                continue;
+            }
+            tracing::info!("dangerous permissive mode: allowing a delegated agent's request");
+            self.worker_request(
+                &scope,
+                RowEvent::Approve {
+                    request,
+                    decision: Decision::Allow,
+                    custom_rule: None,
+                },
+            );
+        }
+    }
+
     pub(super) fn interruption_row(self: &Rc<Self>, event: RowEvent) {
         let scope = self.interruption_scope.borrow().clone();
         if let Some(scope) = scope {
@@ -623,7 +668,7 @@ impl Inner {
         }
     }
 
-    fn queue_worker_flush(self: &Rc<Self>) {
+    pub(super) fn queue_worker_flush(self: &Rc<Self>) {
         if self.worker_flush_queued.replace(true) {
             return;
         }
@@ -635,6 +680,7 @@ impl Inner {
                 inner.refresh_status();
                 inner.refresh_subagents(&[]);
                 inner.refresh_worker_inspector();
+                inner.allow_worker_requests();
             }
         });
     }
@@ -1300,6 +1346,7 @@ pub(crate) mod tests {
         actions: RefCell<Vec<WorkerAction>>,
         diff_scopes: RefCell<Vec<Scope>>,
         root_answers: Cell<u32>,
+        mode: Cell<Mode>,
     }
 
     impl crate::chat::ChatBackend for Backend {
@@ -1326,17 +1373,21 @@ pub(crate) mod tests {
             String::new()
         }
         fn status(&self) -> crate::chat::SessionStatus {
-            super::super::tests::status_of(Driver::Claude)
+            let mut status = super::super::tests::status_of(Driver::Claude);
+            status.mode = self.mode.get();
+            status
         }
     }
 
     /// Called by the existing construction smoke test on its private display.
     pub(crate) fn ui_checks() {
         worker_shelf_ui_checks();
+        bypass_allows_worker_requests_ui_checks();
         let backend = Rc::new(Backend {
             actions: RefCell::new(Vec::new()),
             diff_scopes: RefCell::new(Vec::new()),
             root_answers: Cell::new(0),
+            mode: Cell::new(Mode::Ask),
         });
         let view = ChatView::new(backend.clone());
         let subscriber = view.delegation_subscriber("root-thread");
@@ -1469,6 +1520,7 @@ pub(crate) mod tests {
             actions: RefCell::new(Vec::new()),
             diff_scopes: RefCell::new(Vec::new()),
             root_answers: Cell::new(0),
+            mode: Cell::new(Mode::Ask),
         });
         let view = ChatView::new(backend.clone());
         let subscriber = view.delegation_subscriber("root-thread");
@@ -1622,5 +1674,94 @@ pub(crate) mod tests {
                 .all(|id| id == "approval:delegated-request-1"),
             "worker requests stay outside the root transcript"
         );
+    }
+
+    /// Dangerous permissive mode answers a live worker's approvals Allow, once each, and
+    /// nothing else: not its questions, not a card without Allow, not the root's own requests.
+    fn bypass_allows_worker_requests_ui_checks() {
+        let backend = Rc::new(Backend {
+            actions: RefCell::new(Vec::new()),
+            diff_scopes: RefCell::new(Vec::new()),
+            root_answers: Cell::new(0),
+            mode: Cell::new(Mode::Ask),
+        });
+        let view = ChatView::new(backend.clone());
+        let subscriber = view.delegation_subscriber("root-thread");
+        let inner = view.inner().expect("inner");
+        subscriber.registry("root-thread", &[summary("w_workerAA", "r_firstRun")]);
+        let live = scope("w_workerAA", 1, "r_firstRun");
+        let approval = |request: &str, options: Vec<Decision>| {
+            Envelope::new(Event::ApprovalRequested {
+                tool: "Bash".into(),
+                title: None,
+                input: json!({"command":"true"}),
+                reason: None,
+                options,
+                response: ResponseCapability::Live,
+                remembers: None,
+            })
+            .request(request)
+        };
+        for envelope in [
+            approval("run", vec![Decision::Allow, Decision::Deny]),
+            approval("deny-only", vec![Decision::Deny, Decision::Cancel]),
+            Envelope::new(Event::QuestionRequested {
+                questions: vec![],
+                source: agent_core::event::QuestionSource::Agent,
+            })
+            .request("question"),
+        ] {
+            subscriber.scoped(&ScopedEnvelope {
+                scope: live.clone(),
+                envelope,
+            });
+        }
+        view.apply(&approval("root-own", vec![Decision::Allow, Decision::Deny]));
+
+        // Outside Bypass every request waits for the user.
+        inner.allow_worker_requests();
+        assert!(backend.actions.borrow().is_empty());
+
+        backend.mode.set(Mode::Bypass);
+        inner.allow_worker_requests();
+        let allowed: Vec<_> = backend
+            .actions
+            .borrow()
+            .iter()
+            .map(|action| match action {
+                WorkerAction::Approve {
+                    scope,
+                    request,
+                    decision,
+                    custom_rule,
+                } => {
+                    assert_eq!(scope, &live);
+                    assert!(custom_rule.is_none(), "an automatic answer keeps no rule");
+                    (request.clone(), *decision)
+                }
+                _ => panic!("only approvals are answered"),
+            })
+            .collect();
+        assert_eq!(allowed, [("run".to_owned(), Decision::Allow)]);
+        assert_eq!(
+            backend.root_answers.get(),
+            0,
+            "the root's own card is its own"
+        );
+
+        // Answered once: a later sweep does not send it again.
+        inner.allow_worker_requests();
+        assert_eq!(backend.actions.borrow().len(), 1);
+
+        // A request arriving while in Bypass is answered too.
+        subscriber.scoped(&ScopedEnvelope {
+            scope: live.clone(),
+            envelope: approval("later", vec![Decision::Allow, Decision::Deny]),
+        });
+        inner.allow_worker_requests();
+        assert!(
+            matches!(backend.actions.borrow().last(), Some(WorkerAction::Approve { request, decision: Decision::Allow, .. }) if request == "later")
+        );
+        assert_eq!(backend.actions.borrow().len(), 2);
     }
 }
