@@ -47,6 +47,78 @@ impl TaskMode {
     }
 }
 
+/// What a parent lets a child do beyond reading, when it says so at spawn. A declaration only
+/// narrows the task mode: a call outside it is the parent's intent and is denied, never asked
+/// (so no rule or dangerous permissive mode can approve it). With none declared the task mode
+/// alone decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Capability {
+    /// Change files in its worktree.
+    Edit,
+    /// Run shell commands.
+    Exec,
+    /// Fetch or search the web.
+    Network,
+}
+
+impl Capability {
+    pub const ALL: [Capability; 3] = [Capability::Edit, Capability::Exec, Capability::Network];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Capability::Edit => "edit",
+            Capability::Exec => "exec",
+            Capability::Network => "network",
+        }
+    }
+
+    /// Whether a child in `mode` can hold it at all: a plan child neither edits nor runs
+    /// commands, whatever is declared.
+    pub fn fits(self, mode: TaskMode) -> bool {
+        match self {
+            Capability::Edit | Capability::Exec => mode.writes(),
+            Capability::Network => true,
+        }
+    }
+}
+
+/// `caps` sorted with no duplicates: the one stored and compared form.
+pub fn normalize_capabilities(mut caps: Vec<Capability>) -> Vec<Capability> {
+    caps.sort();
+    caps.dedup();
+    caps
+}
+
+/// A declaration may not name what its task mode cannot do: refused rather than silently cut,
+/// so the parent learns its request meant nothing.
+pub fn capabilities_allowed(mode: TaskMode, caps: &[Capability]) -> Result<(), Capability> {
+    match caps.iter().find(|c| !c.fits(mode)) {
+        Some(c) => Err(*c),
+        None => Ok(()),
+    }
+}
+
+/// The capabilities a new child holds. Under a parent that declared none, its own declaration
+/// (or none). Under a restricted parent it never holds more: none declared inherits the
+/// parent's (cut to what its mode can hold), and a declaration naming more is refused.
+pub fn inherit_capabilities(
+    parent: Option<&[Capability]>,
+    requested: Option<Vec<Capability>>,
+    mode: TaskMode,
+) -> Result<Option<Vec<Capability>>, ErrorCode> {
+    match (parent, requested) {
+        (None, requested) => Ok(requested),
+        (Some(parent), None) => Ok(Some(
+            parent.iter().copied().filter(|c| c.fits(mode)).collect(),
+        )),
+        (Some(parent), Some(requested)) if requested.iter().all(|c| parent.contains(c)) => {
+            Ok(Some(requested))
+        }
+        (Some(_), Some(_)) => Err(ErrorCode::AuthorityDenied),
+    }
+}
+
 const CEILING_ACCEPT_EDITS: [TaskMode; 3] = [TaskMode::AcceptEdits, TaskMode::Ask, TaskMode::Plan];
 const CEILING_ASK: [TaskMode; 2] = [TaskMode::Ask, TaskMode::Plan];
 const CEILING_PLAN: [TaskMode; 1] = [TaskMode::Plan];
@@ -350,6 +422,46 @@ pub fn revocation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capabilities_never_widen_a_mode_or_a_parent() {
+        use Capability::{Edit, Exec, Network};
+        assert_eq!(
+            normalize_capabilities(vec![Network, Edit, Network]),
+            [Edit, Network]
+        );
+        for c in Capability::ALL {
+            assert!(c.fits(TaskMode::Ask) && c.fits(TaskMode::AcceptEdits));
+            assert_eq!(serde_json::to_value(c).ok(), Some(c.as_str().into()));
+        }
+        // A plan child can only be granted the network.
+        assert_eq!(capabilities_allowed(TaskMode::Plan, &[Network]), Ok(()));
+        assert_eq!(
+            capabilities_allowed(TaskMode::Plan, &[Network, Exec]),
+            Err(Exec)
+        );
+        assert_eq!(capabilities_allowed(TaskMode::Ask, &[Edit, Exec]), Ok(()));
+
+        // A parent with no declaration passes on whatever the child asks for, or nothing.
+        assert_eq!(inherit_capabilities(None, None, TaskMode::Ask), Ok(None));
+        assert_eq!(
+            inherit_capabilities(None, Some(vec![Exec]), TaskMode::Ask),
+            Ok(Some(vec![Exec]))
+        );
+        // A restricted parent's limits reach its child, cut to the child's mode.
+        assert_eq!(
+            inherit_capabilities(Some(&[Edit, Network]), None, TaskMode::Plan),
+            Ok(Some(vec![Network]))
+        );
+        assert_eq!(
+            inherit_capabilities(Some(&[Edit]), Some(vec![]), TaskMode::Ask),
+            Ok(Some(vec![]))
+        );
+        assert_eq!(
+            inherit_capabilities(Some(&[Edit]), Some(vec![Edit, Exec]), TaskMode::Ask),
+            Err(ErrorCode::AuthorityDenied)
+        );
+    }
 
     const MODES: [Mode; 4] = [Mode::Ask, Mode::AcceptEdits, Mode::Plan, Mode::Bypass];
 

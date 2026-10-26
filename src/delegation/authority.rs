@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use agent_core::adapter::Driver;
-use agent_core::delegation::authority::{permits, TaskMode, WorkspaceScope};
+use agent_core::delegation::authority::{permits, Capability, TaskMode, WorkspaceScope};
 use agent_core::delegation::SERVER_NAME;
 use serde_json::Value;
 
@@ -147,6 +147,28 @@ impl ChildAuthority {
         self.params.home.as_deref()
     }
 
+    /// Whether the parent's declaration (if any) lets the child use `capability`.
+    fn allows(&self, capability: Capability) -> bool {
+        self.params
+            .capabilities
+            .as_ref()
+            .is_none_or(|declared| declared.contains(&capability))
+    }
+
+    /// What a declaration leaves out of `effect`: `None` when allowed (or nothing was
+    /// declared), `Some(None)` for a tool no capability names.
+    fn undeclared(&self, effect: Effect) -> Option<Option<Capability>> {
+        self.params.capabilities.as_ref()?;
+        let needed = match effect {
+            Effect::Edit => Capability::Edit,
+            Effect::Exec => Capability::Exec,
+            Effect::Network => Capability::Network,
+            Effect::Unknown => return Some(None),
+            Effect::Read | Effect::Delegate | Effect::Mcp { .. } => return None,
+        };
+        (!self.allows(needed)).then_some(Some(needed))
+    }
+
     /// Whether the live authority still holds for this child: valid, not bootstrapping, and the
     /// child's task mode still inside the parent's live ceiling.
     fn holds(&self, live: &LiveAuthority) -> Result<(), String> {
@@ -227,11 +249,31 @@ impl ApprovalGate for ChildAuthority {
             }
             _ => {}
         }
+        // A limit the parent declared is its intent: refused, never asked, so no rule and no
+        // dangerous permissive mode can approve past it.
+        if let Some(missing) = self.undeclared(effect) {
+            return GateVerdict::Deny {
+                reason: format!(
+                    "this agent's parent did not allow it {}",
+                    match missing {
+                        Some(Capability::Edit) => "to change files",
+                        Some(Capability::Exec) => "to run commands",
+                        Some(Capability::Network) => "network access",
+                        None => "to use tools it cannot recognise",
+                    }
+                ),
+            };
+        }
         if self.params.task_mode == TaskMode::Plan {
             return match effect {
                 Effect::Read | Effect::Mcp { own: true } => GateVerdict::Defer,
-                Effect::Network => GateVerdict::AskOnly {
+                // Read-only is the parent's intent unless it declared the network.
+                Effect::Network if self.params.capabilities.is_some() => GateVerdict::AskOnly {
                     reason: "network access from a plan agent".to_owned(),
+                },
+                Effect::Network => GateVerdict::Deny {
+                    reason: "a plan agent has no network access unless its parent allows it"
+                        .to_owned(),
                 },
                 _ => GateVerdict::Deny {
                     reason: "a plan agent cannot change files or run commands".to_owned(),
@@ -260,18 +302,28 @@ impl ApprovalGate for ChildAuthority {
                 // A plan child, or one a restricted parent no longer allows to write, never gets
                 // a rule-allowed edit.
                 let task = self.params.task_mode;
-                if !task.writes() || !permits(live.parent_mode, task) {
+                if !task.writes()
+                    || !permits(live.parent_mode, task)
+                    || !self.allows(Capability::Edit)
+                {
                     return false;
                 }
                 let abs = absolute(path, cwd, &worktree);
                 self.edit_matchable(&abs, &worktree)
+            }
+            // The user's shell rules reach a writing child its parent let run commands (`judge`
+            // has already refused a command that starts an agent).
+            Action::Shell { .. } => {
+                let task = self.params.task_mode;
+                task.writes() && permits(live.parent_mode, task) && self.allows(Capability::Exec)
             }
             Action::Read { path } => {
                 let root = self.read_root();
                 let abs = absolute(path, cwd, &root);
                 read_auto_matchable(&abs, &root, self.home()) && canonically_inside(&abs, &root)
             }
-            Action::Shell { .. } | Action::Mcp { .. } => false,
+            // A child uses no MCP server but agent-terminal's, which no rule covers.
+            Action::Mcp { .. } => false,
         }
     }
 }
@@ -429,7 +481,12 @@ mod tests {
             }
         }
 
-        fn gate(&self, driver: Driver, task_mode: TaskMode) -> ChildAuthority {
+        fn gate_with(
+            &self,
+            driver: Driver,
+            task_mode: TaskMode,
+            capabilities: Option<Vec<Capability>>,
+        ) -> ChildAuthority {
             let live = self.live.clone();
             ChildAuthority::new(AuthorityParams {
                 inherited: InheritedAuthority {
@@ -449,9 +506,14 @@ mod tests {
                 },
                 driver,
                 task_mode,
+                capabilities,
                 home: None,
                 live: Rc::new(move || live.get()),
             })
+        }
+
+        fn gate(&self, driver: Driver, task_mode: TaskMode) -> ChildAuthority {
+            self.gate_with(driver, task_mode, None)
         }
 
         fn inside(&self) -> String {
@@ -513,11 +575,11 @@ mod tests {
                 assert_eq!(effect(driver, tool, &input), eff, "{driver:?} {tool}");
                 let v = gate.judge(tool, &input, None);
                 match eff {
-                    Effect::Edit | Effect::Exec | Effect::Unknown => {
+                    // Read-only is the parent's intent: the network too, unless declared.
+                    Effect::Edit | Effect::Exec | Effect::Unknown | Effect::Network => {
                         assert!(is_deny(&v), "{driver:?} {tool}: {v:?}")
                     }
                     Effect::Read => assert_eq!(v, GateVerdict::Defer, "{driver:?} {tool}"),
-                    Effect::Network => assert!(is_ask_only(&v), "{driver:?} {tool}: {v:?}"),
                     _ => unreachable!(),
                 }
             }
@@ -538,6 +600,66 @@ mod tests {
                 assert!(is_ask_only(&v), "{driver:?} {mode:?}: {v:?}");
             }
         }
+    }
+
+    #[test]
+    fn a_declared_limit_is_refused_and_no_rule_reaches_past_it() {
+        let f = Fixture::new();
+        let file = f.inside();
+        let shell = Action::Shell {
+            command: "ls".into(),
+        };
+        let edit = Action::Edit { path: file.clone() };
+        for driver in DRIVERS {
+            // Edits only: commands, the network and unknown tools are refused outright.
+            let edits = f.gate_with(driver, TaskMode::AcceptEdits, Some(vec![Capability::Edit]));
+            for (eff, tool, input) in calls(driver, &file) {
+                let v = edits.judge(tool, &input, None);
+                match eff {
+                    Effect::Read | Effect::Edit => {
+                        assert_eq!(v, GateVerdict::Defer, "{driver:?} {tool}")
+                    }
+                    _ => assert!(is_deny(&v), "{driver:?} {tool}: {v:?}"),
+                }
+            }
+            assert!(is_deny(&edits.judge("Mystery", &json!({}), None)));
+            assert!(edits.rule_may_apply(&edit, None));
+            assert!(!edits.rule_may_apply(&shell, None));
+
+            // Commands only: no edit, by hand or by rule; shell rules apply.
+            let exec = f.gate_with(driver, TaskMode::Ask, Some(vec![Capability::Exec]));
+            for (eff, tool, input) in calls(driver, &file) {
+                let v = exec.judge(tool, &input, None);
+                match eff {
+                    Effect::Edit | Effect::Network | Effect::Unknown => {
+                        assert!(is_deny(&v), "{driver:?} {tool}: {v:?}")
+                    }
+                    _ => assert!(!is_deny(&v), "{driver:?} {tool}: {v:?}"),
+                }
+            }
+            assert!(!exec.rule_may_apply(&edit, None));
+            assert!(exec.rule_may_apply(&shell, None));
+
+            // An empty declaration: reading and messaging the parent, nothing else.
+            let none = f.gate_with(driver, TaskMode::Ask, Some(vec![]));
+            assert!(!none.rule_may_apply(&edit, None) && !none.rule_may_apply(&shell, None));
+
+            // A plan child the parent let reach the network is asked; never given commands.
+            let plan = f.gate_with(driver, TaskMode::Plan, Some(vec![Capability::Network]));
+            for (eff, tool, input) in calls(driver, &file) {
+                let v = plan.judge(tool, &input, None);
+                match eff {
+                    Effect::Network => assert!(is_ask_only(&v), "{driver:?} {tool}: {v:?}"),
+                    Effect::Read => assert_eq!(v, GateVerdict::Defer),
+                    _ => assert!(is_deny(&v), "{driver:?} {tool}: {v:?}"),
+                }
+            }
+            assert!(!f.gate(driver, TaskMode::Plan).rule_may_apply(&shell, None));
+        }
+        // A parent dropping to Plan takes the shell rules away again.
+        let gate = f.gate(Driver::Claude, TaskMode::Ask);
+        f.live.set(fixed_live(true, false, Mode::Plan));
+        assert!(!gate.rule_may_apply(&shell, None));
     }
 
     #[test]
@@ -739,8 +861,8 @@ mod tests {
             // The source tree: no.
             assert!(!gate.rule_may_apply(&Action::Edit { path: f.outside() }, None));
             assert!(!gate.rule_may_apply(&Action::Read { path: f.outside() }, None));
-            // Shell and MCP: never.
-            assert!(!gate.rule_may_apply(
+            // The user's shell rules reach a writing child; MCP rules never.
+            assert!(gate.rule_may_apply(
                 &Action::Shell {
                     command: "ls".into()
                 },
@@ -871,6 +993,7 @@ mod tests {
             },
             driver: Driver::Claude,
             task_mode: TaskMode::Plan,
+            capabilities: None,
             home: None,
             live: Rc::new(move || live.get()),
         });

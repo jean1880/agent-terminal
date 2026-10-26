@@ -27,6 +27,8 @@ pub(super) struct ChildSpec {
     pub profile: Profile,
     pub driver: Driver,
     pub mode: TaskMode,
+    /// What the parent declared the child may do beyond reading; `None`: nothing declared.
+    pub capabilities: Option<Vec<agent_core::delegation::authority::Capability>>,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub scope: WorkspaceScope,
@@ -205,6 +207,19 @@ impl Supervisor {
             ));
         }
         agent_core::delegation::limits::admit_spawn(&self.limits, &self.usage(&root), true)?;
+        // A restricted worker's limits reach the children it starts (a root has none).
+        let parent_capabilities = self
+            .state
+            .borrow()
+            .child_specs
+            .get(caller)
+            .and_then(|spec| spec.capabilities.clone());
+        let capabilities = agent_core::delegation::authority::inherit_capabilities(
+            parent_capabilities.as_deref(),
+            r.capabilities.clone(),
+            r.task_mode,
+        )
+        .map_err(|code| error(code, "requested capabilities exceed the caller's own"))?;
         let model = r.model.clone().or(resolved.default_model.clone());
         let effort = r.effort.clone().or(resolved.default_effort.clone());
         if model
@@ -297,7 +312,7 @@ impl Supervisor {
             },
         );
         super::attest::sanitise_identity(&mut identity);
-        let plan=SpawnPlan{driver,identity,workspace,launch_json:serde_json::json!({"model":model,"effort":effort,"cwd":child_cwd,"source_repo":lease_plan.as_ref().map(|l|&l.source_repo),"branch":lease_plan.as_ref().map(|l|&l.branch),"base_commit":lease_plan.as_ref().map(|l|&l.base_commit)}).to_string(),cwd:child_cwd.to_string_lossy().into_owned(),state:SpawnState::Starting,process_generation:1};
+        let plan=SpawnPlan{driver,identity,workspace,launch_json:serde_json::json!({"model":model,"effort":effort,"capabilities":capabilities,"cwd":child_cwd,"source_repo":lease_plan.as_ref().map(|l|&l.source_repo),"branch":lease_plan.as_ref().map(|l|&l.branch),"base_commit":lease_plan.as_ref().map(|l|&l.base_commit)}).to_string(),cwd:child_cwd.to_string_lossy().into_owned(),state:SpawnState::Starting,process_generation:1};
         let accept = self.accept_request(
             caller,
             &root,
@@ -383,6 +398,7 @@ impl Supervisor {
             profile,
             driver,
             mode: r.task_mode,
+            capabilities,
             model,
             effort,
             scope: lease
@@ -556,6 +572,7 @@ impl Supervisor {
             inherited,
             driver: spec.driver,
             task_mode: spec.mode,
+            capabilities: spec.capabilities.clone(),
             home: authority_home(&resolved.env),
             live,
         }));

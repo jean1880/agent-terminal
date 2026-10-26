@@ -5,6 +5,18 @@ use agent_core::delegation::authority::WorkspaceScope;
 use agent_core::delegation::ToolError;
 use agent_core::delegation::{ProcessGeneration, RunId, WorkerId};
 use std::path::PathBuf;
+/// The capabilities a child's launch record declared: none when it declared nothing (a child
+/// started before they existed included). A declaration that no longer reads is kept as the
+/// strictest one, nothing beyond reading, rather than dropped.
+fn stored_capabilities(
+    launch: &serde_json::Value,
+) -> Option<Vec<agent_core::delegation::authority::Capability>> {
+    match launch.get("capabilities") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(declared) => Some(serde_json::from_value(declared.clone()).unwrap_or_default()),
+    }
+}
+
 pub(super) async fn startup(services: &AppServices) -> Result<(), ToolError> {
     services
         .durable("reconcile delegation startup", |s| {
@@ -108,6 +120,7 @@ impl Supervisor {
                 profile,
                 driver,
                 mode,
+                capabilities: stored_capabilities(&launch),
                 model: launch
                     .get("model")
                     .and_then(|v| v.as_str())
@@ -132,6 +145,29 @@ impl Supervisor {
                 }
             }
             state.child_specs.insert(worker, spec);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stored_capabilities;
+    use agent_core::delegation::authority::Capability;
+    use serde_json::json;
+
+    #[test]
+    fn a_restored_declaration_never_widens() {
+        assert_eq!(stored_capabilities(&json!({})), None);
+        assert_eq!(stored_capabilities(&json!({"capabilities": null})), None);
+        assert_eq!(
+            stored_capabilities(&json!({"capabilities": ["exec"]})),
+            Some(vec![Capability::Exec])
+        );
+        for unreadable in [json!(["exec", "everything"]), json!("exec"), json!(3)] {
+            assert_eq!(
+                stored_capabilities(&json!({ "capabilities": unreadable })),
+                Some(vec![])
+            );
         }
     }
 }

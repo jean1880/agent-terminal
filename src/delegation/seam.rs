@@ -204,6 +204,8 @@ pub(crate) struct AuthorityParams {
     pub inherited: InheritedAuthority,
     pub driver: Driver,
     pub task_mode: TaskMode,
+    /// What the parent declared the child may do beyond reading; `None`: nothing declared.
+    pub capabilities: Option<Vec<agent_core::delegation::authority::Capability>>,
     pub home: Option<PathBuf>,
     pub live: Rc<dyn Fn() -> LiveAuthority>,
 }
