@@ -167,6 +167,8 @@ pub(crate) struct Inner {
     header: Header,
     plan: PlanPanel,
     interruption: interruption::InterruptionShelf,
+    /// The worker run shown on the shelf; `None` means the root transcript.
+    interruption_scope: RefCell<Option<agent_core::delegation::scope::Scope>>,
     /// The bouncing dots above the composer while the agent works.
     thinking: thinking::ThinkingStrip,
     requests: Rc<Requests>,
@@ -266,9 +268,9 @@ impl ChatView {
                 |inner, task: &BackgroundTask| inner.open_background(task),
             ));
             let interruption = interruption::InterruptionShelf::new(
-                sink.clone(),
+                Rc::new(on_inner(weak, |inner, event| inner.interruption_row(event))),
                 on_inner(weak, |inner, id: String| {
-                    inner.transcript.focus_pending_card(&id);
+                    inner.jump_interruption(&id);
                 }),
             );
             Inner {
@@ -279,6 +281,7 @@ impl ChatView {
                 header: Header::new(),
                 plan: PlanPanel::new(),
                 interruption,
+                interruption_scope: RefCell::new(None),
                 thinking: thinking::ThinkingStrip::new(),
                 requests: Rc::new(Requests::default()),
                 models: RefCell::new(None),
@@ -408,7 +411,6 @@ impl ChatView {
         inner.transcript.reset(&inner.model.borrow());
         let model = inner.model.borrow();
         inner.plan.set(&model.plan);
-        inner.interruption.update(&model);
         inner.header.set_gauge(model.gauge.as_ref());
         if let Some(mode) = model.mode {
             inner.header.set_mode(mode);
@@ -728,7 +730,7 @@ impl Inner {
         self.header
             .set_extra_access(self.model.borrow().extra_access());
         if shelf {
-            self.interruption.update(&self.model.borrow());
+            self.refresh_interruption();
         }
     }
 
@@ -1072,7 +1074,7 @@ impl Inner {
         self.header
             .gauge
             .set_sensitive(status.capabilities.context_usage);
-        self.interruption.update(&self.model.borrow());
+        self.refresh_interruption();
         self.composer.refresh_placeholder();
     }
 

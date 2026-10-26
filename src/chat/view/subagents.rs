@@ -602,6 +602,12 @@ impl SubagentPanel {
         }
     }
 
+    pub(super) fn focus_pending_card(&self, id: &str) {
+        if let Some(row) = self.rows.borrow().get(id) {
+            row.focus_pending_action();
+        }
+    }
+
     /// A supervised worker owns its own reducer. Its turn/model/usage state never enters the
     /// root reducer; this panel renders its top-level rows using the identical card builder.
     pub(super) fn refresh_scoped(
