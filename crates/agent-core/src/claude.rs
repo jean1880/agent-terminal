@@ -103,8 +103,13 @@ pub struct ClaudeAdapter {
     /// Sub-agent task id (its `agentId`) → the `Agent` call that first ran it. A continuation
     /// (`SendMessage` to that id) restarts the same task under the `SendMessage` call's id, but
     /// its steps nest under the original call, so the original card is the one that runs again.
-    /// Kept past the task list (a continuation comes after the task ended); cleared on exit.
+    /// Kept past the task list (a continuation comes after the task ended) and past an exit: the
+    /// next process resumes the same session (an idle suspend, a mode or model restart), and a
+    /// sub-agent it continues is still the one on that card.
     agent_items: HashMap<String, String>,
+    /// Open `Agent` calls. A sub-agent task started under any other open call (a `SendMessage`
+    /// continuing a sub-agent whose first call this adapter never saw) makes that call its card.
+    agent_calls: HashSet<String>,
     /// Sub-agent tool-use id → the model last reported for it ([`Event::SubagentModel`]).
     subagent_models: HashMap<String, String>,
     seen: HashSet<String>,
@@ -165,6 +170,7 @@ impl ClaudeAdapter {
             tasks: Vec::new(),
             task_tools: HashMap::new(),
             agent_items: HashMap::new(),
+            agent_calls: HashSet::new(),
             subagent_models: HashMap::new(),
             seen: HashSet::new(),
             pending: HashMap::new(),
@@ -298,6 +304,19 @@ impl ClaudeAdapter {
                 if let Some(task) = task {
                     self.remember_agent(task, tool);
                 }
+                // A continuation of a sub-agent this adapter never saw start (one from before
+                // the app was restarted): the `SendMessage` call stands in as its card.
+                if self.agent_calls.insert(tool.to_owned()) {
+                    out.push(
+                        Envelope::new(Event::ItemStarted {
+                            kind: ItemKind::Subagent,
+                            title: "Agent".to_owned(),
+                            input: None,
+                            parent: None,
+                        })
+                        .item(tool),
+                    );
+                }
             }
             None => {}
         }
@@ -329,6 +348,17 @@ impl ClaudeAdapter {
             self.agent_items.clear();
         }
         self.agent_items.insert(task.to_owned(), item.to_owned());
+    }
+
+    /// Remembers `item` as an `Agent` call when `kind` says it is one.
+    fn note_call(&mut self, item: &str, kind: ItemKind) {
+        if kind != ItemKind::Subagent {
+            return;
+        }
+        if self.agent_calls.len() >= SEEN_CAP {
+            self.agent_calls.clear();
+        }
+        self.agent_calls.insert(item.to_owned());
     }
 
     /// `background_tasks_changed`: the full list of running background tasks.
@@ -692,6 +722,7 @@ impl ClaudeAdapter {
             },
         );
         self.open_child(&item, parent.as_deref());
+        self.note_call(&item, kind);
         let mut out = vec![Envelope::new(Event::ItemStarted {
             kind,
             title,
@@ -823,6 +854,7 @@ impl ClaudeAdapter {
                         );
                     } else {
                         self.open_child(id, parent.as_deref());
+                        self.note_call(id, tool_kind(name));
                         out.push(
                             Envelope::new(Event::ItemStarted {
                                 kind: tool_kind(name),
@@ -1440,11 +1472,12 @@ impl Adapter for ClaudeAdapter {
         let expected = self.interrupt_pending;
         let mut out = Vec::new();
         // Background tasks die with the process: sub-agents are settled with everything else,
-        // and the task list empties.
+        // and the task list empties. Which card each sub-agent ran on is kept for the resumed
+        // session that may continue it.
         self.background.clear();
         self.background_children.clear();
         self.task_tools.clear();
-        self.agent_items.clear();
+        self.agent_calls.clear();
         if !std::mem::take(&mut self.tasks).is_empty() {
             out.push(Envelope::new(Event::BackgroundTasks { tasks: Vec::new() }));
         }
@@ -3577,20 +3610,54 @@ mod tests {
     }
 
     #[test]
-    fn a_task_whose_call_was_never_seen_starts_nothing() {
-        // A continuation from a new process: the SendMessage call stands in for the sub-agent.
+    fn a_continued_sub_agent_keeps_its_card_across_a_restart() {
+        // An idle suspend, or a mode or model restart, resumes the same session in a new
+        // process: a sub-agent it continues still runs on its first card.
+        let mut a = ClaudeAdapter::new();
+        a.feed(&init_frame());
+        a.feed(&agent_call("toolu_a", true));
+        a.feed(&task_started("ag1", "toolu_a", true));
+        a.feed(&async_launched("toolu_a"));
+        a.on_exit(None);
+
+        a.feed(&init_frame());
+        a.feed(&send_message("toolu_s", "ag1"));
+        let out = a.feed(&task_started("ag1", "toolu_s", true));
+        assert_eq!(starts(&out, "toolu_a"), [ItemKind::Subagent], "{out:?}");
+        assert!(starts(&out, "toolu_s").is_empty(), "{out:?}");
+        let out = a.feed(&tasks_changed(&["ag1"]));
+        assert_eq!(
+            listed_tools(&out),
+            [("ag1".to_owned(), Some("toolu_a".to_owned()))]
+        );
+        let out = a.feed(&task_notification("ag1", "toolu_s", "completed", "OK"));
+        assert_eq!(completions(&out, "toolu_a").len(), 1, "{out:?}");
+    }
+
+    #[test]
+    fn a_task_whose_call_was_never_seen_runs_on_the_call_that_continued_it() {
+        // A continuation from a new app run: the SendMessage call becomes the sub-agent's card.
         let mut a = ClaudeAdapter::new();
         a.feed(&init_frame());
         a.feed(&send_message("toolu_s", "ag1"));
         let out = a.feed(&task_started("ag1", "toolu_s", true));
-        assert!(
-            !out.iter()
-                .any(|e| matches!(e.event, Event::ItemStarted { .. })),
-            "{out:?}"
+        assert_eq!(starts(&out, "toolu_s"), [ItemKind::Subagent], "{out:?}");
+        let out = a.feed(&tasks_changed(&["ag1"]));
+        assert_eq!(
+            listed_tools(&out),
+            [("ag1".to_owned(), Some("toolu_s".to_owned()))]
         );
         assert!(a.feed(&send_message_result("toolu_s", "ag1")).is_empty());
+        // Said once: a second start under the same call starts nothing more.
+        assert!(starts(&a.feed(&task_started("ag1", "toolu_s", true)), "toolu_s").is_empty());
         let out = a.feed(&task_notification("ag1", "toolu_s", "completed", "OK"));
         assert_eq!(completions(&out, "toolu_s").len(), 1, "{out:?}");
+        // A first start under an Agent call does not start its card again.
+        let mut a = ClaudeAdapter::new();
+        a.feed(&init_frame());
+        a.feed(&agent_call("toolu_a", true));
+        let out = a.feed(&task_started("ag2", "toolu_a", true));
+        assert!(starts(&out, "toolu_a").is_empty(), "{out:?}");
         // A task first started under a call that is not open is not remembered either.
         let mut a = ClaudeAdapter::new();
         a.feed(&init_frame());
