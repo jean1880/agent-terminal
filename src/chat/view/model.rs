@@ -971,6 +971,22 @@ impl Transcript {
             .count()
     }
 
+    /// The request ids of the approvals still waiting that offer `decision`, oldest first.
+    pub fn pending_approvals_offering(&self, decision: Decision) -> Vec<String> {
+        self.order
+            .iter()
+            .filter_map(|id| self.items.get(id))
+            .filter_map(|item| match &item.body {
+                Body::Approval(a)
+                    if a.state == ApprovalState::Pending && a.options.contains(&decision) =>
+                {
+                    Some(a.request.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Whether `id` is a sub-agent or one of its steps (at any depth): what the explorer shows.
     pub fn in_subagent(&self, id: &str) -> bool {
         let mut next = Some(id);
@@ -4109,6 +4125,44 @@ mod tests {
         // A late expiry does not overwrite a resolution.
         t.apply(&ev(Event::ApprovalExpired).request("r1"), Driver::Claude);
         assert_eq!(state(&t), ApprovalState::Resolved(Decision::Allow));
+    }
+
+    #[test]
+    fn pending_approvals_offering_lists_only_waiting_cards_with_that_answer() {
+        let mut t = Transcript::new();
+        let mk = |id: &str, options: Vec<Decision>, response| {
+            Envelope::new(Event::ApprovalRequested {
+                tool: "Bash".into(),
+                title: None,
+                input: Value::Null,
+                reason: None,
+                options,
+                response,
+                remembers: None,
+            })
+            .request(id)
+        };
+        let both = || vec![Decision::Allow, Decision::Deny];
+        t.apply(&mk("a", both(), ResponseCapability::Live), Driver::Claude);
+        t.apply(
+            &mk("deny-only", vec![Decision::Deny], ResponseCapability::Live),
+            Driver::Claude,
+        );
+        t.apply(
+            &mk("sent", both(), ResponseCapability::Live),
+            Driver::Claude,
+        );
+        t.mark_approval_sent("sent", Decision::Allow);
+        t.apply(
+            &mk("gone", both(), ResponseCapability::Expired),
+            Driver::Claude,
+        );
+        t.apply(&mk("b", both(), ResponseCapability::Live), Driver::Claude);
+        assert_eq!(t.pending_approvals_offering(Decision::Allow), ["a", "b"]);
+        assert_eq!(
+            t.pending_approvals_offering(Decision::Deny),
+            ["a", "deny-only", "b"]
+        );
     }
 
     #[test]

@@ -169,6 +169,9 @@ pub(crate) struct Inner {
     interruption: interruption::InterruptionShelf,
     /// The worker run shown on the shelf; `None` means the root transcript.
     interruption_scope: RefCell<Option<agent_core::delegation::scope::Scope>>,
+    /// Worker approvals dangerous permissive mode already answered, while they still wait.
+    worker_auto_allowed:
+        RefCell<std::collections::HashSet<(agent_core::delegation::scope::Scope, String)>>,
     /// The bouncing dots above the composer while the agent works.
     thinking: thinking::ThinkingStrip,
     requests: Rc<Requests>,
@@ -282,6 +285,7 @@ impl ChatView {
                 plan: PlanPanel::new(),
                 interruption,
                 interruption_scope: RefCell::new(None),
+                worker_auto_allowed: RefCell::default(),
                 thinking: thinking::ThinkingStrip::new(),
                 requests: Rc::new(Requests::default()),
                 models: RefCell::new(None),
@@ -702,8 +706,13 @@ impl Inner {
                 Change::Plan => self.plan.set(&self.model.borrow().plan),
                 Change::Gauge => self.header.set_gauge(self.model.borrow().gauge.as_ref()),
                 Change::Mode => {
-                    if let Some(mode) = self.model.borrow().mode {
+                    let mode = self.model.borrow().mode;
+                    if let Some(mode) = mode {
                         self.header.set_mode(mode);
+                    }
+                    // Entering dangerous permissive mode answers the workers already waiting.
+                    if mode == Some(Mode::Bypass) {
+                        self.queue_worker_flush();
                     }
                     self.header
                         .set_pending_mode(self.model.borrow().pending_mode);

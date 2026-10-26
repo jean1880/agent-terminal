@@ -183,6 +183,10 @@ Architectural mandates, standards, and workflows for this codebase.
   gets the safe mode, a switch to another agent ends it, and Settings never offers it. Natively:
   Claude `bypassPermissions` (entered by a resumed restart, since a live `setMode` is a no-op),
   Codex `never` + `dangerFullAccess`, agy the hook allowing everything; hookless agy refuses it.
+  It never propagates to a delegated worker (its task mode stays inside the root's safe mode), but
+  while the root is in it, the root's view answers each live worker approval that offers Allow
+  (`allow_worker_requests`): once, keeping no rule, through the shelf's own route, so the worker's
+  inherited authority is re-checked at the answer. Questions and forms still wait for the user.
   It stays last in the picker, below its divider. The session tests
   `dangerous_permissive_mode_*` prove these.
 - **Every persisted or injected text is redacted**: the store scrubs every
