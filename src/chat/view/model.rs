@@ -356,8 +356,10 @@ impl SubagentSummary {
         let name = field("subagent_type")
             .or_else(|| field("agent"))
             .unwrap_or_else(|| tool.title.clone());
+        // `message`: a `SendMessage` call standing in for the sub-agent it continued.
         let task = field("description")
             .or_else(|| field("prompt").and_then(|p| p.lines().next().map(str::to_owned)))
+            .or_else(|| field("message").and_then(|m| m.lines().next().map(str::to_owned)))
             .unwrap_or_default();
         Self {
             id: item.id.clone(),
@@ -1933,6 +1935,20 @@ impl Transcript {
                             out.push(Change::Updated(id));
                             return out;
                         }
+                        // A plain Claude call a sub-agent turned out to run under (a
+                        // `SendMessage` continuing one from before the app restarted) becomes
+                        // that sub-agent's card.
+                        if driver == Driver::Claude
+                            && tool.kind == ItemKind::Tool
+                            && *kind == ItemKind::Subagent
+                        {
+                            tool.kind = ItemKind::Subagent;
+                            tool.title.clone_from(title);
+                            tool.status = ToolStatus::Running;
+                            tool.error = None;
+                            out.push(Change::Updated(id));
+                            return out;
+                        }
                     }
                     // Codex can start a tool before it knows the full action, then repeat the
                     // item in its completed snapshot. Accept a matching tool start as a metadata
@@ -2721,6 +2737,57 @@ mod tests {
             Driver::Claude,
         );
         assert!(!t.subagents()[0].active());
+    }
+
+    #[test]
+    fn a_claude_call_a_sub_agent_runs_under_becomes_its_card() {
+        let mut t = Transcript::new();
+        let input = json!({"to": "ag1", "message": "Fix the review findings.\nThen amend."});
+        t.apply(
+            &ev(tool_start(
+                ItemKind::Tool,
+                "SendMessage",
+                Some(input.clone()),
+            ))
+            .item("toolu_s"),
+            Driver::Claude,
+        );
+        assert!(t.subagents().is_empty());
+        let changes = t.apply(
+            &ev(tool_start(ItemKind::Subagent, "Agent", None)).item("toolu_s"),
+            Driver::Claude,
+        );
+        assert_eq!(changes, [Change::Updated("toolu_s".to_owned())]);
+        let agents = t.subagents();
+        assert_eq!(agents.len(), 1);
+        assert!(agents[0].active());
+        assert_eq!(agents[0].name, "Agent");
+        assert_eq!(agents[0].task, "Fix the review findings.");
+        let Some(Body::Tool(tool)) = t.get("toolu_s").map(|i| &i.body) else {
+            panic!("no tool card");
+        };
+        assert_eq!(tool.input.as_ref(), Some(&input));
+        // Only a Claude plain tool: a Codex one, or a command, keeps its kind.
+        let mut t = Transcript::new();
+        t.apply(
+            &ev(tool_start(ItemKind::Tool, "spawn", None)).item("c1"),
+            Driver::Codex,
+        );
+        t.apply(
+            &ev(tool_start(ItemKind::Command, "Bash", None)).item("b1"),
+            Driver::Claude,
+        );
+        for (id, driver) in [("c1", Driver::Codex), ("b1", Driver::Claude)] {
+            t.apply(
+                &ev(tool_start(ItemKind::Subagent, "Agent", None)).item(id),
+                driver,
+            );
+        }
+        assert!(
+            t.subagents().iter().all(|a| a.name != "Agent"),
+            "{:?}",
+            t.subagents()
+        );
     }
 
     #[test]
