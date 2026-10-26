@@ -15,7 +15,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -29,6 +29,24 @@ use crate::diff_tool::{self, DiffTools, NewSide, OpenRequest};
 
 /// How long a card waits for a baseline that is still being taken.
 const BASE_WAIT: Duration = Duration::from_secs(10);
+
+/// The path an "Open in tool" request carries: a relative one is the thread's, so it is joined to
+/// the thread's `dir` (the rule the card's own diff uses) rather than left for the repository
+/// root to resolve.
+fn path_to_open(dir: &str, path: &str) -> String {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        path.to_owned()
+    } else {
+        // A relative `dir` is the process's: made absolute first, or the repository root would
+        // read the joined path as its own.
+        let dir = Path::new(dir)
+            .canonicalize()
+            .or_else(|_| std::env::current_dir().map(|cwd| cwd.join(dir)))
+            .unwrap_or_else(|_| PathBuf::from(dir));
+        dir.join(p).to_string_lossy().into_owned()
+    }
+}
 
 /// One turn's baseline, filled in off the main thread.
 #[derive(Default)]
@@ -168,6 +186,7 @@ impl DiffSource for ThreadDiffs {
 
     fn open_external(&self, ask: DiffAsk) {
         let Some(me) = self.me.upgrade() else { return };
+        let dir = self.dir.clone();
         let Some(tool) = DiffTools::shared().get() else {
             (self.toast)(diff_tool::NO_TOOL_HINT);
             return;
@@ -195,6 +214,15 @@ impl DiffSource for ThreadDiffs {
                 return;
             };
             let name = tool.name.clone();
+            // Resolving `dir` touches the filesystem, so it runs on a worker.
+            let path =
+                match off_main("resolving the path", move || Ok(path_to_open(&dir, &path))).await {
+                    Ok(path) => path,
+                    Err(why) => {
+                        (me.toast)(&why);
+                        return;
+                    }
+                };
             let request = OpenRequest {
                 toplevel: base.toplevel.clone(),
                 path,
@@ -215,6 +243,27 @@ mod tests {
 
     fn diffs() -> Rc<ThreadDiffs> {
         ThreadDiffs::new("/nonexistent", 1, "test", Rc::new(|_| {}))
+    }
+
+    #[test]
+    fn a_relative_path_to_open_is_the_threads_not_the_repository_roots() {
+        assert_eq!(path_to_open("/repo/sub", "a.rs"), "/repo/sub/a.rs");
+        assert_eq!(path_to_open("/repo/sub", "x/a.rs"), "/repo/sub/x/a.rs");
+        assert_eq!(path_to_open("/repo/sub", "/repo/b.rs"), "/repo/b.rs");
+    }
+
+    #[test]
+    fn a_relative_thread_dir_gives_an_absolute_path_to_the_right_file() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let got = path_to_open(".", "a.rs");
+        assert!(Path::new(&got).is_absolute(), "{got}");
+        assert_eq!(
+            Path::new(&got),
+            cwd.canonicalize().expect("canon").join("a.rs")
+        );
+        // A relative dir that does not exist still anchors at the working directory.
+        let got = path_to_open("no/such/dir", "a.rs");
+        assert_eq!(Path::new(&got), cwd.join("no/such/dir/a.rs"));
     }
 
     #[test]

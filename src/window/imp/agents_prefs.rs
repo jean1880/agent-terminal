@@ -12,7 +12,7 @@ use agent_core::adapter::{Driver, Mode};
 
 use super::*;
 use crate::availability::{AgentAvailability, Availability};
-use crate::config::Profile;
+use crate::config::{FieldChange, Profile};
 use crate::model_catalog::ModelCatalog;
 
 mod delegation;
@@ -81,43 +81,102 @@ const PERMISSION_SOURCES_HELP: &str =
     "Extra permissions.toml files to import from and export to, separated by ':' (absolute or \
      ~/ paths to existing files). Blank: none";
 
-const AGENT_EDIT_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
-
+/// One commit-only row's uncommitted edit: held until a commit ([`Self::flush`]) saves it, or
+/// dropped ([`Self::cancel`]) when the text turns invalid. The window keeps every live one so
+/// closing flushes them ([`AgentTerminalWindow::flush_agent_edits`]).
 #[derive(Default)]
 pub(super) struct EditDebounce {
-    source: RefCell<Option<glib::SourceId>>,
     pending: RefCell<Option<std::boxed::Box<dyn FnOnce()>>>,
 }
 
 impl EditDebounce {
     fn cancel(&self) {
-        if let Some(id) = self.source.borrow_mut().take() {
-            id.remove();
-        }
         self.pending.borrow_mut().take();
     }
 
     fn flush(&self) {
-        if let Some(id) = self.source.borrow_mut().take() {
-            id.remove();
-        }
         let pending = self.pending.borrow_mut().take();
         if let Some(pending) = pending {
             pending();
         }
     }
 
-    fn schedule(self: &Rc<Self>, then: impl FnOnce() + 'static) {
+    /// Keeps `then` until [`Self::flush`] (a commit, the dialog or the window closing).
+    fn hold(&self, then: impl FnOnce() + 'static) {
         self.cancel();
         *self.pending.borrow_mut() = Some(std::boxed::Box::new(then));
-        let weak = Rc::downgrade(self);
-        *self.source.borrow_mut() =
-            Some(glib::timeout_add_local_once(AGENT_EDIT_DELAY, move || {
-                if let Some(timer) = weak.upgrade() {
-                    timer.source.borrow_mut().take();
-                    timer.flush();
-                }
-            }));
+    }
+
+    /// The row's window became active (`true`) or stopped being so: a held edit commits when
+    /// the window loses focus, so a valid edit left in a focused row survives a crash.
+    fn window_focus_changed(&self, active: bool) {
+        if !active {
+            self.flush();
+        }
+    }
+}
+
+/// What an agent's Detected row last found for the saved command, shared with its Enabled row
+/// so the two rows never contradict each other ([`enabled_subtitle`]).
+/// Both answers are stamped on one clock, so the newer one speaks.
+#[derive(Default)]
+struct DetectedLink {
+    /// The last stamp handed out.
+    clock: std::cell::Cell<u64>,
+    /// The check's answer and when it arrived; `None` while a check runs.
+    detected: RefCell<Option<(u64, Result<String, String>)>>,
+    /// The scan result last seen for this agent: when it was first seen, its number
+    /// ([`AgentAvailability::scanned`]) and its state.
+    scan: RefCell<Option<(u64, u64, Availability)>>,
+    /// Redraws the Enabled row; gone once its dialog closed.
+    refresh: RefCell<Option<std::rc::Weak<dyn Fn()>>>,
+}
+
+impl DetectedLink {
+    fn tick(&self) -> u64 {
+        let now = self.clock.get() + 1;
+        self.clock.set(now);
+        now
+    }
+
+    /// When this agent's latest scan result (number `scans`, [`AgentAvailability::scanned`])
+    /// was first seen: a new stamp for every new result, the same Ready path again included, but
+    /// not when the signal fires for another agent's scan.
+    fn scanned_at(&self, scans: u64, state: &Availability) -> u64 {
+        let mut scan = self.scan.borrow_mut();
+        match scan.as_ref() {
+            Some((at, seen_scans, seen)) if *seen_scans == scans && seen == state => *at,
+            _ => {
+                let at = self.tick();
+                *scan = Some((at, scans, state.clone()));
+                at
+            }
+        }
+    }
+
+    /// The Enabled row's subtitle for `driver` now, from `availability` and the last check.
+    fn enabled_now(&self, availability: &AgentAvailability, driver: Driver) -> String {
+        let state = availability.get(driver);
+        let scanned_at = self.scanned_at(availability.scanned(driver), &state);
+        let detected = self.detected.borrow();
+        enabled_subtitle(
+            driver,
+            (scanned_at, &state),
+            detected.as_ref().map(|(at, found)| (*at, found)),
+        )
+    }
+
+    fn set(&self, found: Option<Result<String, String>>) {
+        let stamped = found.map(|f| (self.tick(), f));
+        *self.detected.borrow_mut() = stamped;
+        let refresh = self
+            .refresh
+            .borrow()
+            .as_ref()
+            .and_then(std::rc::Weak::upgrade);
+        if let Some(refresh) = refresh {
+            refresh();
+        }
     }
 }
 
@@ -235,6 +294,29 @@ fn command_ok(text: &str) -> bool {
 
 // Splits an arguments field as a shell would, as the diff tool's command line is split.
 use super::diff_prefs::parse_argv as parse_args;
+
+/// What the Command row does with `text`, against the `saved` command: validated on every
+/// change, saved only on commit ([`crate::config::field_change`]).
+fn command_edit(text: &str, saved: &str, commit: bool) -> FieldChange<String> {
+    let text = text.trim();
+    let parsed = if command_ok(text) {
+        Ok(text.to_owned())
+    } else {
+        Err("Enter a command name or a path (not an option)".to_owned())
+    };
+    crate::config::field_change(parsed, &saved.to_owned(), commit)
+}
+
+/// What the Environment File row does with `text` (blank is none), against the `saved` file.
+fn env_file_edit(text: &str, saved: Option<&str>, commit: bool) -> FieldChange<Option<String>> {
+    let text = text.trim();
+    let parsed = if env_file_ok(text) {
+        Ok((!text.is_empty()).then(|| text.to_owned()))
+    } else {
+        Err("That file does not exist".to_owned())
+    };
+    crate::config::field_change(parsed, &saved.map(str::to_owned), commit)
+}
 
 /// Whether an env-file field is usable: blank, or a file that exists.
 fn env_file_ok(text: &str) -> bool {
@@ -584,19 +666,12 @@ impl AgentTerminalWindow {
         });
     }
 
-    /// Applies `edit` to `driver`'s profile (created when missing) and schedules the save.
+    /// Applies `edit` to `driver`'s profile (created when missing, and recorded as `driver`'s so
+    /// a command edit never detaches it) and schedules the save.
     fn edit_agent_profile(&self, driver: Driver, edit: impl FnOnce(&mut Profile)) {
         let profile_id = {
             let mut config = self.config.borrow_mut();
-            let index = match config.agent_profile_index(driver) {
-                Some(i) => i,
-                None => {
-                    config
-                        .profiles
-                        .push(crate::config::new_agent_profile(driver));
-                    config.profiles.len() - 1
-                }
-            };
+            let index = config.agent_profile_slot(driver);
             config.profiles.get_mut(index).map(|profile| {
                 edit(profile);
                 profile.id.clone()
@@ -1485,7 +1560,8 @@ impl AgentTerminalWindow {
             .title(driver.info().long_label)
             .description(format!("Profile “{}”", profile.name))
             .build();
-        group.add(&self.agent_enabled_row(driver, dialog.upcast_ref()));
+        let (enabled, detected) = self.agent_enabled_row_linked(driver, dialog.upcast_ref());
+        group.add(&enabled);
         group.add(&self.agent_account_row(driver, dialog.upcast_ref()));
         let subtitle = if driver == Driver::Agy {
             "This agent only (the switch under Cross-agent delegation sets every agent). Turning it on reviews Antigravity's managed registration; turning it off offers to remove it."
@@ -1511,7 +1587,7 @@ impl AgentTerminalWindow {
             }
         ));
         group.add(&delegation);
-        self.add_agent_detail_rows(&group, driver, &profile, dialog);
+        self.add_agent_detail_rows_linked(&group, driver, &profile, dialog, Some(detected));
         group
     }
 
@@ -1589,7 +1665,18 @@ impl AgentTerminalWindow {
     /// `driver`'s on/off switch, saying what detection found (ready and where, missing and how to
     /// install, or off). Follows the scan until `dialog` closes.
     pub(super) fn agent_enabled_row(&self, driver: Driver, dialog: &adw::Dialog) -> adw::SwitchRow {
+        self.agent_enabled_row_linked(driver, dialog).0
+    }
+
+    /// [`Self::agent_enabled_row`], with what the Detected row found (set it, then call the
+    /// returned refresh) so the two never disagree.
+    fn agent_enabled_row_linked(
+        &self,
+        driver: Driver,
+        dialog: &adw::Dialog,
+    ) -> (adw::SwitchRow, Rc<DetectedLink>) {
         let obj = self.obj();
+        let link = Rc::new(DetectedLink::default());
         let profile = self.agent_profile_now(driver);
         let enabled = adw::SwitchRow::builder()
             .title("Enabled")
@@ -1619,20 +1706,30 @@ impl AgentTerminalWindow {
                 imp.refresh_agent_data(super::threads::Probes::Force);
             }
         ));
-        // The row says what detection found: ready (where), missing (how to install), or off.
-        let state_id = AgentAvailability::shared().connect_changed(glib::clone!(
+        // The row says what detection found: ready (where), missing (how to install), or off;
+        // the Detected row's own check of the saved command wins when the two disagree.
+        let show: Rc<dyn Fn()> = Rc::new(glib::clone!(
             #[weak]
             enabled,
             #[weak]
             get_it,
+            #[strong]
+            link,
             move || {
-                let state = AgentAvailability::shared().get(driver);
-                enabled.set_subtitle(&state.describe(driver));
-                get_it.set_visible(state == Availability::Missing);
+                let text = link.enabled_now(&AgentAvailability::shared(), driver);
+                get_it.set_visible(text == Availability::Missing.describe(driver));
+                enabled.set_subtitle(&text);
             }
         ));
+        *link.refresh.borrow_mut() = Some(Rc::downgrade(&show));
+        show();
+        let state_id = AgentAvailability::shared().connect_changed({
+            let show = show.clone();
+            move || show()
+        });
         dialog.connect_closed(move |_| AgentAvailability::shared().disconnect(state_id));
-        enabled
+        // The availability handler keeps `show` (and with it the link) alive with the dialog.
+        (enabled, link)
     }
 
     /// Who is signed in to `driver`, with Sign In (then Check Again) when nobody is: an installed
@@ -1725,12 +1822,143 @@ impl AgentTerminalWindow {
         timer
     }
 
+    /// Makes `row` a commit-only text entry: validated on every change by `decide` (given the
+    /// text and whether it is a commit), saved only on commit. A commit is Enter, the apply
+    /// button (shown), focus leaving the row, the row's window losing focus (which also writes
+    /// the config at once, so a valid edit left focused survives a crash), or the dialog or app
+    /// window closing (through `timer`, an [`Self::agent_edit_timer`]). On commit `apply` gets
+    /// the value to save, or `None` when the committed text is the value already in use.
+    fn commit_only_entry<T: 'static>(
+        &self,
+        row: &adw::EntryRow,
+        feedback: &adw::ActionRow,
+        help: &'static str,
+        timer: &Rc<EditDebounce>,
+        decide: impl Fn(&Self, &str, bool) -> FieldChange<T> + 'static,
+        apply: impl Fn(&Self, Option<T>) + 'static,
+    ) {
+        let obj = self.obj();
+        let decide = Rc::new(decide);
+        row.set_show_apply_button(true);
+        let commit = Rc::new(glib::clone!(
+            #[weak]
+            obj,
+            #[weak]
+            row,
+            #[weak]
+            feedback,
+            #[strong]
+            decide,
+            move || {
+                let imp = obj.imp();
+                match decide(imp, &row.text(), true) {
+                    FieldChange::Invalid(reason) => {
+                        show_validation(&row, &feedback, help, Some(&reason));
+                    }
+                    FieldChange::Keep => apply(imp, None),
+                    FieldChange::Persist(value) => apply(imp, Some(value)),
+                }
+            }
+        ));
+        row.connect_changed(glib::clone!(
+            #[weak]
+            obj,
+            #[weak]
+            feedback,
+            #[strong]
+            timer,
+            move |row| match decide(obj.imp(), &row.text(), false) {
+                FieldChange::Invalid(reason) => {
+                    timer.cancel();
+                    show_validation(row, &feedback, help, Some(&reason));
+                }
+                FieldChange::Keep | FieldChange::Persist(_) => {
+                    show_validation(row, &feedback, help, None);
+                    let commit = commit.clone();
+                    timer.hold(move || commit());
+                }
+            }
+        ));
+        let commit_now = glib::clone!(
+            #[strong]
+            timer,
+            move || timer.flush()
+        );
+        row.connect_apply({
+            let commit_now = commit_now.clone();
+            move |_| commit_now()
+        });
+        row.connect_entry_activated({
+            let commit_now = commit_now.clone();
+            move |_| commit_now()
+        });
+        let focus = gtk4::EventControllerFocus::new();
+        focus.connect_leave(move |_| commit_now());
+        row.add_controller(focus);
+        // The window the row is in (the app's, or the dialog's own when it floats), followed
+        // while the row is mapped.
+        type WindowWatch = Option<(glib::WeakRef<gtk4::Window>, glib::SignalHandlerId)>;
+        let window_watch: Rc<RefCell<WindowWatch>> = Rc::default();
+        row.connect_map(glib::clone!(
+            #[weak]
+            obj,
+            #[strong]
+            timer,
+            #[strong]
+            window_watch,
+            move |row| {
+                let Some(window) = row.root().and_downcast::<gtk4::Window>() else {
+                    return;
+                };
+                let id = window.connect_is_active_notify(glib::clone!(
+                    #[weak]
+                    obj,
+                    #[strong]
+                    timer,
+                    move |window| {
+                        timer.window_focus_changed(window.is_active());
+                        if !window.is_active() {
+                            obj.imp().flush_pending_save();
+                        }
+                    }
+                ));
+                if let Some((old, old_id)) = window_watch.replace(Some((window.downgrade(), id))) {
+                    if let Some(old) = old.upgrade() {
+                        old.disconnect(old_id);
+                    }
+                }
+            }
+        ));
+        row.connect_unmap(move |_| {
+            if let Some((window, id)) = window_watch.take() {
+                if let Some(window) = window.upgrade() {
+                    window.disconnect(id);
+                }
+            }
+        });
+    }
+
+    /// The detail rows alone, with no Enabled row to tell: for tests.
+    #[cfg(test)]
     fn add_agent_detail_rows(
         &self,
         group: &adw::PreferencesGroup,
         driver: Driver,
         profile: &Profile,
         dialog: &adw::PreferencesDialog,
+    ) {
+        self.add_agent_detail_rows_linked(group, driver, profile, dialog, None);
+    }
+
+    /// [`Self::add_agent_detail_rows`], telling the agent's Enabled row (through `enabled`)
+    /// what the Detected row finds.
+    fn add_agent_detail_rows_linked(
+        &self,
+        group: &adw::PreferencesGroup,
+        driver: Driver,
+        profile: &Profile,
+        dialog: &adw::PreferencesDialog,
+        enabled: Option<Rc<DetectedLink>>,
     ) {
         let obj = self.obj();
         // Command, with what detection makes of it.
@@ -1752,11 +1980,23 @@ impl AgentTerminalWindow {
             move |command: String| {
                 let current = generation.next();
                 status.set_subtitle("Checking…");
+                if let Some(link) = &enabled {
+                    link.set(None);
+                }
                 let generation = generation.clone();
+                let enabled = enabled.clone();
                 glib::MainContext::default().spawn_local(async move {
                     let found = off_main("the check", move || detect_agent(&command)).await;
                     if !generation.is_current(current) {
                         return;
+                    }
+                    if let Some(link) = &enabled {
+                        // A check that failed to run (it panicked) found nothing either way.
+                        let answer = found.as_ref().map_or_else(
+                            |e| e.starts_with("Not found").then(|| found.clone()),
+                            |_| Some(found.clone()),
+                        );
+                        link.set(answer);
                     }
                     match found {
                         Ok(text) => {
@@ -1772,50 +2012,31 @@ impl AgentTerminalWindow {
             }
         ));
         detect(profile.command.clone());
+        // Saved only on commit: a half-typed path never becomes the agent's command.
         let command_timer = self.agent_edit_timer(dialog);
-        command.connect_changed(glib::clone!(
-            #[strong]
-            command_timer,
-            #[weak]
-            obj,
-            #[strong]
-            detect,
-            #[weak]
-            command_error,
-            move |row| {
-                command_timer.cancel();
-                let text = row.text().trim().to_owned();
-                if !command_ok(&text) {
-                    show_validation(
-                        row,
-                        &command_error,
-                        COMMAND_HELP,
-                        Some("Enter a command name or a path (not an option)"),
-                    );
-                    return;
+        self.commit_only_entry(
+            &command,
+            &command_error,
+            COMMAND_HELP,
+            &command_timer,
+            move |imp, text, commit| {
+                command_edit(text, &imp.agent_profile_now(driver).command, commit)
+            },
+            move |imp, value| {
+                let changed = value.is_some();
+                if let Some(text) = value {
+                    imp.edit_agent_profile(driver, |p| p.command = text);
                 }
-                show_validation(row, &command_error, COMMAND_HELP, None);
-                let obj = obj.downgrade();
-                let detect = detect.clone();
-                command_timer.schedule(move || {
-                    let Some(obj) = obj.upgrade() else {
-                        return;
-                    };
-                    let imp = obj.imp();
-                    let changed = imp.agent_profile_now(driver).command != text;
+                if !imp.is_closing() {
+                    // A commit checks the command again, even one already in use.
+                    detect(imp.agent_profile_now(driver).command);
                     if changed {
-                        imp.edit_agent_profile(driver, |p| p.command = text.clone());
+                        imp.refresh_profile_selection();
+                        imp.refresh_agent_data(super::threads::Probes::Force);
                     }
-                    if !imp.is_closing() {
-                        detect(text);
-                        if changed {
-                            imp.refresh_profile_selection();
-                            imp.refresh_agent_data(super::threads::Probes::Force);
-                        }
-                    }
-                });
-            }
-        ));
+                }
+            },
+        );
         group.add(&command);
         group.add(&command_error);
         group.add(&status);
@@ -1830,24 +2051,28 @@ impl AgentTerminalWindow {
                 .collect::<Vec<_>>()
                 .join(" "),
         );
-        args.connect_changed(glib::clone!(
-            #[weak]
-            obj,
-            #[weak]
-            args_error,
-            move |row| match parse_args(&row.text()) {
-                Ok(parsed) => {
-                    show_validation(row, &args_error, ARGS_HELP, None);
-                    let imp = obj.imp();
-                    if imp.agent_profile_now(driver).args != parsed {
-                        imp.edit_agent_profile(driver, |p| p.args = parsed);
-                    }
+        // Validated on every change, saved only on commit (Enter, the apply button, focus
+        // leaving the row, or the dialog or window closing): a half-typed argument list is
+        // never written, and never restarts the agent.
+        let args_timer = self.agent_edit_timer(dialog);
+        self.commit_only_entry(
+            &args,
+            &args_error,
+            ARGS_HELP,
+            &args_timer,
+            move |imp, text, commit| {
+                crate::config::field_change(
+                    parse_args(text),
+                    &imp.agent_profile_now(driver).args,
+                    commit,
+                )
+            },
+            move |imp, value| {
+                if let Some(parsed) = value {
+                    imp.edit_agent_profile(driver, |p| p.args = parsed);
                 }
-                Err(reason) => {
-                    show_validation(row, &args_error, ARGS_HELP, Some(&reason));
-                }
-            }
-        ));
+            },
+        );
         group.add(&args);
         group.add(&args_error);
 
@@ -1857,42 +2082,27 @@ impl AgentTerminalWindow {
             profile.env_file.as_deref().unwrap_or(""),
         );
         let env_timer = self.agent_edit_timer(dialog);
-        env_file.connect_changed(glib::clone!(
-            #[strong]
-            env_timer,
-            #[weak]
-            obj,
-            #[weak]
-            env_error,
-            move |row| {
-                env_timer.cancel();
-                let text = row.text().trim().to_owned();
-                if !env_file_ok(&text) {
-                    show_validation(
-                        row,
-                        &env_error,
-                        ENV_FILE_HELP,
-                        Some("That file does not exist"),
-                    );
-                    return;
-                }
-                show_validation(row, &env_error, ENV_FILE_HELP, None);
-                let value = (!text.is_empty()).then_some(text);
-                let obj = obj.downgrade();
-                env_timer.schedule(move || {
-                    let Some(obj) = obj.upgrade() else {
-                        return;
-                    };
-                    let imp = obj.imp();
-                    if imp.agent_profile_now(driver).env_file != value {
-                        imp.edit_agent_profile(driver, |p| p.env_file = value);
-                        if !imp.is_closing() {
-                            imp.refresh_agent_data(super::threads::Probes::Force);
-                        }
+        self.commit_only_entry(
+            &env_file,
+            &env_error,
+            ENV_FILE_HELP,
+            &env_timer,
+            move |imp, text, commit| {
+                env_file_edit(
+                    text,
+                    imp.agent_profile_now(driver).env_file.as_deref(),
+                    commit,
+                )
+            },
+            move |imp, value| {
+                if let Some(value) = value {
+                    imp.edit_agent_profile(driver, |p| p.env_file = value);
+                    if !imp.is_closing() {
+                        imp.refresh_agent_data(super::threads::Probes::Force);
                     }
-                });
-            }
-        ));
+                }
+            },
+        );
         group.add(&env_file);
         group.add(&env_error);
 
@@ -2118,26 +2328,12 @@ impl AgentTerminalWindow {
                     ),
                 )
                 .await;
-                let badge = crate::hook_config::badge(&probe, bound);
-                crate::hook_config::log_verdict(badge, &probe, bound);
-                let (text, class) = match badge {
-                    crate::hook_config::HookBadge::Ready => (
-                        "Ready: Hook entry present and runtime directory available.",
-                        None,
-                    ),
-                    crate::hook_config::HookBadge::Missing => (
-                        "Not installed: Antigravity cannot ask before acting until the entry below is added.",
-                        Some("error"),
-                    ),
-                    crate::hook_config::HookBadge::Unreadable => (
-                        "Could not verify the approval hook for a thread. Treat Antigravity as ungated.",
-                        Some("warning"),
-                    ),
-                };
-                let detail = match &probe {
-                    crate::hook_config::HookProbe::Unreadable(why) => format!("Could not verify: {why}"),
-                    _ => text.to_owned(),
-                };
+                crate::hook_config::log_verdict(
+                    crate::hook_config::badge(&probe, bound),
+                    &probe,
+                    bound,
+                );
+                let (detail, class) = hook_status(&probe, bound);
                 let detail = format!(
                     "{detail}\nAny other Antigravity hooks file (home or plugin) must also route \
                      through this app's approval hook, or Antigravity runs without skipping permissions."
@@ -2150,6 +2346,37 @@ impl AgentTerminalWindow {
                 }
             }
         ));
+    }
+}
+
+/// The Approval Hook row's text and style class for a probe of the hooks file and whether the
+/// approval socket can be bound. Every state that is not Ready says why.
+fn hook_status(
+    probe: &crate::hook_config::HookProbe,
+    socket_bound: bool,
+) -> (String, Option<&'static str>) {
+    use crate::hook_config::{HookBadge, HookProbe};
+    match crate::hook_config::badge(probe, socket_bound) {
+        HookBadge::Ready => (
+            "Ready: Hook entry present and runtime directory available.".to_owned(),
+            None,
+        ),
+        HookBadge::Missing => (
+            "Not installed: Antigravity cannot ask before acting until the entry below is added."
+                .to_owned(),
+            Some("error"),
+        ),
+        HookBadge::Unreadable => {
+            let text = match probe {
+                HookProbe::Unreadable(why) => format!("Could not verify: {why}"),
+                // The badge's only other unverified case: installed, with no socket to bind.
+                _ => "Could not verify: the hook entry is present, but no approval socket can \
+                      be bound ($XDG_RUNTIME_DIR is unset or not a directory). Treat \
+                      Antigravity as ungated."
+                    .to_owned(),
+            };
+            (text, Some("warning"))
+        }
     }
 }
 
@@ -2351,6 +2578,29 @@ fn catalogue_efforts(driver: Driver) -> Vec<String> {
     out
 }
 
+/// The Enabled row's subtitle: the shared scan's `state`, unless the Detected row's own check
+/// of the saved command (`detected`, `None` while it runs) disagrees with it. The two rows
+/// never contradict each other. Each answer carries when it arrived (`scanned_at`, and the
+/// check's own stamp) on one clock.
+fn enabled_subtitle(
+    driver: Driver,
+    (scanned_at, state): (u64, &Availability),
+    detected: Option<(u64, &Result<String, String>)>,
+) -> String {
+    // Only a check newer than the scan may speak over it; an older one is stale.
+    let detected = detected
+        .filter(|(checked_at, _)| *checked_at > scanned_at)
+        .map(|(_, found)| found);
+    match (state, detected) {
+        (Availability::Disabled, _) | (_, None) => state.describe(driver),
+        (Availability::Ready(_), Some(Err(_))) => Availability::Missing.describe(driver),
+        (Availability::Missing | Availability::Detecting, Some(Ok(found))) => {
+            format!("Ready: {}", found.trim_start_matches("Installed at "))
+        }
+        _ => state.describe(driver),
+    }
+}
+
 /// "Installed at <path> · <version>", or why not. Blocking: locate + `--version`.
 fn detect_agent(command: &str) -> Result<String, String> {
     let (path, home, shell) = env_triplet();
@@ -2446,6 +2696,206 @@ pub(super) mod tests {
         *timer.pending.borrow_mut() = Some(std::boxed::Box::new(move || seen.set(true)));
         drop(timer);
         assert!(saved.get());
+    }
+
+    #[test]
+    fn a_hook_with_no_bindable_socket_says_why_it_is_unverified() {
+        use crate::hook_config::HookProbe;
+        // The entry is installed, but $XDG_RUNTIME_DIR is unusable, so no socket can be bound.
+        let (text, class) = hook_status(&HookProbe::Installed, false);
+        assert_eq!(class, Some("warning"));
+        assert!(text.contains("socket"), "no reason given: {text}");
+        assert!(text.contains("XDG_RUNTIME_DIR"), "no reason given: {text}");
+        assert!(text.contains("ungated"), "{text}");
+        // An unreadable file still names its own reason; ready and missing are unchanged.
+        let (text, _) = hook_status(&HookProbe::Unreadable("permission denied".into()), true);
+        assert_eq!(text, "Could not verify: permission denied");
+        assert_eq!(hook_status(&HookProbe::Installed, true).1, None);
+        assert_eq!(
+            hook_status(&HookProbe::Missing("no entry".into()), true).1,
+            Some("error")
+        );
+    }
+
+    #[test]
+    fn the_enabled_row_never_says_ready_when_detected_says_not_found() {
+        let driver = Driver::Claude;
+        let ready = Availability::Ready("/usr/bin/claude".into());
+        let not_found: Result<String, String> = Err("Not found: /nonexistent/claude".into());
+        // The scan still holds the old command's result; Detected checked the saved one since.
+        let text = enabled_subtitle(driver, (1, &ready), Some((2, &not_found)));
+        assert!(!text.starts_with("Ready"), "{text}");
+        assert!(text.starts_with("Not found"), "{text}");
+        // Detected found it after the scan said missing: not "Not found" either.
+        let found: Result<String, String> = Ok("Installed at /opt/claude · 2.1".into());
+        let text = enabled_subtitle(driver, (1, &Availability::Missing), Some((2, &found)));
+        assert!(!text.starts_with("Not found"), "{text}");
+        assert!(text.contains("/opt/claude"), "{text}");
+        // Agreement, a check still running, or an agent turned off: the scan's own words.
+        assert_eq!(
+            enabled_subtitle(driver, (1, &ready), Some((2, &found))),
+            ready.describe(driver)
+        );
+        assert_eq!(
+            enabled_subtitle(driver, (1, &ready), None),
+            ready.describe(driver)
+        );
+        assert_eq!(
+            enabled_subtitle(driver, (1, &Availability::Disabled), Some((2, &not_found))),
+            Availability::Disabled.describe(driver)
+        );
+    }
+
+    #[test]
+    fn the_link_stamps_each_new_scan_result_but_not_another_agents() {
+        let link = DetectedLink::default();
+        let ready = Availability::Ready("/usr/bin/claude".into());
+        let first = link.scanned_at(1, &ready);
+        link.set(Some(Err("Not found: x".into())));
+        // Another agent's scan fires the signal again: this agent's result (still number 1)
+        // keeps its stamp, so the newer check still speaks.
+        assert_eq!(link.scanned_at(1, &ready), first);
+        let checked = link.detected.borrow().as_ref().map(|(at, _)| *at).unwrap();
+        assert!(checked > first);
+        // A new result for this agent is newer than that check, even with the same state.
+        assert!(link.scanned_at(2, &ready) > checked);
+    }
+
+    #[test]
+    fn a_rescan_with_the_same_ready_path_overrides_an_older_not_found() {
+        let driver = Driver::Claude;
+        let availability = AgentAvailability::new();
+        let link = DetectedLink::default();
+        let ready = Availability::Ready("/usr/bin/claude".into());
+        // A cached Ready.
+        availability.set(driver, ready.clone());
+        assert_eq!(
+            link.enabled_now(&availability, driver),
+            ready.describe(driver)
+        );
+        // The binary disappears: Detected checks the command and finds nothing.
+        link.set(Some(Err("Not found: /usr/bin/claude".into())));
+        assert!(link
+            .enabled_now(&availability, driver)
+            .starts_with("Not found"));
+        // The binary returns, and the next scan gives the very same Ready path.
+        availability.set(driver, ready.clone());
+        assert_eq!(
+            link.enabled_now(&availability, driver),
+            ready.describe(driver),
+            "an unchanged rescan left the stale Not found"
+        );
+    }
+
+    #[test]
+    fn an_older_detected_answer_never_overrides_a_newer_scan() {
+        let driver = Driver::Claude;
+        let ready = Availability::Ready("/usr/bin/claude".into());
+        let not_found: Result<String, String> = Err("Not found: /nonexistent/claude".into());
+        let found: Result<String, String> = Ok("Installed at /opt/claude · 2.1".into());
+        // The Settings row checked the command at 1; the agent was installed and rescanned at 2.
+        assert_eq!(
+            enabled_subtitle(driver, (2, &ready), Some((1, &not_found))),
+            ready.describe(driver),
+            "a stale Not found overrode a newer Ready"
+        );
+        // And the other way round: a stale Installed never hides a newer Missing.
+        assert_eq!(
+            enabled_subtitle(driver, (2, &Availability::Missing), Some((1, &found))),
+            Availability::Missing.describe(driver),
+            "a stale Ready overrode a newer Not found"
+        );
+    }
+
+    #[test]
+    fn a_half_typed_command_is_not_saved_before_commit() {
+        let saved = "claude";
+        // Typing a path: each prefix is a valid command, and none is saved while typing.
+        for typed in ["/", "/usr/bin/cl", "/usr/bin/claude-nigh"] {
+            assert_eq!(
+                command_edit(typed, saved, false),
+                FieldChange::Keep,
+                "{typed:?} was saved while typing"
+            );
+        }
+        assert_eq!(
+            command_edit("/usr/bin/claude-nightly", saved, true),
+            FieldChange::Persist("/usr/bin/claude-nightly".into())
+        );
+        for commit in [false, true] {
+            assert!(matches!(
+                command_edit("--oops", saved, commit),
+                FieldChange::Invalid(_)
+            ));
+        }
+        assert_eq!(command_edit(" claude ", saved, true), FieldChange::Keep);
+    }
+
+    #[test]
+    fn a_half_typed_env_file_is_not_saved_before_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        // A prefix of the intended path that happens to name a file too.
+        let prefix = dir.path().join("work");
+        let full = dir.path().join("work.env");
+        std::fs::write(&prefix, "A=1\n").unwrap();
+        std::fs::write(&full, "A=2\n").unwrap();
+        let (prefix, full) = (prefix.to_string_lossy(), full.to_string_lossy());
+        assert_eq!(
+            env_file_edit(&prefix, None, false),
+            FieldChange::Keep,
+            "a valid prefix was saved while typing"
+        );
+        assert_eq!(
+            env_file_edit(&full, None, true),
+            FieldChange::Persist(Some(full.to_string()))
+        );
+        // Clearing the row is a value too, saved on commit only.
+        assert_eq!(env_file_edit("", Some(&full), false), FieldChange::Keep);
+        assert_eq!(
+            env_file_edit("", Some(&full), true),
+            FieldChange::Persist(None)
+        );
+        assert!(matches!(
+            env_file_edit("/definitely/not/here.env", None, true),
+            FieldChange::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn a_held_edit_commits_when_its_window_loses_focus() {
+        let commits = Rc::new(std::cell::Cell::new(0));
+        let timer = EditDebounce::default();
+        let seen = commits.clone();
+        timer.hold(move || seen.set(seen.get() + 1));
+        timer.window_focus_changed(true);
+        assert_eq!(
+            commits.get(),
+            0,
+            "the window becoming active commits nothing"
+        );
+        // The user switches to another app with the valid edit still in the focused row.
+        timer.window_focus_changed(false);
+        assert_eq!(commits.get(), 1, "the edit was left uncommitted");
+        timer.window_focus_changed(false);
+        assert_eq!(commits.get(), 1);
+    }
+
+    #[test]
+    fn a_held_commit_runs_only_on_flush_and_an_invalid_edit_drops_it() {
+        let commits = Rc::new(std::cell::Cell::new(0));
+        let timer = EditDebounce::default();
+        let seen = commits.clone();
+        timer.hold(move || seen.set(seen.get() + 1));
+        assert_eq!(commits.get(), 0, "a draft is not saved while typing");
+        timer.flush(); // Enter, focus leaving, or the dialog or window closing
+        assert_eq!(commits.get(), 1);
+        timer.flush();
+        assert_eq!(commits.get(), 1, "one commit per draft");
+        let seen = commits.clone();
+        timer.hold(move || seen.set(seen.get() + 1));
+        timer.cancel(); // the text turned invalid
+        drop(timer);
+        assert_eq!(commits.get(), 1);
     }
 
     #[test]
@@ -2572,10 +3022,16 @@ pub(super) mod tests {
         ] {
             field.set_text(text);
         }
+        // Nothing is saved while typing, however long the user pauses.
+        let paused = std::time::Instant::now();
+        crate::testutil::pump_until(&ctx, 1, || paused.elapsed().as_millis() > 800);
         assert_eq!(
             window.imp().agent_profile_now(Driver::Codex).command,
             saved.command
         );
+        assert_eq!(super::super::threads::scan_generation_for_test(), before);
+        // Enter commits it, once.
+        field.emit_by_name::<()>("entry-activated", &[]);
         assert!(crate::testutil::pump_until(&ctx, 5, || window
             .imp()
             .agent_profile_now(Driver::Codex)
@@ -2602,8 +3058,7 @@ pub(super) mod tests {
         let before = super::super::threads::scan_generation_for_test();
         field.set_text("/nonexistent/valid-draft/codex");
         field.set_text("--invalid");
-        let elapsed = std::time::Instant::now();
-        assert!(crate::testutil::pump_until(&ctx, 2, || elapsed.elapsed() > AGENT_EDIT_DELAY * 2));
+        field.emit_by_name::<()>("entry-activated", &[]);
         assert_eq!(
             window.imp().agent_profile_now(Driver::Codex).command,
             final_command
@@ -2613,6 +3068,8 @@ pub(super) mod tests {
         status.set_subtitle("Checking…");
         field.set_text("/nonexistent/another-draft/codex");
         field.set_text(final_command);
+        // Committing the command already in use checks it again, with no rescan.
+        field.emit_by_name::<()>("entry-activated", &[]);
         assert!(crate::testutil::pump_until(&ctx, 10, || status
             .subtitle()
             .is_some_and(|s| s != "Checking…")));
@@ -2666,6 +3123,10 @@ pub(super) mod tests {
                 .iter()
                 .find(|row| row.title() == title)
                 .expect("entry row");
+            if title == "Extra Arguments" {
+                // It saves only on commit, so the commit must be visible.
+                assert!(field.shows_apply_button(), "no apply button on {title}");
+            }
             let original = field.text();
             field.set_text(bad);
             assert!(field.has_css_class("error"));
