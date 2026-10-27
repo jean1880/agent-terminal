@@ -2,6 +2,8 @@
   <img src="assets/ca.nuvek.AgentTerminal.svg" alt="Agent Terminal icon" width="128" height="128">
 </p>
 
+> **Agent Terminal has moved to [jean1880/nuvek-agent-terminal](https://github.com/jean1880/nuvek-agent-terminal), where development continues from version 1.0.0. This repository is archived.**
+
 # Agent Terminal
 
 [![CI](https://github.com/jean1880/agent-terminal/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/jean1880/agent-terminal/actions/workflows/ci.yml)
